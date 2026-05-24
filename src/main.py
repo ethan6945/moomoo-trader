@@ -1,0 +1,856 @@
+"""Entry point. Two modes:
+
+    python -m src.main scan      # one-shot scan + trade decisions
+    python -m src.main run       # APScheduler loop during US market hours
+"""
+from __future__ import annotations
+
+import json
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pytz
+from apscheduler.schedulers.blocking import BlockingScheduler
+
+from moomoo import KLType
+
+from . import (
+    adaptive_sizing, ai_validator, audit, blacklist, clock, cron_state,
+    executor, history, indicators, kill_switch, notifier, portfolio,
+    regime as regime_mod, risk_manager, strategy_mr, watchlist_updater,
+)
+from .config import settings
+from .earnings import earnings_block
+from .ml import predict as ml_predict
+from .moomoo_client import client
+from .reconcile import log_reconcile, reconcile
+from .sector import check_sector_exposure
+
+SPREAD_MAX_PCT = 0.5   # refuse entry if bid-ask spread > 0.5% of mid
+# Frames where the last K-line is still forming when we fetch — drop it
+# before scoring to eliminate look-ahead bias.
+_INTRADAY_TFS = {"HOUR_1", "MIN_10", "MIN_30"}
+
+
+def _drop_forming_bar(df, timeframe: str):
+    """Look-ahead audit: strip the last (currently-forming) intraday bar.
+
+    MooMoo's `request_history_kline` returns bars up to and including the bar
+    that contains "now" — i.e. the last row of an intraday df is OPEN, not
+    closed. Scoring on an open bar means the close, volume, and indicators
+    all keep moving after we evaluate, so the live signal won't match the
+    backtest's closed-bar signal. We always drop the last intraday row.
+
+    Daily bars are left intact — the daily scan path runs once after close.
+    """
+    if timeframe.upper() in _INTRADAY_TFS and len(df) > 1:
+        return df.iloc[:-1]
+    return df
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(settings.root / "logs" / "trader.log"),
+    ],
+)
+log = logging.getLogger("main")
+
+WATCHLIST_FILE = settings.root / "config" / "watchlist.json"
+NY = pytz.timezone("America/New_York")
+
+
+def load_watchlist() -> list[str]:
+    return json.loads(WATCHLIST_FILE.read_text())["tickers"]
+
+
+def _refresh_account_snapshot(c, vix: float | None = None,
+                              regime: "regime_mod.Regime | None" = None,
+                              full: bool = True) -> None:
+    """Write data/account.json — used by the GUI for status + heartbeat.
+
+    Called from BOTH the full trade-phase scan AND the outside-trade-phase
+    branch so the GUI heartbeat stays current at every scan interval, not
+    just during 09:45–15:30 ET.
+
+    When `full=False` we skip VIX + regime fetches (slow + only matter for
+    entries that won't happen anyway).
+    """
+    try:
+        cash = c.get_account_cash()
+        positions = c.get_positions()
+    except Exception as e:
+        log.warning("snapshot fetch failed: %s", e)
+        return
+
+    if vix is None:
+        if full:
+            try:
+                vix = c.get_vix()
+            except Exception:
+                vix = 0.0
+        else:
+            # Carry over last-known VIX from previous snapshot (don't blank it).
+            try:
+                prev = json.loads((settings.root / "data" / "account.json").read_text())
+                vix = float(prev.get("vix") or 0)
+            except Exception:
+                vix = 0.0
+
+    if regime is None:
+        if full:
+            try:
+                spy_df = c.get_kline("SPY", bars=250, ktype=KLType.K_DAY)
+                regime = regime_mod.assess(spy_df)
+            except Exception:
+                regime = regime_mod.Regime("NEUTRAL", 0, 0, 0, False, False, "not assessed")
+        else:
+            try:
+                prev = json.loads((settings.root / "data" / "account.json").read_text())
+                regime = regime_mod.Regime(
+                    prev.get("regime", "NEUTRAL"), 0, 0, 0, False, False,
+                    prev.get("regime_note", "carried over from last full scan"),
+                )
+            except Exception:
+                regime = regime_mod.Regime("NEUTRAL", 0, 0, 0, False, False, "unknown")
+
+    try:
+        real_held = positions[positions["qty"].astype(float) > 0] if not positions.empty else positions
+        invested = 0.0
+        unrealized = 0.0
+        symbols: list[str] = []
+        # Per-position live snapshot — the GUI overlays this onto the open_trades
+        # table so each row shows current price + unrealized P&L without making
+        # an extra API call from the GUI thread.
+        per_pos: dict[str, dict] = {}
+        if not real_held.empty:
+            invested = float((real_held["qty"].astype(float) * real_held["cost_price"].astype(float)).sum())
+            unrealized = float(real_held.get("pl_val", 0).astype(float).sum()) if "pl_val" in real_held.columns else 0.0
+            symbols = [code.split(".")[-1] for code in real_held["code"].tolist()]
+            for _, row in real_held.iterrows():
+                sym = row["code"].split(".")[-1]
+                per_pos[sym] = {
+                    "last": float(row.get("nominal_price") or 0)
+                            or float(row.get("market_val", 0)) / max(float(row.get("qty", 1)), 1),
+                    "pl_val": float(row.get("pl_val", 0) or 0),
+                    "pl_ratio": float(row.get("pl_ratio", 0) or 0),
+                }
+        state = risk_manager._load_state()
+        realized_total = float(state.get("realized_pnl_total", 0.0))
+        snap = {
+            "ts": clock.ny_now().isoformat(),
+            "cash": cash,
+            "positions_count": len(real_held),
+            "invested": invested,
+            "budget": settings.account_usd,
+            "budget_used_pct": round(invested / settings.account_usd * 100, 1) if settings.account_usd else 0,
+            "unrealized_pnl": unrealized,
+            "realized_pnl_total": realized_total,
+            "total_pnl": unrealized + realized_total,
+            "symbols": symbols,
+            "ai_model": settings.gemini_model,
+            "scan_interval_min": settings.scan_interval_min,
+            "entry_threshold": settings.entry_threshold,
+            "max_hold_days": settings.max_hold_days,
+            "timeframe": settings.timeframe,
+            "trade_env": settings.moomoo_trade_env,
+            "vix": round(vix or 0, 1),
+            "regime": regime.label,
+            "regime_note": regime.note,
+            "open_risk": round(portfolio.current_open_risk(), 2),
+            "heat_cap": round(settings.account_usd * portfolio.PORTFOLIO_HEAT_PCT, 2),
+            "trade_stats": portfolio.trade_stats(50),
+            "skip_gates": audit.gate_summary(200),
+            "last_scan_utc": clock.utc_now_corrected().isoformat(),
+            "ml_enabled": settings.ml_enabled,
+            "ml_available": ml_predict.is_available(),
+            "ml_blend_weight": settings.ml_blend_weight,
+            "ml_trained_at": ml_predict.model_meta().get("trained_at", ""),
+            "phase": "trade" if full else "manage_only",
+            "clock": clock.status(),
+            "per_position": per_pos,
+            "realized_pnl_today": float(state.get("realized_pnl_today", 0.0)),
+        }
+        (settings.root / "data" / "account.json").write_text(
+            json.dumps(snap, indent=2, default=str)
+        )
+        if full:
+            history.append({
+                "invested": round(invested, 2),
+                "budget": settings.account_usd,
+                "unrealized_pnl": round(unrealized, 2),
+                "realized_pnl_total": round(realized_total, 2),
+                "total_pnl": round(unrealized + realized_total, 2),
+                "positions_count": len(real_held),
+                "symbols": symbols,
+                "timeframe": settings.timeframe,
+            })
+    except Exception as e:
+        log.warning("snapshot write failed: %s", e)
+
+
+def scan_once() -> None:
+    log.info("=== scan start ===")
+    audit.record("scan_start")
+    tickers = load_watchlist()
+
+    # Pre-kill-switch fast path: if we're outside trade phase, do management
+    # work + snapshot refresh, then exit before any candidate logic runs.
+    # The full kill_switch.evaluate() happens later (after we have cash + regime).
+    if not kill_switch.in_trade_phase():
+        log.info("Outside trade phase — managing only, no new entries")
+        try:
+            with client() as c:
+                executor.manage_open_trades(c)
+                _refresh_account_snapshot(c, full=False)
+        except Exception as e:
+            log.exception("manage during off-phase failed: %s", e)
+        audit.record("scan_end", gate="trade_phase",
+                     reason="outside trade phase — manage only")
+        return
+
+    with client() as c:
+        # 1. Manage existing positions first
+        try:
+            actions = executor.manage_open_trades(c)
+            for a in actions:
+                notifier.send(notifier.trade_action_msg(a))
+        except Exception as e:
+            log.exception("manage_open_trades failed: %s", e)
+
+        # 2. Refresh account state and VIX, then persist snapshot for the GUI.
+        try:
+            cash = c.get_account_cash()
+            positions = c.get_positions()
+            pending_value = c.get_pending_buy_value()
+            pending_symbols = c.get_pending_symbols()
+        except Exception as e:
+            log.exception("account fetch failed: %s", e)
+            return
+
+        # 2b. Reconcile broker vs internal records — catch drift before trading.
+        try:
+            recon = reconcile(positions)
+            msg = log_reconcile(recon)
+            if msg:
+                notifier.send(msg)
+        except Exception as e:
+            log.warning("reconcile failed: %s", e)
+
+        # 3. Fetch VIX + classify market regime (SPY 200MA).
+        try:
+            vix = c.get_vix()
+            log.info("VIX=%.1f%s", vix,
+                     " ⚠ HIGH — sizes halved" if 25 < vix <= 35 else
+                     " ⚠ CRISIS — sizes quartered" if vix > 35 else "")
+        except Exception as e:
+            log.warning("VIX fetch failed: %s", e)
+            vix = 15.0
+
+        # Market regime via SPY
+        regime = regime_mod.Regime("NEUTRAL", 0, 0, 0, False, False, "not assessed")
+        try:
+            spy_df = c.get_kline("SPY", bars=250, ktype=KLType.K_DAY)
+            regime = regime_mod.assess(spy_df)
+            log.info("Regime: %s — %s", regime.label, regime.note)
+        except Exception as e:
+            log.warning("regime assessment failed: %s", e)
+
+        # Daily rollover — clear stale halt / realized_pnl_today on day boundary.
+        try:
+            kill_switch.reset_for_new_day(cash)
+        except Exception as e:
+            log.warning("reset_for_new_day failed: %s", e)
+
+        # Unified kill switch — replaces three separate checks (trade_phase /
+        # regime block / halt / drawdown). Single source of truth for "can we
+        # open new positions right now?". manage_open_trades has already run
+        # so existing stops/TPs still fire even when entries are blocked.
+        verdict = kill_switch.evaluate(
+            regime_block_new=regime.block_new_entries,
+            regime_label=regime.label,
+            regime_note=regime.note,
+            current_cash=cash,
+        )
+        if not verdict.can_trade:
+            log.warning("kill_switch [%s]: %s", verdict.gate, verdict.reason)
+            audit.record("scan_end", gate=f"kill_{verdict.gate}",
+                         reason=verdict.reason)
+            if verdict.gate in ("regime", "drawdown"):
+                notifier.send(f"⚠ {verdict.reason}")
+            return
+
+        try:
+            real_held = positions[positions["qty"].astype(float) > 0] if not positions.empty else positions
+            invested = 0.0
+            unrealized = 0.0
+            symbols = []
+            per_pos: dict[str, dict] = {}
+            if not real_held.empty:
+                invested = float((real_held["qty"].astype(float) * real_held["cost_price"].astype(float)).sum())
+                unrealized = float(real_held.get("pl_val", 0).astype(float).sum()) if "pl_val" in real_held.columns else 0.0
+                symbols = [code.split(".")[-1] for code in real_held["code"].tolist()]
+                for _, row in real_held.iterrows():
+                    sym = row["code"].split(".")[-1]
+                    per_pos[sym] = {
+                        "last": float(row.get("nominal_price") or 0),
+                        "pl_val": float(row.get("pl_val", 0) or 0),
+                        "pl_ratio": float(row.get("pl_ratio", 0) or 0),
+                    }
+            state = risk_manager._load_state()
+            realized_total = float(state.get("realized_pnl_total", 0.0))
+            snap = {
+                "ts": clock.ny_now().isoformat(),
+                "cash": cash,
+                "positions_count": len(real_held),
+                "invested": invested,
+                "budget": settings.account_usd,
+                "budget_used_pct": round(invested / settings.account_usd * 100, 1) if settings.account_usd else 0,
+                "unrealized_pnl": unrealized,
+                "realized_pnl_total": realized_total,
+                "total_pnl": unrealized + realized_total,
+                "symbols": symbols,
+                "ai_model": settings.gemini_model,
+                "scan_interval_min": settings.scan_interval_min,
+                "entry_threshold": settings.entry_threshold,
+                "max_hold_days": settings.max_hold_days,
+                "timeframe": settings.timeframe,
+                "trade_env": settings.moomoo_trade_env,
+                "vix": round(vix, 1),
+                "regime": regime.label,
+                "regime_note": regime.note,
+                "open_risk": round(portfolio.current_open_risk(), 2),
+                "heat_cap": round(settings.account_usd * portfolio.PORTFOLIO_HEAT_PCT, 2),
+                "trade_stats": portfolio.trade_stats(50),
+                "skip_gates": audit.gate_summary(200),
+                "last_scan_utc": clock.utc_now_corrected().isoformat(),
+                "ml_enabled": settings.ml_enabled,
+                "ml_available": ml_predict.is_available(),
+                "ml_blend_weight": settings.ml_blend_weight,
+                "ml_trained_at": ml_predict.model_meta().get("trained_at", ""),
+                "phase": "trade",
+                "clock": clock.status(),
+                "per_position": per_pos,
+                "realized_pnl_today": float(state.get("realized_pnl_today", 0.0)),
+            }
+            (settings.root / "data" / "account.json").write_text(
+                json.dumps(snap, indent=2, default=str)
+            )
+            history.append({
+                "invested": round(invested, 2),
+                "budget": settings.account_usd,
+                "unrealized_pnl": round(unrealized, 2),
+                "realized_pnl_total": round(realized_total, 2),
+                "total_pnl": round(unrealized + realized_total, 2),
+                "positions_count": len(real_held),
+                "symbols": symbols,
+                "timeframe": settings.timeframe,
+            })
+        except Exception as e:
+            log.warning("snapshot/history write failed: %s", e)
+
+        # 4. Score candidates with TWO strategies (trend + mean-revert) in parallel.
+        # For each ticker, keep the higher-scoring signal — they're complementary
+        # and rarely both fire (trend wants ADX↑, MR wants ADX↓).
+        ranked: list[indicators.Signal] = []
+        ml_scores: dict[str, float] = {}     # symbol → ML proba (0-1)
+        ml_active = settings.ml_enabled and ml_predict.is_available()
+        if ml_active:
+            log.info("ML model active (trained %s)",
+                     ml_predict.model_meta().get("trained_at", "?"))
+        # Marginal-setup buffer: anything within 10 pts BELOW threshold also
+        # enters the funnel, but gets half-conviction (smaller position).
+        # Without this buffer the bot scores ~60 for most US large-caps and
+        # NEVER hits 70+, so top_5 = [] every scan → zero trades. This zone
+        # is the same idea as the ML "neutral" band — try it, but small.
+        threshold_floor = settings.entry_threshold - 10
+        # Refresh the blacklist before this scan's symbol loop. Cheap (file read).
+        _bl_active = blacklist.get_blacklist()
+        for sym in tickers:
+            # Adaptive blacklist — skip symbols flagged as recent net losers.
+            if sym in _bl_active:
+                audit.record("skip", symbol=sym, gate="blacklist",
+                             reason=_bl_active[sym].reason)
+                continue
+            try:
+                df = c.get_kline(sym, bars=120)
+                # Look-ahead audit — never score on a still-forming intraday bar.
+                df = _drop_forming_bar(df, settings.timeframe)
+                # Independent strategies: each can submit if its own score
+                # clears the floor.
+                sig_trend = indicators.evaluate(sym, df)
+                sig_mr = strategy_mr.evaluate(sym, df)
+                if sig_trend.score >= threshold_floor:
+                    ranked.append(sig_trend)
+                if sig_mr.score >= threshold_floor:
+                    ranked.append(sig_mr)
+                if ml_active:
+                    proba = ml_predict.predict_proba(df)
+                    if proba is not None:
+                        ml_scores[sym] = proba
+            except Exception as e:
+                log.warning("scoring %s failed: %s", sym, e)
+
+        ranked.sort(key=lambda s: s.score, reverse=True)
+        log.info("top 5: %s", [(s.symbol, s.score) for s in ranked[:5]])
+
+        # (Regime / halt / drawdown kill switches already evaluated above
+        # via kill_switch.evaluate() — by this point we're cleared to trade.)
+
+        # 5. Candidate funnel — 3-layer decision architecture:
+        #    Rule score (0-100)   → ranking + initial pass (≥ entry_threshold)
+        #    ML proba   (0-1)     → conviction multiplier (veto if too low)
+        #    AI verdict (pass/veto) → independent veto (no score blend!)
+        #
+        # No more "final_score" — each layer answers its own question:
+        #   • Rule:  "is this a textbook technical setup?"          → rank + filter
+        #   • ML:    "did similar setups historically work out?"    → size
+        #   • AI:    "is there fresh news that contradicts this?"   → veto
+        #
+        # AI budget: Gemini 2.5-flash free tier is 50 RPM / 1500 RPD. With 12
+        # scans/day (trade-phase only) × budget=5 = 60 calls/day → well under
+        # quota. Previous budget=2 was leaving most candidates unchecked.
+        ai_budget = 5
+        for sig in ranked:
+            # Ranked is sorted desc by score; stop once we drop below the floor.
+            if sig.score < threshold_floor:
+                break
+
+            # "Marginal" = rule score in [threshold-10, threshold). These setups
+            # still enter the funnel but get sized down via conviction.
+            marginal_setup = sig.score < settings.entry_threshold
+            setup_conviction = 0.5 if marginal_setup else 1.0
+
+            def _skip(gate: str, reason: str, _sig=sig) -> None:
+                log.info("Skip %s [%s]: %s", _sig.symbol, gate, reason)
+                audit.record("skip", symbol=_sig.symbol, gate=gate,
+                             reason=reason, score=_sig.score)
+
+            # --- Context fetches (daily df for MTF/gap, ML proba already cached) ---
+            df_d = None
+            try:
+                df_d = c.get_kline(sig.symbol, bars=60, ktype=KLType.K_DAY)
+            except Exception as e:
+                log.warning("daily fetch failed %s: %s — skipping MTF/gap", sig.symbol, e)
+
+            if df_d is not None:
+                if settings.timeframe == "HOUR_1":
+                    daily_ok, daily_reason = indicators.daily_trend_bullish(df_d)
+                    if not daily_ok:
+                        _skip("mtf", daily_reason)
+                        continue
+                gap_ok, gap_reason = indicators.check_gap(df_d, max_gap_pct=settings.max_gap_pct)
+                if not gap_ok:
+                    _skip("gap", gap_reason)
+                    continue
+
+            # --- Sector / earnings / spread (cheap context veto) ---
+            sector_ok, sector_reason = check_sector_exposure(
+                sig.symbol, positions, pending_symbols
+            )
+            if not sector_ok:
+                _skip("sector", sector_reason)
+                continue
+
+            ern_blocked, ern_reason = earnings_block(sig.symbol)
+            if ern_blocked:
+                _skip("earnings", ern_reason)
+                continue
+
+            try:
+                spread_pct = c.get_spread_pct(sig.symbol)
+                if spread_pct > SPREAD_MAX_PCT:
+                    _skip("spread", f"bid-ask {spread_pct:.2f}% > {SPREAD_MAX_PCT}%")
+                    continue
+            except Exception:
+                pass
+
+            # --- Layer 2: ML proba → conviction (NOT score blend) ---
+            ml_proba = ml_scores.get(sig.symbol)
+            ml_conviction = 1.0
+            ml_tag = ""
+            if ml_active and ml_proba is not None:
+                ml_tag = f" ml={ml_proba:.2f}"
+                if ml_proba < ml_predict.ML_VETO_THRESHOLD:
+                    _skip("ml_veto", f"ML proba {ml_proba:.2f} < {ml_predict.ML_VETO_THRESHOLD}")
+                    continue
+                # Neutral zone (0.35-0.55) → half size; high conviction → full size
+                ml_conviction = 0.5 if ml_proba < ml_predict.ML_BOOST_THRESHOLD else 1.0
+
+            # Compose: setup quality × ML confidence. Both bands can independently
+            # halve the size — marginal-rule + neutral-ML = 0.25 quartersize.
+            conviction = setup_conviction * ml_conviction
+
+            # --- Layer 3: AI verdict (Gemini + Tavily news, independent veto) ---
+            if ai_budget <= 0:
+                ai_pass, ai_score, ai_reason = True, 50, "AI budget exhausted — neutral"
+            else:
+                ai_pass, ai_score, ai_reason = ai_validator.validate(sig)
+                ai_budget -= 1
+            log.info("%s rule=%.1f%s ai=%s conviction=%.2f (%s)",
+                     sig.symbol, sig.score, ml_tag,
+                     "pass" if ai_pass else "veto", conviction, ai_reason)
+            if not ai_pass:
+                _skip("ai_veto", ai_reason)
+                continue
+
+            # --- Risk / heat / sizing (all factor in conviction) ---
+            ok, reason = risk_manager.can_open_new(
+                sig, positions, cash, pending_value, pending_symbols,
+                vix=vix, conviction=conviction,
+            )
+            if not ok:
+                _skip("risk", reason)
+                notifier.send(notifier.skip_msg(sig.symbol, reason))
+                continue
+
+            qty = risk_manager.calc_position_size(sig, vix=vix, conviction=conviction)
+
+            heat_ok, heat_reason = portfolio.heat_check(sig, qty)
+            if not heat_ok:
+                _skip("heat", heat_reason)
+                notifier.send(notifier.skip_msg(sig.symbol, heat_reason))
+                continue
+
+            try:
+                executor.open_position(c, sig, qty, ml_proba=ml_proba)
+                audit.record("buy", symbol=sig.symbol, score=sig.score,
+                             reason=ai_reason,
+                             extra={"qty": qty, "price": sig.price,
+                                    "stop": sig.stop_loss, "tp": sig.take_profit,
+                                    "vix": vix, "regime": regime.label,
+                                    "ml_proba": round(ml_proba, 3) if ml_proba is not None else None,
+                                    "conviction": conviction,
+                                    "setup_quality": "marginal" if marginal_setup else "full",
+                                    "strategy": getattr(sig, "strategy", "trend")})
+                notifier.send(notifier.signal_msg(sig, ai_reason, qty))
+                cash -= qty * sig.price
+                pending_value += qty * sig.price
+                pending_symbols.add(sig.symbol)
+            except Exception as e:
+                log.exception("open_position failed for %s: %s", sig.symbol, e)
+                audit.record("error", symbol=sig.symbol, reason=str(e))
+                notifier.send(notifier.skip_msg(sig.symbol, f"exec error: {e}"))
+
+    audit.record("scan_end")
+    log.info("=== scan end ===")
+
+
+def in_market_hours() -> bool:
+    now = clock.ny_now()
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= minutes <= 16 * 60
+
+
+def _monthly_retrain_job() -> None:
+    """Background ML retrain — runs 1st of each month at 02:00 ET.
+    Uses current watchlist + 365 days. Skips on data fetch failure."""
+    log.info("monthly retrain: starting")
+    try:
+        import json
+        from .ml.train import _fetch_history, train_model, save_model
+        from .ml.dataset import LabelConfig
+        tickers = json.loads(WATCHLIST_FILE.read_text())["tickers"]
+        klines = _fetch_history(tickers, days=365, timeframe=settings.timeframe)
+        if not klines:
+            log.warning("monthly retrain aborted: no data fetched")
+            return
+        model, metrics = train_model(klines, LabelConfig())
+        save_model(model, metrics)
+        notifier.send(f"🧠 *ML retrained* AUC={metrics['auc_holdout']:.3f}  "
+                      f"acc={metrics['accuracy_holdout']*100:.1f}%  "
+                      f"({metrics['n_rows_total']:,} rows)")
+        log.info("monthly retrain: done")
+        cron_state.record_run("ml_retrain")
+    except Exception as e:
+        log.exception("monthly retrain failed: %s", e)
+        notifier.send(f"⚠ ML monthly retrain failed: {e}")
+
+
+def _weekly_backtest_validation_job() -> None:
+    """Sunday 22:30 ET — runs a 90-day backtest under current .env settings.
+
+    Purpose: continuous health-check. If the strategy starts degrading (rule
+    changes in the market, watchlist drift, etc.) the Sortino on a rolling
+    90-day window will fall before live results do, giving early warning.
+
+    Result is logged + a one-line summary is sent to Telegram. Does NOT
+    interrupt or modify the live trading loop — purely diagnostic.
+    """
+    log.info("weekly backtest validation: starting")
+    try:
+        from .backtest import BacktestConfig, run_backtest
+        cfg = BacktestConfig(
+            days=90,
+            timeframe=settings.timeframe,
+            threshold=settings.entry_threshold,
+            account_usd=settings.account_usd,
+            risk_per_trade=settings.risk_per_trade,
+            max_position_pct=settings.max_position_pct,
+            max_hold_days=settings.max_hold_days,
+            tp_atr_mult=settings.tp_atr_mult,
+            sl_atr_mult=settings.sl_atr_mult,
+            max_gap_pct=settings.max_gap_pct,
+        )
+        result = run_backtest(cfg)
+        m = result.get("metrics", {})
+        mc = m.get("monte_carlo", {})
+        prob_str = (f"{mc['prob_profitable_pct']}%"
+                    if "prob_profitable_pct" in mc else "—")
+        notifier.send(
+            f"📊 *Weekly backtest* ({cfg.timeframe}, {cfg.days}d)\n"
+            f"  Trades:     {m.get('total_trades', 0)}\n"
+            f"  Win rate:   {m.get('win_rate_pct', 0)}%\n"
+            f"  Sortino:    {m.get('sortino_ratio', 0)}\n"
+            f"  Profit factor: {m.get('profit_factor', 0)}\n"
+            f"  Net PnL:    ${m.get('net_pnl_usd', 0):+.2f}  "
+            f"({m.get('total_return_pct', 0):+.1f}%)\n"
+            f"  Max DD:     {m.get('max_drawdown_pct', 0):.1f}%\n"
+            f"  P(profit):  {prob_str}"
+        )
+        log.info("weekly backtest done: trades=%d sortino=%s",
+                 m.get("total_trades", 0), m.get("sortino_ratio", 0))
+        cron_state.record_run("weekly_backtest")
+    except Exception as e:
+        log.exception("weekly backtest failed: %s", e)
+        notifier.send(f"⚠ Weekly backtest failed: {e}")
+
+
+def _monthly_optuna_job() -> None:
+    """1st of each month 03:00 ET — runs a 30-trial Optuna walk-forward study.
+
+    Best params are saved to `data/optimizer/*.json` and a summary is sent
+    to Telegram. Does **NOT** auto-update `.env` — the user reviews and
+    decides whether to apply. This is intentional: blindly chasing the latest
+    Optuna winner is overfitting to last month's regime.
+    """
+    log.info("monthly Optuna optimization: starting")
+    try:
+        from .optimizer import run_study
+        summary = run_study(
+            n_trials=30,
+            days=60,
+            n_folds=3,
+            min_trades=30,
+            timeframe=settings.timeframe,
+            fast_mode=True,
+        )
+        bp = summary.get("best_params", {})
+        attrs = summary.get("best_user_attrs", {})
+        msg = (
+            f"🧪 *Monthly Optuna* ({summary['base_config']['timeframe']}, "
+            f"{summary['base_config']['days']}d, {summary['n_trials']} trials)\n"
+            f"  Best Sortino: {summary.get('best_value_sortino', '?')}\n"
+            f"  n_trades:     {attrs.get('n_trades', '?')}\n"
+            f"  worst-fold:   {attrs.get('sortino_min', '?')}\n"
+            f"\n*Suggested params* (review before applying):\n"
+            f"  threshold     = {bp.get('threshold', '?')}\n"
+            f"  tp_atr_mult   = {bp.get('tp_atr_mult', '?')}\n"
+            f"  sl_atr_mult   = {bp.get('sl_atr_mult', '?')}\n"
+            f"  max_gap_pct   = {bp.get('max_gap_pct', '?')}\n"
+            f"  base_slip_bp  = {bp.get('base_slip_bp', '?')}\n"
+            f"\n*Live .env now*: thr={settings.entry_threshold}, "
+            f"tp={settings.tp_atr_mult}, sl={settings.sl_atr_mult}, "
+            f"gap={settings.max_gap_pct}"
+        )
+        notifier.send(msg)
+        log.info("monthly Optuna done: best_sortino=%s params=%s",
+                 summary.get("best_value_sortino"), bp)
+        cron_state.record_run("monthly_optuna")
+    except Exception as e:
+        log.exception("monthly Optuna failed: %s", e)
+        notifier.send(f"⚠ Monthly Optuna failed: {e}")
+
+
+def _daily_blacklist_review_job() -> None:
+    """Daily 23:00 ET — adaptive blacklist evaluation.
+
+    Adds new chronic losers, removes recovered names, extends review periods
+    for symbols that are still bad. Telegram summary fires only when anything
+    changed (no spam on quiet days).
+    """
+    log.info("daily blacklist review: starting")
+    try:
+        summary = blacklist.evaluate_all(notifier_send=notifier.send)
+        log.info("blacklist review done: %s", summary)
+        cron_state.record_run("daily_blacklist")
+    except Exception as e:
+        log.exception("blacklist review failed: %s", e)
+
+
+def _weekly_watchlist_refresh_job() -> None:
+    """Sunday 22:00 ET — rebuild watchlist from S&P 500 via yfinance.
+    The scheduler will read the new file on its next scan automatically.
+    """
+    log.info("weekly watchlist refresh: starting")
+    try:
+        tickers = watchlist_updater.refresh()
+        notifier.send(
+            f"📋 Watchlist refreshed: {len(tickers)} tickers\n"
+            + ", ".join(tickers[:15])
+            + (f" ... (+{len(tickers)-15})" if len(tickers) > 15 else "")
+        )
+        log.info("weekly watchlist refresh: done (%d tickers)", len(tickers))
+        cron_state.record_run("watchlist_refresh")
+    except Exception as e:
+        log.exception("weekly watchlist refresh failed: %s", e)
+        notifier.send(f"⚠ Watchlist refresh failed: {e}")
+
+
+def _run_catchup_on_startup() -> None:
+    """Detect and run any scheduled jobs that were missed while the laptop was off.
+
+    Compares each known job's persisted `last_run` to its most-recent expected
+    fire time. If `last_run < expected`, we fire the job ONCE (no backlog
+    flooding — one catchup per missed cycle is enough).
+
+    On a first-ever boot we seed the state with NOW so we don't run every
+    job at once. Sends a Telegram summary so the user knows what fired.
+    """
+    # Seed empty state — fresh installs don't fire anything.
+    is_first_boot = cron_state.initialize_if_empty()
+    if is_first_boot:
+        log.info("catchup: first boot detected — cron_state seeded, no catchup needed")
+        return
+
+    # Map each known job → (expected_last_fire, runner_function, label).
+    plan = [
+        ("daily_blacklist",
+         cron_state.expected_last_fire_daily(23, 0, weekdays_only=True),
+         _daily_blacklist_review_job, "Daily blacklist review"),
+        ("watchlist_refresh",
+         cron_state.expected_last_fire_weekly(6, 22, 0),   # Sunday 22:00
+         _weekly_watchlist_refresh_job, "Weekly watchlist refresh"),
+        ("weekly_backtest",
+         cron_state.expected_last_fire_weekly(6, 22, 30),  # Sunday 22:30
+         _weekly_backtest_validation_job, "Weekly backtest"),
+        ("ml_retrain",
+         cron_state.expected_last_fire_monthly(1, 2, 0),
+         _monthly_retrain_job, "Monthly ML retrain"),
+        ("monthly_optuna",
+         cron_state.expected_last_fire_monthly(1, 3, 0),
+         _monthly_optuna_job, "Monthly Optuna optimization"),
+    ]
+
+    missed = [(name, fn, label) for name, exp, fn, label in plan
+              if cron_state.needs_catchup(name, exp)]
+
+    if not missed:
+        log.info("catchup: no missed jobs — all schedules up to date")
+        return
+
+    labels = [label for _, _, label in missed]
+    log.info("catchup: %d missed job(s) → %s", len(missed), labels)
+    try:
+        notifier.send("🔄 *Catching up missed scheduled jobs*\n  "
+                      + "\n  ".join(f"• {label}" for label in labels)
+                      + "\n  (laptop was off when these were due)")
+    except Exception as e:
+        log.warning("catchup: notifier failed: %s", e)
+
+    for name, fn, label in missed:
+        log.info("catchup: running %s (%s)", label, name)
+        try:
+            fn()
+        except Exception as e:
+            log.exception("catchup: %s failed: %s", label, e)
+            try:
+                notifier.send(f"⚠ Catchup '{label}' failed: {e}")
+            except Exception:
+                pass
+
+    try:
+        notifier.send(f"✓ Catchup complete — ran {len(missed)} missed job(s)")
+    except Exception:
+        pass
+
+
+def run_loop() -> None:
+    # Detect missed scheduled jobs and run them once before the normal loop
+    # takes over. Synchronous on purpose — a quick Telegram lets the user
+    # know what's happening; long jobs (Optuna ~10 min) just delay the first
+    # market scan, which is fine.
+    _run_catchup_on_startup()
+
+    sched = BlockingScheduler(timezone=NY)
+
+    def job():
+        if in_market_hours():
+            scan_once()
+        else:
+            log.info("outside market hours, skipping")
+
+    # Misfire policy:
+    #   • coalesce=True       → if N runs were missed (laptop slept etc), only fire ONCE
+    #   • misfire_grace_time  → drop runs more than this many seconds late
+    #   • max_instances=1     → never let two scans overlap (prevents API rate-limit blowups)
+    sched.add_job(
+        job, "interval",
+        minutes=settings.scan_interval_min,
+        next_run_time=clock.ny_now(),
+        coalesce=True,
+        misfire_grace_time=60,
+        max_instances=1,
+    )
+    # Monthly ML retrain: 1st of each month at 02:00 ET (after data settles).
+    sched.add_job(_monthly_retrain_job, "cron", day=1, hour=2, minute=0,
+                  coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # Weekly watchlist refresh: Sunday 22:00 ET — picks up board rotation
+    # before the new trading week starts.
+    sched.add_job(_weekly_watchlist_refresh_job, "cron",
+                  day_of_week="sun", hour=22, minute=0,
+                  coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # Weekly backtest validation: Sunday 22:30 ET — health-check the strategy
+    # on a rolling 90-day window. Runs AFTER watchlist refresh so we evaluate
+    # on the fresh ticker set.
+    sched.add_job(_weekly_backtest_validation_job, "cron",
+                  day_of_week="sun", hour=22, minute=30,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
+
+    # Monthly Optuna re-optimization: 1st of each month at 03:00 ET. Runs
+    # AFTER the ML retrain at 02:00 so the search uses the freshest model.
+    # Telegrams suggested params; user reviews before editing .env.
+    sched.add_job(_monthly_optuna_job, "cron", day=1, hour=3, minute=0,
+                  coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # Daily blacklist review: 23:00 ET every weekday. Reads recent closed
+    # trades, adds chronic losers, removes recovered names, extends watch on
+    # symbols still in the doghouse. Notifies via Telegram only on changes.
+    sched.add_job(_daily_blacklist_review_job, "cron",
+                  day_of_week="mon-fri", hour=23, minute=0,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
+
+    log.info(
+        "scheduler started — scan=%dm, ML retrain=1st@02:00, "
+        "watchlist refresh=Sun 22:00, weekly backtest=Sun 22:30, "
+        "monthly Optuna=1st@03:00, daily blacklist=23:00 ET",
+        settings.scan_interval_min,
+    )
+    from .i18n import t
+    notifier.send(t("tg_started", env=settings.moomoo_trade_env))
+    sched.start()
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    cmd = sys.argv[1]
+    if cmd == "scan":
+        scan_once()
+    elif cmd == "run":
+        run_loop()
+    else:
+        print(f"unknown command: {cmd}")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

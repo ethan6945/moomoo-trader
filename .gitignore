@@ -1,0 +1,55 @@
+# ============== Secrets — NEVER commit these ==============
+.env
+.env.local
+*.pem
+*.key
+
+# ============== Runtime / generated data ==============
+# Live trade history, balances, open positions, audit logs.
+# Everything in data/ is per-machine state; keep template only.
+data/*
+!data/.gitkeep
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+
+# Backups
+*.bak
+
+# ============== Python ==============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+env/
+ENV/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ============== macOS / IDE ==============
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============== Optional: keep config templates in repo ==============
+# (config/watchlist.json IS tracked — auto-refreshes weekly)
+config/watchlist.json.bak
+
+# ============== Compiled / temp ==============
+*.tmp
+*.temp
