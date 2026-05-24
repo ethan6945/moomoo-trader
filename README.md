@@ -97,32 +97,6 @@
 
 ---
 
-## 私人数据 vs 公开代码
-
-> **重要：每个人的账户、密钥、交易记录都是私人的，绝对不会进 GitHub。**
-
-仓库**只包含代码 + 模板**。所有跟你账户相关的东西都本地存档，每个人安装后自己生成。
-
-| 类型 | 内容 | 在哪里 | 是否进 GitHub |
-|------|------|--------|--------------|
-| 🔓 公开代码 | `src/*.py`, `gui.py` | 仓库 | ✅ 是 |
-| 🔓 配置模板 | `.env.example`, `requirements.txt` | 仓库 | ✅ 是 |
-| 🔓 默认 watchlist | `config/watchlist.json` | 仓库 | ✅ 是（自动周更）|
-| 🔒 **API 密钥** | `.env` (MOOMOO_TRADE_PWD / GEMINI / TAVILY / TELEGRAM) | 本地 | ❌ **绝对不会** |
-| 🔒 **交易历史** | `data/trades.jsonl`, `data/audit.jsonl` | 本地 | ❌ 不会 |
-| 🔒 **账户状态** | `data/account.json`, `data/state.json`, `data/open_trades.json` | 本地 | ❌ 不会 |
-| 🔒 **SQLite 数据库** | `data/trader.db` | 本地 | ❌ 不会 |
-| 🔒 **黑名单** | `data/blacklist.json` | 本地 | ❌ 不会 |
-| 🔒 **ML 模型** | `data/ml/*.joblib` | 本地 | ❌ 不会 |
-| 🔒 **Optuna 结果** | `data/optimizer/*.json` | 本地 | ❌ 不会 |
-| 🔒 **日志** | `logs/*.log`, `logs/scheduler.pid` | 本地 | ❌ 不会 |
-
-**`.gitignore` 已经设置好这些规则**，你正常 `git push` 不会泄密。
-
-**别人 clone 你的仓库后**：他们看到 `.env.example` 但不是你的 `.env`；他们看到空的 `data/` 但不是你的交易历史。他们填自己的密钥、跑自己的交易，互不影响。
-
----
-
 ## 快速上手
 
 ### Step 0. 本地必备依赖（每个人安装一次）
