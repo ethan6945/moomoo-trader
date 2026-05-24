@@ -1409,6 +1409,14 @@ class MLWindow(tk.Toplevel):
                   font=("SF Pro", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 0))
         self.fi_canvas = tk.Canvas(tab_ov, bg="white", height=380)
         self.fi_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        # Cache the last feature_importance dict so the canvas can redraw
+        # itself on window resize (otherwise bars vanish when user enlarges
+        # the window after first paint).
+        self._fi_data: dict = {}
+        self.fi_canvas.bind(
+            "<Configure>",
+            lambda _e: self._draw_feature_importance(self._fi_data),
+        )
 
         # Tab 2: Calibration (predicted proba vs actual outcome)
         tab_cal = ttk.Frame(nb)
@@ -1510,13 +1518,27 @@ class MLWindow(tk.Toplevel):
         self.txt_metrics.configure(state="disabled")
 
     def _draw_feature_importance(self, fi: dict) -> None:
+        """Draw the top-20 feature-importance horizontal bar chart.
+
+        Cache `fi` so the bound <Configure> event can redraw with the new
+        size. Use `update_idletasks()` to force a layout pass before reading
+        winfo_width — otherwise the canvas reports width=1 on first paint
+        and bars get drawn with negative width (invisible).
+        """
+        self._fi_data = fi or {}
         self.fi_canvas.delete("all")
-        items = list(fi.items())[:20]
+        items = list(self._fi_data.items())[:20]
         if not items:
             return
+        self.fi_canvas.update_idletasks()   # force layout — fixes width=1 bug
+        w = self.fi_canvas.winfo_width()
+        if w < 300:
+            # Canvas not laid out yet OR window is tiny — use a sane default
+            # so bars are still visible. The <Configure> binding will redraw
+            # at the real size as soon as the layout settles.
+            w = 740
         max_imp = max(v for _, v in items) or 1
-        w = self.fi_canvas.winfo_width() or 740
-        bar_w = w - 200
+        bar_w = max(50, w - 200)            # never go negative
         y = 8
         for name, imp in items:
             self.fi_canvas.create_text(5, y + 8, anchor="w", text=name,
