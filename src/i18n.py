@@ -61,7 +61,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "ago": "ago",
 
         # --- Budget section ---
-        "budget_section": "Budget (cap from .env ACCOUNT_USD)",
+        "budget_section": "Budget & Performance",
+        "budget_label_total": "Total Budget (click to edit)",
+        "budget_label_deployed": "Deployed",
+        "budget_label_today_pnl": "Today's P&L",
+        "budget_label_total_pnl": "Total P&L",
         "budget_template": "${invested:,.0f} / ${budget:,.0f}  ({pct:.1f}% used)",
         "pnl_template": "PnL: ${total:+,.2f}  (unreal ${unreal:+,.2f} | real ${realiz:+,.2f})",
         "today_pnl": "today {today:+,.2f}",
@@ -209,7 +213,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "regime_none": "市场状态: —",
         "ago": "前",
 
-        "budget_section": "预算 (来自 .env 的 ACCOUNT_USD)",
+        "budget_section": "预算 & 盈亏",
+        "budget_label_total": "总预算（点击修改）",
+        "budget_label_deployed": "已部署",
+        "budget_label_today_pnl": "今日盈亏",
+        "budget_label_total_pnl": "累计盈亏",
         "budget_template": "${invested:,.0f} / ${budget:,.0f}  (已用 {pct:.1f}%)",
         "pnl_template": "盈亏: ${total:+,.2f}  (浮动 ${unreal:+,.2f} | 已结 ${realiz:+,.2f})",
         "today_pnl": "今日 {today:+,.2f}",

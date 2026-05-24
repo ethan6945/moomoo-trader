@@ -100,16 +100,107 @@ def read_json(path: Path) -> dict:
 
 
 class App(tk.Tk):
+    # ------- Colour palette (one place to tune the whole look) -------
+    COLORS = {
+        "bg":          "#f5f6f8",   # window background
+        "card_bg":     "#ffffff",   # card / labelframe inside
+        "border":      "#d8dde3",
+        "primary":     "#1f6feb",
+        "primary_dk":  "#1858c4",
+        "success":     "#28a745",
+        "success_bg":  "#e8f5e9",
+        "danger":      "#d73a49",
+        "danger_bg":   "#fdecea",
+        "warning":     "#e0a73c",
+        "muted":       "#6a737d",
+        "text":        "#24292e",
+        "text_strong": "#0d1117",
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self.title(_t("app_title"))
         # Sized for 13" MacBook (1280×800 logical) — fits with menu bar + dock.
-        # Compact 2-row controls + 2-row strategy so nothing wraps off-screen.
-        self.geometry("1180x720")
+        self.geometry("1200x740")
         self.minsize(1024, 640)
+        self.configure(bg=self.COLORS["bg"])
+        self._setup_theme()
         self._build_menu()
         self._build()
         self._refresh()
+
+    # ---------- visual theme ----------
+    def _setup_theme(self) -> None:
+        """Configure ttk Style once so widgets look consistent.
+
+        Defines named styles used in `_build` — change a colour here and the
+        whole UI follows. Uses 'clam' on non-macOS for greater control;
+        on macOS we keep 'aqua' as the base since native widgets look better,
+        but override font/padding for everything we care about.
+        """
+        style = ttk.Style()
+        # 'aqua' is macOS-native — we keep it and just layer styles on top.
+        # On Linux/Windows 'clam' gives us the most-customisable look.
+        if style.theme_use() not in ("aqua",):
+            try:
+                style.theme_use("clam")
+            except tk.TclError:
+                pass
+
+        c = self.COLORS
+
+        # Labelframe header text
+        style.configure("Section.TLabelframe",
+                        background=c["bg"], padding=6)
+        style.configure("Section.TLabelframe.Label",
+                        background=c["bg"], font=("SF Pro", 11, "bold"),
+                        foreground=c["muted"])
+
+        # Plain label variants
+        style.configure("Muted.TLabel",
+                        background=c["bg"], foreground=c["muted"],
+                        font=("SF Pro", 10))
+        style.configure("Stat.TLabel",
+                        background=c["bg"], foreground=c["text"],
+                        font=("Menlo", 11))
+        style.configure("StatBold.TLabel",
+                        background=c["bg"], foreground=c["text_strong"],
+                        font=("Menlo", 11, "bold"))
+        style.configure("Money.TLabel",
+                        background=c["bg"], foreground=c["text_strong"],
+                        font=("SF Pro", 22, "bold"))
+        style.configure("MoneyMid.TLabel",
+                        background=c["bg"], foreground=c["text"],
+                        font=("Menlo", 13, "bold"))
+        style.configure("Win.TLabel",
+                        background=c["bg"], foreground=c["success"],
+                        font=("Menlo", 13, "bold"))
+        style.configure("Loss.TLabel",
+                        background=c["bg"], foreground=c["danger"],
+                        font=("Menlo", 13, "bold"))
+
+        # Pretty buttons: a bit more padding, larger font.
+        style.configure("TButton", padding=(10, 6), font=("SF Pro", 11))
+        style.configure("Primary.TButton", padding=(12, 7),
+                        font=("SF Pro", 11, "bold"))
+        # ✎ tiny icon button next to the budget
+        style.configure("Icon.TButton", padding=(4, 2), font=("SF Pro", 11))
+
+        # Progressbar — thicker
+        style.configure("Budget.Horizontal.TProgressbar",
+                        thickness=14, troughcolor="#e9ecef",
+                        background=c["primary"])
+
+        # Treeview row striping (positions table)
+        style.configure("Treeview",
+                        font=("Menlo", 11),
+                        rowheight=24,
+                        background=c["card_bg"],
+                        fieldbackground=c["card_bg"])
+        style.configure("Treeview.Heading",
+                        font=("SF Pro", 11, "bold"),
+                        background="#eef1f4",
+                        foreground=c["text"])
 
     # ---------- menu bar ----------
     def _build_menu(self) -> None:
@@ -131,6 +222,67 @@ class App(tk.Tk):
                             _t("lang_switched_body"),
                             parent=self)
 
+    # ---------- editable budget ----------
+    def _edit_budget(self) -> None:
+        """Edit ACCOUNT_USD live without leaving the GUI.
+
+        Rewrites the matching line in `.env` so the change survives restarts.
+        The running scheduler subprocess won't pick it up until restart —
+        the toast reminds the user.
+        """
+        from src.config import settings as _settings
+        current = float(_settings.account_usd)
+        new_val = _prompt_float(
+            self, "Edit Budget",
+            f"New ACCOUNT_USD (currently ${current:,.2f}):\n\n"
+            f"This is the total capital the bot may deploy.\n"
+            f"Bot will never invest more than this, even if your\n"
+            f"broker cash is higher.\n\n"
+            f"Increase when you add funds; decrease to derisk.",
+            current,
+        )
+        if new_val is None or new_val <= 0:
+            return
+        new_val = round(new_val, 2)
+        if abs(new_val - current) < 1:
+            return  # no real change
+
+        env_path = ROOT / ".env"
+        if not env_path.exists():
+            self._toast("⚠ .env not found — cannot save")
+            return
+
+        # Rewrite the matching line in-place, keeping any inline comment.
+        original = env_path.read_text()
+        lines = original.splitlines()
+        found = False
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            if stripped.startswith("ACCOUNT_USD=") or stripped.startswith("#ACCOUNT_USD="):
+                comment = ""
+                if "#" in line:
+                    # Preserve any trailing comment so we don't lose context.
+                    hash_idx = line.index("#")
+                    # Only preserve comments AFTER the value (not commented-out lines)
+                    if hash_idx > line.find("="):
+                        comment = "  " + line[hash_idx:]
+                lines[i] = f"ACCOUNT_USD={new_val:.0f}{comment}"
+                found = True
+                break
+        if not found:
+            lines.append(f"ACCOUNT_USD={new_val:.0f}")
+        env_path.write_text("\n".join(lines) + "\n")
+
+        scheduler_running = read_pid() is not None
+        msg = (f"💰 Budget updated to ${new_val:,.0f}\n"
+               + ("⚠ Restart scheduler for it to take effect"
+                  if scheduler_running
+                  else "✓ Will apply on next scheduler start"))
+        self._toast(msg)
+        # Refresh display — the snapshot file still shows old value until
+        # next scan writes, so just update the on-screen number now.
+        self.after(50, self._refresh)
+
     # ---------- layout ----------
     def _build(self) -> None:
         pad = {"padx": 6, "pady": 3}
@@ -151,15 +303,56 @@ class App(tk.Tk):
                                 self.lbl_regime]):
             w.grid(row=0, column=i, padx=8, pady=6, sticky="w")
 
-        # Budget row — most important number for the user
-        bud = ttk.LabelFrame(self, text=_t("budget_section"))
-        bud.pack(fill="x", **pad)
-        self.lbl_budget = ttk.Label(bud, text="—", font=("SF Pro", 13, "bold"))
-        self.lbl_budget.grid(row=0, column=0, padx=10, pady=4, sticky="w")
-        self.bar = ttk.Progressbar(bud, mode="determinate", maximum=100, length=300)
-        self.bar.grid(row=0, column=1, padx=10, pady=4, sticky="w")
-        self.lbl_pnl = ttk.Label(bud, text="PnL: —", font=("SF Pro", 12))
-        self.lbl_pnl.grid(row=0, column=2, padx=20, pady=4, sticky="w")
+        # ─── Budget & Performance card — the most-glanced numbers ───
+        # Layout: 3 columns
+        #   [ BUDGET (editable) ] [ DEPLOYED + bar ] [ P&L today + total ]
+        bud = ttk.LabelFrame(self, text="  💰 " + _t("budget_section") + "  ",
+                              style="Section.TLabelframe")
+        bud.pack(fill="x", padx=10, pady=6)
+
+        # Column 0 — big editable budget number
+        col0 = ttk.Frame(bud)
+        col0.grid(row=0, column=0, padx=14, pady=8, sticky="w")
+        ttk.Label(col0, text=_t("budget_label_total"),
+                  style="Muted.TLabel").pack(anchor="w")
+        budget_row = ttk.Frame(col0)
+        budget_row.pack(anchor="w", pady=(2, 0))
+        self.lbl_budget = ttk.Label(budget_row, text="$—", style="Money.TLabel",
+                                     cursor="hand2")
+        self.lbl_budget.pack(side="left")
+        self.lbl_budget.bind("<Button-1>", lambda _: self._edit_budget())
+        ttk.Button(budget_row, text="✎", style="Icon.TButton", width=3,
+                   command=self._edit_budget).pack(side="left", padx=(8, 0))
+
+        # Column 1 — deployed + progress bar
+        col1 = ttk.Frame(bud)
+        col1.grid(row=0, column=1, padx=20, pady=8, sticky="ew")
+        ttk.Label(col1, text=_t("budget_label_deployed"),
+                  style="Muted.TLabel").pack(anchor="w")
+        self.lbl_invested = ttk.Label(col1, text="$— / $— (—%)",
+                                       style="MoneyMid.TLabel")
+        self.lbl_invested.pack(anchor="w", pady=(2, 4))
+        self.bar = ttk.Progressbar(col1, mode="determinate", maximum=100,
+                                    length=260,
+                                    style="Budget.Horizontal.TProgressbar")
+        self.bar.pack(anchor="w")
+
+        # Column 2 — today + total PnL
+        col2 = ttk.Frame(bud)
+        col2.grid(row=0, column=2, padx=20, pady=8, sticky="e")
+        # Today
+        ttk.Label(col2, text=_t("budget_label_today_pnl"),
+                  style="Muted.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 8))
+        self.lbl_pnl_today = ttk.Label(col2, text="—", style="Stat.TLabel")
+        self.lbl_pnl_today.grid(row=0, column=1, sticky="w")
+        # Total
+        ttk.Label(col2, text=_t("budget_label_total_pnl"),
+                  style="Muted.TLabel").grid(row=1, column=0, sticky="e",
+                                              padx=(0, 8), pady=(4, 0))
+        self.lbl_pnl = ttk.Label(col2, text="—", style="Stat.TLabel")
+        self.lbl_pnl.grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        bud.columnconfigure(1, weight=1)   # middle column stretches
 
         # Account row
         acct = ttk.LabelFrame(self, text=_t("account_section"))
@@ -522,26 +715,31 @@ class App(tk.Tk):
         state = read_json(STATE_FILE)
         account = read_json(ACCOUNT_FILE)
 
-        # Budget — the user's allocated capital cap
+        # ─── Budget card: big editable number + deployment bar + PnL ───
+        # Pull the most-recent budget from .env in case the user just edited
+        # it; account.json's `budget` field lags by one scan.
+        from src.config import settings as _live_settings
+        budget = _live_settings.account_usd or account.get("budget", 0) or 0
         invested = account.get("invested", 0)
-        budget = account.get("budget", 0)
-        used_pct = account.get("budget_used_pct", 0)
+        used_pct = (invested / budget * 100) if budget else 0
         self.bar["value"] = min(100, used_pct)
-        self.lbl_budget.configure(
-            text=_t("budget_template", invested=invested, budget=budget, pct=used_pct)
+        self.lbl_budget.configure(text=f"${budget:,.0f}")
+        self.lbl_invested.configure(
+            text=f"${invested:,.2f} / ${budget:,.0f}  ({used_pct:.1f}%)"
         )
+
+        # Today's PnL + total PnL — separately coloured.
         total = account.get("total_pnl", 0)
+        today = account.get("realized_pnl_today", 0)
         unreal = account.get("unrealized_pnl", 0)
         realiz = account.get("realized_pnl_total", 0)
-        today = account.get("realized_pnl_today", 0)
-        pnl_color = "#0a0" if total >= 0 else "#c00"
-        # Show today's realized PnL alongside the lifetime total — "did I make
-        # money today?" is the single most-asked question by a trader staring
-        # at the dashboard mid-session.
+        self.lbl_pnl_today.configure(
+            text=f"${today:+,.2f}",
+            style="Win.TLabel" if today >= 0 else "Loss.TLabel",
+        )
         self.lbl_pnl.configure(
-            text=(_t("pnl_template", total=total, unreal=unreal, realiz=realiz)
-                  + "  ·  " + _t("today_pnl", today=today)),
-            foreground=pnl_color,
+            text=f"${total:+,.2f}  (R ${realiz:+,.0f} · U ${unreal:+,.0f})",
+            style="Win.TLabel" if total >= 0 else "Loss.TLabel",
         )
 
         cash = account.get("cash") or state.get("starting_cash")
