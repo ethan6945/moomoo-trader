@@ -1321,18 +1321,74 @@ class WatchlistWindow(tk.Toplevel):
 # ---------- Sector heat-map ----------
 
 class SectorHeatmapWindow(tk.Toplevel):
+    """Card-grid heat-map of watchlist by sector.
+
+    Each sector is a card showing:
+      - sector name + usage indicator (e.g. "2/3") in coloured header
+      - a thin progress bar visualising sector heat
+      - the tickers in that sector, with a green dot + bold for held positions
+
+    The grid auto-flows into 1–4 columns based on window width, with rows
+    sized to the tallest card in each row so nothing overlaps. Content that
+    exceeds the visible area is scrollable; window resize re-draws.
+    """
+
+    # Layout constants (px)
+    PADDING = 12
+    CARD_GAP = 12
+    CARD_MIN_W = 210
+    HEADER_H = 42
+    LINE_H = 19
+    MAX_COLS = 4
+
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("Sector Heat-map")
-        self.geometry("760x480")
+        self.geometry("820x540")
         self._build()
 
     def _build(self) -> None:
-        ttk.Label(self, text="Watchlist tickers grouped by sector — exposure = held positions.",
-                  font=("SF Pro", 11)).pack(anchor="w", padx=12, pady=6)
-        self.canvas = tk.Canvas(self, bg="white")
-        self.canvas.pack(fill="both", expand=True, padx=10, pady=8)
+        ttk.Label(
+            self,
+            text="Watchlist by sector — green dot = held position, bar = sector exposure.",
+            font=("SF Pro", 11),
+        ).pack(anchor="w", padx=14, pady=(10, 4))
+
+        # Canvas + vertical scrollbar in a frame
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.canvas = tk.Canvas(frame, bg="#f6f7f9", highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Resize → redraw. Mouse wheel → scroll.
+        self.canvas.bind("<Configure>", lambda _e: self._draw())
+        # macOS sends fine-grained deltas; Windows sends ±120 multiples. The
+        # /120-or-1 fallback works for both.
+        self.canvas.bind(
+            "<MouseWheel>",
+            lambda e: self.canvas.yview_scroll(
+                int(-1 * (e.delta / 120 if abs(e.delta) >= 120 else e.delta)),
+                "units",
+            ),
+        )
         self.after(50, self._draw)
+
+    # ---------- drawing helpers ----------
+
+    @staticmethod
+    def _ratio_colors(ratio: float) -> tuple[str, str, str]:
+        """Returns (header_fill, border, bar_fill) tuned for green→yellow→red."""
+        if ratio == 0:
+            return "#e8f5e9", "#a5d6a7", "#4caf50"
+        if ratio < 0.7:
+            return "#e3f2fd", "#90caf9", "#2196f3"
+        if ratio < 1:
+            return "#fff3e0", "#ffcc80", "#ff9800"
+        return "#ffebee", "#ef9a9a", "#f44336"
 
     def _draw(self) -> None:
         from src.sector import SECTOR_MAP, MAX_PER_SECTOR
@@ -1342,37 +1398,119 @@ class SectorHeatmapWindow(tk.Toplevel):
         trades = read_json(OPEN_TRADES)
         held = set(trades.keys())
 
-        groups: dict = {}
+        # Group by sector → list of tickers
+        groups: dict[str, list[str]] = {}
         for sym in watchlist:
             sect = SECTOR_MAP.get(sym.upper(), "unknown")
             groups.setdefault(sect, []).append(sym)
 
+        # Sort: more-held sectors first, then larger ones
+        sorted_groups = sorted(
+            groups.items(),
+            key=lambda kv: (-len([s for s in kv[1] if s in held]), -len(kv[1])),
+        )
+        n = len(sorted_groups)
+        if n == 0:
+            return
+
         self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 740
-        col_w = max(140, w // max(1, len(groups)))
-        x = 10
-        for sect, syms in sorted(groups.items(), key=lambda x: -len(x[1])):
-            in_sector = [s for s in syms if s in held]
-            ratio = len(in_sector) / max(1, MAX_PER_SECTOR)
-            # Colour: green low, yellow mid, red full
-            if ratio == 0:
-                fill = "#e8f5e9"
-            elif ratio < 1:
-                fill = "#fff8e1"
-            else:
-                fill = "#ffcdd2"
-            self.canvas.create_rectangle(x, 10, x + col_w - 10, 40, fill=fill, outline="#888")
-            self.canvas.create_text(x + 6, 22, anchor="w",
-                                    text=f"{sect}  ({len(in_sector)}/{MAX_PER_SECTOR})",
-                                    font=("SF Pro", 11, "bold"))
-            y = 56
-            for sym in syms:
-                color = "#0a5" if sym in held else "#555"
-                weight = "bold" if sym in held else "normal"
-                self.canvas.create_text(x + 6, y, anchor="w", text=sym,
-                                        fill=color, font=("Menlo", 11, weight))
-                y += 18
-            x += col_w
+        self.canvas.update_idletasks()
+        cw = self.canvas.winfo_width()
+        if cw < 300:
+            cw = 800
+
+        # Decide column count so each card is ≥ CARD_MIN_W wide.
+        usable = cw - 2 * self.PADDING + self.CARD_GAP
+        cols = max(1, min(self.MAX_COLS, usable // (self.CARD_MIN_W + self.CARD_GAP)))
+        cols = min(cols, n)   # don't show empty trailing columns
+        rows = (n + cols - 1) // cols
+        card_w = (cw - 2 * self.PADDING - (cols - 1) * self.CARD_GAP) // cols
+
+        # Per-row height = tallest card on that row.
+        row_heights: list[int] = []
+        for r in range(rows):
+            tallest = 0
+            for c in range(cols):
+                idx = r * cols + c
+                if idx >= n:
+                    continue
+                n_syms = len(sorted_groups[idx][1])
+                tallest = max(tallest, self.HEADER_H + n_syms * self.LINE_H + 16)
+            row_heights.append(tallest)
+
+        # Draw each card.
+        y_origin = self.PADDING
+        for r in range(rows):
+            x_origin = self.PADDING
+            for c in range(cols):
+                idx = r * cols + c
+                if idx >= n:
+                    break
+                sect, syms = sorted_groups[idx]
+                in_sector = [s for s in syms if s in held]
+                ratio = len(in_sector) / max(1, MAX_PER_SECTOR)
+                header_fill, border, bar_color = self._ratio_colors(ratio)
+
+                card_x2 = x_origin + card_w
+                card_y2 = y_origin + row_heights[r]
+
+                # Card body (white) + border
+                self.canvas.create_rectangle(
+                    x_origin, y_origin, card_x2, card_y2,
+                    fill="white", outline=border, width=1,
+                )
+                # Header band
+                self.canvas.create_rectangle(
+                    x_origin, y_origin, card_x2, y_origin + self.HEADER_H,
+                    fill=header_fill, outline=border, width=1,
+                )
+                # Sector name (left)
+                self.canvas.create_text(
+                    x_origin + 10, y_origin + 14,
+                    anchor="w", text=sect,
+                    font=("SF Pro", 12, "bold"), fill="#222",
+                )
+                # Usage count (right)
+                self.canvas.create_text(
+                    card_x2 - 10, y_origin + 14,
+                    anchor="e", text=f"{len(in_sector)}/{MAX_PER_SECTOR}",
+                    font=("Menlo", 11, "bold"), fill="#333",
+                )
+                # Progress bar (under name+count, inside header)
+                bar_y = y_origin + self.HEADER_H - 8
+                bar_x1, bar_x2 = x_origin + 10, card_x2 - 10
+                self.canvas.create_rectangle(
+                    bar_x1, bar_y, bar_x2, bar_y + 4,
+                    fill="#ddd", outline="",
+                )
+                if ratio > 0:
+                    fill_x = bar_x1 + (bar_x2 - bar_x1) * min(1.0, ratio)
+                    self.canvas.create_rectangle(
+                        bar_x1, bar_y, fill_x, bar_y + 4,
+                        fill=bar_color, outline="",
+                    )
+
+                # Symbol list — dot + ticker
+                ty = y_origin + self.HEADER_H + 8
+                for sym in syms:
+                    is_held = sym in held
+                    dot_color = bar_color if is_held else "#ccc"
+                    self.canvas.create_oval(
+                        x_origin + 12, ty + 4, x_origin + 18, ty + 10,
+                        fill=dot_color, outline="",
+                    )
+                    self.canvas.create_text(
+                        x_origin + 26, ty + 7, anchor="w", text=sym,
+                        font=("Menlo", 11, "bold" if is_held else "normal"),
+                        fill="#1b5e20" if is_held else "#555",
+                    )
+                    ty += self.LINE_H
+
+                x_origin += card_w + self.CARD_GAP
+            y_origin += row_heights[r] + self.CARD_GAP
+
+        # Enable scroll if content taller than canvas viewport.
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
 
 # ---------- ML model window ----------
