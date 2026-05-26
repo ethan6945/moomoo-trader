@@ -16,7 +16,7 @@ import json
 import logging
 import re
 
-import google.generativeai as genai
+from google import genai
 
 from .config import settings
 from .indicators import Signal
@@ -31,12 +31,11 @@ def _next_key() -> str | None:
     return next(_KEY_CYCLE) if _KEY_CYCLE else None
 
 
-def _model():
+def _client() -> tuple[genai.Client, str] | tuple[None, None]:
     key = _next_key()
     if not key:
-        return None
-    genai.configure(api_key=key)
-    return genai.GenerativeModel(settings.gemini_model)
+        return None, None
+    return genai.Client(api_key=key), settings.gemini_model
 
 
 PROMPT = """You are a risk gate for an automated short-term US-stock trading bot.
@@ -65,8 +64,8 @@ If you have no concerning info, default to "pass".
 
 def validate(signal: Signal) -> tuple[bool, int, str]:
     """Returns (pass, ai_sub_score_0_100, reason). On error, defaults to pass."""
-    model = _model()
-    if model is None:
+    client, model_name = _client()
+    if client is None:
         return True, 50, "no Gemini key configured — neutral"
     ticker_news = news_fetcher.format_news(
         news_fetcher.fetch_ticker_news(signal.symbol), "Ticker news"
@@ -75,14 +74,15 @@ def validate(signal: Signal) -> tuple[bool, int, str]:
         news_fetcher.fetch_macro_news(), "Macro"
     )
     try:
-        resp = model.generate_content(
-            PROMPT.format(
+        resp = client.models.generate_content(
+            model=model_name,
+            contents=PROMPT.format(
                 symbol=signal.symbol,
                 price=signal.price,
                 reasons="\n".join(f"- {r}" for r in signal.reasons),
                 ticker_news=ticker_news,
                 macro_news=macro_news,
-            )
+            ),
         )
         text = resp.text.strip()
         match = re.search(r"\{.*\}", text, re.DOTALL)

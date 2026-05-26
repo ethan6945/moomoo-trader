@@ -34,6 +34,14 @@ class Settings:
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # Signal reporter watchlist — tickers to analyse and push as signal cards.
+    # Separate from the trading watchlist; can overlap. Set via SIGNAL_WATCHLIST env var.
+    signal_watchlist: tuple = tuple(
+        s.strip().upper()
+        for s in os.getenv("SIGNAL_WATCHLIST", "").split(",")
+        if s.strip()
+    )
+
     account_usd: float = _float("ACCOUNT_USD", 4500)
     risk_per_trade: float = _float("RISK_PER_TRADE", 0.02)
     max_positions: int = _int("MAX_POSITIONS", 5)

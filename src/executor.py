@@ -12,6 +12,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+import pytz
+
+_ET = pytz.timezone("America/New_York")
+
 from moomoo import TrdSide
 
 from .config import settings as _settings  # noqa: F401 (used in caller too)
@@ -181,14 +185,13 @@ def cancel_stale_orders(client: MoomooClient) -> list[dict]:
     if pending.empty:
         return canceled
 
-    now_utc = datetime.utcnow()
+    # Use ET (America/New_York) for both sides — MooMoo create_time is naive ET.
+    now_et = datetime.now(_ET).replace(tzinfo=None)
     for _, row in pending.iterrows():
         ct = str(row.get("create_time", ""))
         try:
-            # MooMoo create_time is "YYYY-MM-DD HH:MM:SS.ffffff" in market local time;
-            # the comparison is approximate but adequate for >5min staleness.
-            created = datetime.fromisoformat(ct.split(".")[0]) if ct else now_utc
-            age_min = (now_utc - created).total_seconds() / 60
+            created = datetime.fromisoformat(ct.split(".")[0]) if ct else now_et
+            age_min = (now_et - created).total_seconds() / 60
         except (ValueError, IndexError):
             age_min = 0.0
         if age_min > ORDER_TIMEOUT_MIN:

@@ -413,7 +413,9 @@ def scan_once() -> None:
         # AI budget: Gemini 2.5-flash free tier is 50 RPM / 1500 RPD. With 12
         # scans/day (trade-phase only) × budget=5 = 60 calls/day → well under
         # quota. Previous budget=2 was leaving most candidates unchecked.
-        ai_budget = 5
+        ai_budget = 10
+        scan_skips: list[tuple[str, str]] = []   # (symbol, gate) — summarised at scan end
+
         for sig in ranked:
             # Ranked is sorted desc by score; stop once we drop below the floor.
             if sig.score < threshold_floor:
@@ -428,6 +430,7 @@ def scan_once() -> None:
                 log.info("Skip %s [%s]: %s", _sig.symbol, gate, reason)
                 audit.record("skip", symbol=_sig.symbol, gate=gate,
                              reason=reason, score=_sig.score)
+                scan_skips.append((_sig.symbol, gate))
 
             # --- Context fetches (daily df for MTF/gap, ML proba already cached) ---
             df_d = None
@@ -504,7 +507,6 @@ def scan_once() -> None:
             )
             if not ok:
                 _skip("risk", reason)
-                notifier.send(notifier.skip_msg(sig.symbol, reason))
                 continue
 
             qty = risk_manager.calc_position_size(sig, vix=vix, conviction=conviction)
@@ -512,7 +514,6 @@ def scan_once() -> None:
             heat_ok, heat_reason = portfolio.heat_check(sig, qty)
             if not heat_ok:
                 _skip("heat", heat_reason)
-                notifier.send(notifier.skip_msg(sig.symbol, heat_reason))
                 continue
 
             try:
@@ -535,13 +536,74 @@ def scan_once() -> None:
                 audit.record("error", symbol=sig.symbol, reason=str(e))
                 notifier.send(notifier.skip_msg(sig.symbol, f"exec error: {e}"))
 
+    # Send one skip-summary per scan instead of one message per candidate.
+    if scan_skips:
+        by_gate: dict[str, list[str]] = {}
+        for sym, gate in scan_skips:
+            by_gate.setdefault(gate, []).append(sym)
+        lines = [f"  • {gate}: {', '.join(syms)}" for gate, syms in sorted(by_gate.items())]
+        notifier.send(f"📋 *Scan skips* ({len(scan_skips)} total)\n" + "\n".join(lines))
+
     audit.record("scan_end")
     log.info("=== scan end ===")
+
+
+def _nyse_holidays(year: int) -> set:
+    """Return the set of NYSE full-day holiday dates for `year`."""
+    from datetime import date, timedelta
+
+    def observed(d: date) -> date:
+        if d.weekday() == 5:   # Saturday → Friday
+            return d - timedelta(days=1)
+        if d.weekday() == 6:   # Sunday → Monday
+            return d + timedelta(days=1)
+        return d
+
+    def nth_weekday(y: int, m: int, wd: int, n: int) -> date:
+        """nth occurrence (1-based) of weekday wd (0=Mon) in month m."""
+        d = date(y, m, 1)
+        d += timedelta(days=(wd - d.weekday()) % 7)
+        return d + timedelta(weeks=n - 1)
+
+    def last_monday(y: int, m: int) -> date:
+        import calendar
+        last = date(y, m, calendar.monthrange(y, m)[1])
+        return last - timedelta(days=last.weekday())   # weekday 0 = Mon
+
+    def easter(y: int) -> date:
+        a = y % 19
+        b, c = divmod(y, 100)
+        d, e = divmod(b, 4)
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i, k = divmod(c, 4)
+        ll = (32 + 2 * e + 2 * i - h - k) % 7
+        m2 = (a + 11 * h + 22 * ll) // 451
+        mo, dy = divmod(114 + h + ll - 7 * m2, 31)
+        return date(y, mo, dy + 1)
+
+    hols = {
+        observed(date(year, 1, 1)),            # New Year's Day
+        nth_weekday(year, 1, 0, 3),            # MLK Day (3rd Mon Jan)
+        nth_weekday(year, 2, 0, 3),            # Presidents Day (3rd Mon Feb)
+        easter(year) - timedelta(days=2),      # Good Friday
+        last_monday(year, 5),                  # Memorial Day (last Mon May)
+        observed(date(year, 6, 19)),           # Juneteenth
+        observed(date(year, 7, 4)),            # Independence Day
+        nth_weekday(year, 9, 0, 1),            # Labor Day (1st Mon Sep)
+        nth_weekday(year, 11, 3, 4),           # Thanksgiving (4th Thu Nov)
+        observed(date(year, 12, 25)),          # Christmas
+    }
+    return hols
 
 
 def in_market_hours() -> bool:
     now = clock.ny_now()
     if now.weekday() >= 5:
+        return False
+    if now.date() in _nyse_holidays(now.year):
+        log.info("NYSE holiday today (%s) — skipping scan", now.date())
         return False
     minutes = now.hour * 60 + now.minute
     return 9 * 60 + 30 <= minutes <= 16 * 60

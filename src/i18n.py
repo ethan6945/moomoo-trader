@@ -60,6 +60,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "regime_none": "Regime: —",
         "ago": "ago",
 
+        # --- Theme menu ---
+        "menu_theme":        "Theme",
+        "menu_theme_light":  "Light",
+        "menu_theme_dark":   "Dark",
+        "menu_theme_auto":   "Follow Device",
+        "theme_switched_toast": "🎨 Theme: {theme} (now {resolved})",
+        "menu_help":         "Help",
+
         # --- Budget section ---
         "budget_section": "Budget & Performance",
         "budget_label_total": "Total Budget (click to edit)",
@@ -80,6 +88,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "halted_yes": "🛑 YES",
         "halted_no": "✓ no",
         "halted_reset_label": "reset",
+        "halted_label_yes": "🛑 Trading paused — reconcile/drawdown triggered (click to resume)",
+        "halted_label_no": "✅ Trading active",
         "halted_reset_confirm_title": "Reset halt?",
         "halted_reset_confirm_body": ("This will clear the `halted` flag and reset "
                                        "the loss-streak counter. Use after reviewing why "
@@ -213,6 +223,14 @@ STRINGS: dict[str, dict[str, str]] = {
         "regime_none": "市场状态: —",
         "ago": "前",
 
+        # --- Theme menu ---
+        "menu_theme":        "主题",
+        "menu_theme_light":  "浅色",
+        "menu_theme_dark":   "深色",
+        "menu_theme_auto":   "跟随系统",
+        "theme_switched_toast": "🎨 主题: {theme}（当前 {resolved}）",
+        "menu_help":         "帮助",
+
         "budget_section": "预算 & 盈亏",
         "budget_label_total": "总预算（点击修改）",
         "budget_label_deployed": "已部署",
@@ -231,6 +249,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "halted_yes": "🛑 是",
         "halted_no": "✓ 否",
         "halted_reset_label": "重置",
+        "halted_label_yes": "🛑 交易已暂停 — 对账/回撤触发（点击恢复）",
+        "halted_label_no": "✅ 正常交易中",
         "halted_reset_confirm_title": "重置暂停?",
         "halted_reset_confirm_body": ("将清除 halted 标志 + 连亏天数计数。"
                                        "建议先确认 bot 为什么暂停（连亏 3 天 / 日内回撤超限），"

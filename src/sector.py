@@ -10,36 +10,98 @@ from __future__ import annotations
 import pandas as pd
 
 SECTOR_MAP: dict[str, str] = {
-    # Technology (software + hardware + large-cap internet)
+    # ─── Technology — software, cloud, networking, large-cap internet ───
     "AAPL": "tech", "MSFT": "tech", "NVDA": "tech", "GOOGL": "tech",
     "META": "tech", "AMD": "tech", "AVGO": "tech", "CRM": "tech",
-    "XLK": "tech",
-    # Semiconductors (high intra-sector correlation, separate from broad tech)
-    "MU": "semis", "TSM": "semis", "ASML": "semis", "SMH": "semis",
-    # Consumer (discretionary + staples combined — high macro correlation)
+    "ORCL": "tech", "IBM": "tech", "NOW": "tech",
+    "CSCO": "tech",                  # Cisco — enterprise networking
+    "DDOG": "tech",                  # Datadog — observability cloud
+    "FTNT": "tech", "PANW": "tech",  # Fortinet / Palo Alto — cybersecurity
+    "GEN": "tech",                   # Gen Digital — Norton / consumer security
+    "AKAM": "tech",                  # Akamai — CDN / edge
+    "DELL": "tech", "HPQ": "tech", "HPE": "tech",   # PC / enterprise hardware
+    "PLTR": "tech", "RDDT": "tech",  # Palantir, Reddit
+    "XLK":  "tech",                  # tech sector ETF
+
+    # ─── Semiconductors (separate bucket — high intra-sector correlation) ───
+    "MU":   "semis", "TSM":  "semis", "ASML": "semis", "SMH": "semis",
+    "INTC": "semis",                 # Intel
+    "QCOM": "semis",                 # Qualcomm — wireless chips
+    "TXN":  "semis",                 # Texas Instruments
+    "SWKS": "semis",                 # Skyworks — RF chips
+    "ON":   "semis",                 # ON Semiconductor
+    "ARM":  "semis",                 # ARM Holdings
+    "SNDK": "semis",                 # SanDisk — NAND flash storage
+    "WDC":  "semis",                 # Western Digital — HDD/SSD storage
+    "STX":  "semis",                 # Seagate — storage
+    "SMCI": "semis",                 # Super Micro — AI servers tied to chip demand
+
+    # ─── Healthcare / biotech ───
+    "MRNA": "healthcare",            # Moderna
+    "CNC":  "healthcare",            # Centene — health insurance
+    "DXCM": "healthcare",            # DexCom — CGM medical devices
+    "LLY":  "healthcare", "UNH": "healthcare", "JNJ": "healthcare",
+    "ABBV": "healthcare", "MRK": "healthcare", "ABT": "healthcare",
+    "XLV":  "healthcare",
+
+    # ─── Consumer (discretionary + staples — high macro correlation) ───
     "AMZN": "consumer", "NFLX": "consumer", "DIS": "consumer",
-    "COST": "consumer", "WMT": "consumer",
-    # Mobility / travel
+    "COST": "consumer", "WMT": "consumer", "TGT": "consumer", "LOW": "consumer",
+    "SBUX": "consumer", "MCD": "consumer", "NKE": "consumer",
+    "PEP":  "consumer", "KO": "consumer", "PG": "consumer",
+    "XLP":  "consumer", "XLY": "consumer",
+
+    # ─── Mobility / travel ───
     "UBER": "mobility", "ABNB": "mobility",
-    # Auto / EV
-    "TSLA": "auto", "F": "auto",
-    # Finance
-    "JPM": "finance", "V": "finance", "MA": "finance", "XLF": "finance",
-    # Industrials
-    "BA": "industrial", "CAT": "industrial", "GE": "industrial",
-    # Energy
-    "XLE": "energy",
-    # Broad ETFs — each is its own bucket (they're uncorrelated by design)
-    "SPY": "etf_spy", "QQQ": "etf_qqq", "IWM": "etf_iwm",
+
+    # ─── Auto / EV ───
+    "TSLA": "auto", "F": "auto", "GM": "auto",
+
+    # ─── Finance + crypto exchanges (high correlation to rates) ───
+    "JPM":  "finance", "V": "finance", "MA": "finance",
+    "BAC":  "finance", "WFC": "finance", "PYPL": "finance",
+    "COIN": "finance",               # Coinbase — crypto exchange
+    "XLF":  "finance",
+
+    # ─── Industrials ───
+    "BA":   "industrial", "CAT": "industrial", "GE": "industrial",
+    "XLI":  "industrial",
+
+    # ─── Energy ───
+    "XOM":  "energy", "CVX": "energy", "XLE": "energy",
+    "TPL":  "energy",                # Texas Pacific Land — Permian Basin
+
+    # ─── Broad ETFs — each is its own bucket (uncorrelated by design) ───
+    "SPY":  "etf_spy", "QQQ": "etf_qqq", "IWM": "etf_iwm",
+    "DIA":  "etf_dia", "VTI": "etf_vti",
 }
 
 # At most this many positions in the same sector bucket at once.
-# With MAX_POSITIONS=5 this caps any one sector at 40%.
-MAX_PER_SECTOR = 2
+# With MAX_POSITIONS=10 + MAX_POSITION_PCT=10%, cap of 4 lets a strong
+# sector run up to 40% while still requiring at least 3 different sectors
+# for a fully-deployed account. Watchlist skews tech/semis (~80%), so
+# capping at 2 left too many good signals on the table.
+MAX_PER_SECTOR = 4
 
 
 def get_sector(symbol: str) -> str:
-    return SECTOR_MAP.get(symbol.upper(), "unknown")
+    """Look up a symbol's sector. Logs once per unknown so missing entries
+    are visible without spamming the log on every scan."""
+    sym = symbol.upper()
+    if sym in SECTOR_MAP:
+        return SECTOR_MAP[sym]
+    # Track unknowns just once; helpful when watchlist auto-updates pulls in
+    # a new ticker the map doesn't cover yet.
+    if sym not in _logged_unknowns:
+        _logged_unknowns.add(sym)
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "sector unknown for %s — add to SECTOR_MAP in src/sector.py", sym
+        )
+    return "unknown"
+
+
+_logged_unknowns: set[str] = set()
 
 
 def check_sector_exposure(

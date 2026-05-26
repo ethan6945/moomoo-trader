@@ -44,9 +44,207 @@ RECONCILE_FILE = ROOT / "data" / "reconcile.json"
 AUDIT_FILE = ROOT / "data" / "audit.jsonl"
 TRADES_FILE = ROOT / "data" / "trades.jsonl"
 WATCHLIST_FILE = ROOT / "config" / "watchlist.json"
+SIGNAL_WL_FILE = ROOT / "config" / "signal_watchlist.json"
+SIGNAL_PID_FILE = ROOT / "logs" / "signal_reporter.pid"
+SIGNAL_LOG_FILE = ROOT / "logs" / "signal_reporter.log"
 PYTHON = str(ROOT / ".venv" / "bin" / "python")
+PREFS_FILE = ROOT / "data" / "prefs.json"
 
 REFRESH_MS = 5000
+
+# ====== Theme palettes ======
+# Two complete colour sets. The active palette is copied into THEME (below)
+# at startup and whenever the user switches. Sub-windows read THEME live,
+# so updating THEME in-place is enough for new widgets — existing widgets
+# get repainted by _refresh_widget_tree().
+LIGHT_PALETTE = {
+    "bg":            "#f1f5f9",
+    "sidebar_bg":    "#e8edf4",
+    "card_bg":       "#ffffff",
+    "border":        "#e2e8f0",
+    "border2":       "#cbd5e1",
+    "primary":       "#0891b2",
+    "secondary":     "#7c3aed",
+    "success":       "#059669",
+    "danger":        "#dc2626",
+    "warning":       "#d97706",
+    "muted":         "#64748b",
+    "text":          "#334155",
+    "text_strong":   "#0f172a",
+    "tree_head_bg":  "#f1f5f9",
+    "select_fg":     "#ffffff",
+}
+
+DARK_PALETTE = {
+    "bg":            "#0a0f1e",
+    "sidebar_bg":    "#060b14",
+    "card_bg":       "#111827",
+    "border":        "#1f2937",
+    "border2":       "#374151",
+    "primary":       "#06b6d4",
+    "secondary":     "#7c3aed",
+    "success":       "#10b981",
+    "danger":        "#ef4444",
+    "warning":       "#f59e0b",
+    "muted":         "#6b7280",
+    "text":          "#9ca3af",
+    "text_strong":   "#f9fafb",
+    "tree_head_bg":  "#1f2937",
+    "select_fg":     "#ffffff",
+}
+
+# Mutable — never reassigned. All code references THEME["key"] which reads
+# the *current* value, so an in-place update propagates everywhere.
+THEME: dict = {}
+THEME.update(LIGHT_PALETTE)   # boot default
+
+_current_theme_pref = "auto"  # "light" | "dark" | "auto"
+_resolved_theme = "light"     # what's actually displayed
+
+
+# ---------- theme detection ----------
+
+def _detect_macos_dark() -> bool:
+    """True if macOS is currently in dark appearance.
+
+    `defaults read -g AppleInterfaceStyle` returns "Dark" in dark mode and
+    exits non-zero in light mode. Sub-second cost; safe to call on every
+    "auto" refresh.
+    """
+    import sys as _sys
+    if _sys.platform != "darwin":
+        return False
+    try:
+        r = subprocess.run(
+            ["defaults", "read", "-g", "AppleInterfaceStyle"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return r.returncode == 0 and "Dark" in r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def detect_system_theme() -> str:
+    """Returns 'dark' or 'light' based on OS preference."""
+    return "dark" if _detect_macos_dark() else "light"
+
+
+# ---------- theme preference (persisted in data/prefs.json) ----------
+
+def load_theme_pref() -> str:
+    """Read theme pref from prefs.json. 'auto' is the default."""
+    try:
+        prefs = json.loads(PREFS_FILE.read_text())
+        pref = prefs.get("theme", "auto")
+        if pref not in ("light", "dark", "auto"):
+            pref = "auto"
+        return pref
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "auto"
+
+
+def save_theme_pref(name: str) -> None:
+    """Write theme pref to prefs.json (preserves other keys like `lang`)."""
+    PREFS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        prefs = json.loads(PREFS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        prefs = {}
+    prefs["theme"] = name
+    PREFS_FILE.write_text(json.dumps(prefs, indent=2, ensure_ascii=False))
+
+
+# ---------- theme application ----------
+
+def _resolve_theme(pref: str) -> str:
+    return detect_system_theme() if pref == "auto" else pref
+
+
+def apply_theme(pref: str, app=None) -> str:
+    """Apply theme `pref` globally. Returns the resolved theme name.
+
+    Mutates THEME in-place so all code reading THEME["..."] sees new values
+    on the next paint. When `app` is provided, re-runs ttk style setup +
+    walks the widget tree to repaint Tk-native widgets that don't follow
+    styles (Toplevel / Text / Listbox / Canvas).
+    """
+    global _current_theme_pref, _resolved_theme
+    _current_theme_pref = pref
+    resolved = _resolve_theme(pref)
+    _resolved_theme = resolved
+    palette = DARK_PALETTE if resolved == "dark" else LIGHT_PALETTE
+    THEME.clear()
+    THEME.update(palette)
+
+    if app is not None:
+        app._setup_theme()
+        _refresh_widget_tree(app)
+    return resolved
+
+
+def _refresh_widget_tree(root) -> None:
+    """Walk root + all descendants and update colours for non-ttk widgets.
+
+    ttk widgets follow `ttk.Style` so they refresh automatically when
+    `_setup_theme()` re-runs. Plain Tk widgets (Toplevel, Text, Listbox,
+    Canvas, Menu) need explicit configure() — that's what this function does.
+    """
+    queue = [root]
+    visited = set()
+    while queue:
+        w = queue.pop()
+        if id(w) in visited:
+            continue
+        visited.add(id(w))
+        cls = w.winfo_class()
+        try:
+            if cls in ("Toplevel", "Tk"):
+                w.configure(bg=THEME["bg"])
+            elif cls == "Frame":
+                if not getattr(w, '_is_accent', False):
+                    w.configure(bg=THEME["bg"])
+            elif cls == "Text":
+                w.configure(bg=THEME["card_bg"], fg=THEME["text"],
+                            insertbackground=THEME["text"])
+            elif cls == "Listbox":
+                w.configure(bg=THEME["card_bg"], fg=THEME["text"],
+                            selectbackground=THEME["primary"],
+                            selectforeground=THEME["select_fg"])
+            elif cls == "Canvas":
+                w.configure(bg=THEME["card_bg"])
+            elif cls == "Menu":
+                w.configure(bg=THEME["card_bg"], fg=THEME["text"],
+                            activebackground=THEME["primary"],
+                            activeforeground=THEME["select_fg"])
+        except tk.TclError:
+            pass
+        try:
+            queue.extend(w.winfo_children())
+        except tk.TclError:
+            pass
+
+
+def _apply_theme(toplevel: tk.Toplevel) -> None:
+    """Apply the shared visual theme to a NEW sub-window.
+
+    Called from every Toplevel `__init__`. Sets the background + default
+    options for tk-native widgets created later in that window's _build().
+    """
+    toplevel.configure(bg=THEME["bg"])
+    try:
+        toplevel.option_add("*Text.background",      THEME["card_bg"])
+        toplevel.option_add("*Text.foreground",      THEME["text"])
+        toplevel.option_add("*Text.borderWidth",     0)
+        toplevel.option_add("*Text.highlightThickness", 0)
+        toplevel.option_add("*Text.relief",          "flat")
+        toplevel.option_add("*Listbox.background",   THEME["card_bg"])
+        toplevel.option_add("*Listbox.foreground",   THEME["text"])
+        toplevel.option_add("*Listbox.borderWidth",  0)
+        toplevel.option_add("*Listbox.highlightThickness", 0)
+        toplevel.option_add("*Listbox.relief",       "flat")
+        toplevel.option_add("*Listbox.font",         "Menlo 12")
+    except tk.TclError:
+        pass
 
 
 def is_process_alive(pid: int) -> bool:
@@ -100,22 +298,10 @@ def read_json(path: Path) -> dict:
 
 
 class App(tk.Tk):
-    # ------- Colour palette (one place to tune the whole look) -------
-    COLORS = {
-        "bg":          "#f5f6f8",   # window background
-        "card_bg":     "#ffffff",   # card / labelframe inside
-        "border":      "#d8dde3",
-        "primary":     "#1f6feb",
-        "primary_dk":  "#1858c4",
-        "success":     "#28a745",
-        "success_bg":  "#e8f5e9",
-        "danger":      "#d73a49",
-        "danger_bg":   "#fdecea",
-        "warning":     "#e0a73c",
-        "muted":       "#6a737d",
-        "text":        "#24292e",
-        "text_strong": "#0d1117",
-    }
+    # `App.COLORS` is the live theme reference. It points at the same dict
+    # as the module-level THEME, so app.COLORS["bg"] always reads the
+    # current value after a theme switch.
+    COLORS = THEME
 
     def __init__(self) -> None:
         super().__init__()
@@ -123,7 +309,10 @@ class App(tk.Tk):
         # Sized for 13" MacBook (1280×800 logical) — fits with menu bar + dock.
         self.geometry("1200x740")
         self.minsize(1024, 640)
-        self.configure(bg=self.COLORS["bg"])
+        # Boot the theme from prefs.json BEFORE we build any widget — that
+        # way the first paint already uses the user's preferred colours.
+        apply_theme(load_theme_pref(), app=None)
+        self.configure(bg=THEME["bg"])
         self._setup_theme()
         self._build_menu()
         self._build()
@@ -131,32 +320,74 @@ class App(tk.Tk):
 
     # ---------- visual theme ----------
     def _setup_theme(self) -> None:
-        """Configure ttk Style once so widgets look consistent.
-
-        Defines named styles used in `_build` — change a colour here and the
-        whole UI follows. Uses 'clam' on non-macOS for greater control;
-        on macOS we keep 'aqua' as the base since native widgets look better,
-        but override font/padding for everything we care about.
-        """
+        """Configure ttk Style for the current THEME palette."""
         style = ttk.Style()
-        # 'aqua' is macOS-native — we keep it and just layer styles on top.
-        # On Linux/Windows 'clam' gives us the most-customisable look.
-        if style.theme_use() not in ("aqua",):
+        prefer_clam = _resolved_theme == "dark" or style.theme_use() != "aqua"
+        if prefer_clam:
             try:
                 style.theme_use("clam")
             except tk.TclError:
                 pass
 
-        c = self.COLORS
+        c = THEME
 
-        # Labelframe header text
+        # ── Sidebar ──────────────────────────────────────────────
+        style.configure("Sidebar.TFrame",   background=c["sidebar_bg"])
+        style.configure("Divider.TFrame",   background=c["border"])
+        style.configure("SidebarTitle.TLabel",
+                        background=c["sidebar_bg"], foreground=c["primary"],
+                        font=("SF Pro", 13, "bold"))
+        style.configure("SidebarSub.TLabel",
+                        background=c["sidebar_bg"], foreground=c["muted"],
+                        font=("SF Pro", 9))
+        style.configure("SidebarSection.TLabel",
+                        background=c["sidebar_bg"], foreground=c["muted"],
+                        font=("SF Pro", 9, "bold"), padding=(16, 4, 0, 2))
+
+        # ── Nav buttons ──────────────────────────────────────────
+        style.configure("Nav.TButton",
+                        padding=(10, 8), font=("SF Pro", 11),
+                        relief="flat", anchor="w",
+                        background=c["sidebar_bg"], foreground=c["text"],
+                        borderwidth=0, focusthickness=0)
+        style.map("Nav.TButton",
+                  background=[("active", c["card_bg"]), ("pressed", c["border"])],
+                  foreground=[("active", c["text_strong"])])
+        style.configure("NavAccent.TButton",
+                        padding=(10, 8), font=("SF Pro", 11, "bold"),
+                        relief="flat", anchor="w",
+                        background=c["primary"], foreground="#000000",
+                        borderwidth=0, focusthickness=0)
+        style.map("NavAccent.TButton",
+                  background=[("active", c["success"]), ("pressed", c["success"])],
+                  foreground=[("active", "#000000")])
+
+        # ── Cards ────────────────────────────────────────────────
+        style.configure("Card.TFrame",      background=c["card_bg"])
+        style.configure("CardTitle.TLabel",
+                        background=c["card_bg"], foreground=c["muted"],
+                        font=("SF Pro", 10))
+        style.configure("CardValue.TLabel",
+                        background=c["card_bg"], foreground=c["text_strong"],
+                        font=("SF Pro", 22, "bold"))
+        style.configure("CardMid.TLabel",
+                        background=c["card_bg"], foreground=c["text"],
+                        font=("Menlo", 12, "bold"))
+        style.configure("StatusPill.TLabel",
+                        background=c["card_bg"], foreground=c["text"],
+                        font=("SF Pro", 10))
+        style.configure("InfoPill.TLabel",
+                        background=c["card_bg"], foreground=c["text"],
+                        font=("SF Pro", 10))
+
+        # ── Section LabelFrames (popup windows) ──────────────────
         style.configure("Section.TLabelframe",
                         background=c["bg"], padding=6)
         style.configure("Section.TLabelframe.Label",
                         background=c["bg"], font=("SF Pro", 11, "bold"),
                         foreground=c["muted"])
 
-        # Plain label variants
+        # ── Plain label variants ──────────────────────────────────
         style.configure("Muted.TLabel",
                         background=c["bg"], foreground=c["muted"],
                         font=("SF Pro", 10))
@@ -173,45 +404,104 @@ class App(tk.Tk):
                         background=c["bg"], foreground=c["text"],
                         font=("Menlo", 13, "bold"))
         style.configure("Win.TLabel",
-                        background=c["bg"], foreground=c["success"],
-                        font=("Menlo", 13, "bold"))
+                        background=c["card_bg"], foreground=c["success"],
+                        font=("SF Pro", 20, "bold"))
         style.configure("Loss.TLabel",
-                        background=c["bg"], foreground=c["danger"],
-                        font=("Menlo", 13, "bold"))
+                        background=c["card_bg"], foreground=c["danger"],
+                        font=("SF Pro", 20, "bold"))
 
-        # Pretty buttons: a bit more padding, larger font.
-        style.configure("TButton", padding=(10, 6), font=("SF Pro", 11))
-        style.configure("Primary.TButton", padding=(12, 7),
-                        font=("SF Pro", 11, "bold"))
-        # ✎ tiny icon button next to the budget
-        style.configure("Icon.TButton", padding=(4, 2), font=("SF Pro", 11))
+        # ── Buttons ───────────────────────────────────────────────
+        style.configure("TButton",         padding=(10, 6), font=("SF Pro", 11))
+        style.configure("Primary.TButton", padding=(12, 7), font=("SF Pro", 11, "bold"))
+        style.configure("Icon.TButton",    padding=(4, 2),  font=("SF Pro", 11))
 
-        # Progressbar — thicker
+        # ── Progressbar ───────────────────────────────────────────
         style.configure("Budget.Horizontal.TProgressbar",
-                        thickness=14, troughcolor="#e9ecef",
-                        background=c["primary"])
+                        thickness=8, troughcolor=c["border"],
+                        background=c["secondary"])
 
-        # Treeview row striping (positions table)
+        # ── Treeview ──────────────────────────────────────────────
         style.configure("Treeview",
-                        font=("Menlo", 11),
-                        rowheight=24,
-                        background=c["card_bg"],
+                        font=("Menlo", 11), rowheight=24,
+                        background=c["card_bg"], foreground=c["text"],
                         fieldbackground=c["card_bg"])
         style.configure("Treeview.Heading",
                         font=("SF Pro", 11, "bold"),
-                        background="#eef1f4",
-                        foreground=c["text"])
+                        background=c["tree_head_bg"],
+                        foreground=c["text_strong"])
+        style.map("Treeview",
+                  background=[("selected", c["primary"])],
+                  foreground=[("selected", c["select_fg"])])
+
+        # ── Base widget styles ────────────────────────────────────
+        style.configure("TFrame",      background=c["bg"])
+        style.configure("TLabel",      background=c["bg"], foreground=c["text"])
+        style.configure("TLabelframe", background=c["bg"])
+        style.configure("TLabelframe.Label",
+                        background=c["bg"], foreground=c["muted"])
+        style.configure("TNotebook", background=c["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab",
+                        padding=(14, 6),
+                        background=c["card_bg"], foreground=c["text"])
+        style.map("TNotebook.Tab",
+                  background=[("selected", c["primary"])],
+                  foreground=[("selected", c["select_fg"])])
+        style.configure("TEntry",
+                        fieldbackground=c["card_bg"],
+                        foreground=c["text"], insertcolor=c["text"])
+        style.configure("TCombobox",
+                        fieldbackground=c["card_bg"],
+                        background=c["card_bg"], foreground=c["text"])
 
     # ---------- menu bar ----------
     def _build_menu(self) -> None:
         bar = tk.Menu(self)
+
+        # Language submenu
         lang_menu = tk.Menu(bar, tearoff=0)
         lang_menu.add_command(label=_t("menu_lang_zh"),
                               command=lambda: self._switch_lang("zh"))
         lang_menu.add_command(label=_t("menu_lang_en"),
                               command=lambda: self._switch_lang("en"))
         bar.add_cascade(label=_t("menu_language"), menu=lang_menu)
+
+        # Theme submenu — radio button so the current pref is visible.
+        theme_menu = tk.Menu(bar, tearoff=0)
+        self._theme_var = tk.StringVar(value=_current_theme_pref)
+        theme_menu.add_radiobutton(label=_t("menu_theme_light"),
+                                    variable=self._theme_var, value="light",
+                                    command=lambda: self._switch_theme("light"))
+        theme_menu.add_radiobutton(label=_t("menu_theme_dark"),
+                                    variable=self._theme_var, value="dark",
+                                    command=lambda: self._switch_theme("dark"))
+        theme_menu.add_radiobutton(label=_t("menu_theme_auto"),
+                                    variable=self._theme_var, value="auto",
+                                    command=lambda: self._switch_theme("auto"))
+        bar.add_cascade(label=_t("menu_theme"), menu=theme_menu)
+
+        # Help — opens the in-app glossary / term & feature explainer.
+        bar.add_command(label=_t("menu_help"), command=self.open_help)
+
         self.config(menu=bar)
+
+    def open_help(self) -> None:
+        HelpWindow(self)
+
+    def _switch_theme(self, pref: str) -> None:
+        """Switch theme live + persist preference."""
+        if pref not in ("light", "dark", "auto"):
+            return
+        # Persist BEFORE applying so a crash mid-apply doesn't lose the choice.
+        save_theme_pref(pref)
+        resolved = apply_theme(pref, app=self)
+        self._theme_var.set(pref)
+        # Force a data refresh so colour-coded labels (PnL etc.) recompute
+        # with the new Win/Loss styles.
+        self.after(50, self._refresh)
+        label = _t("menu_theme_auto") if pref == "auto" else (
+            _t("menu_theme_dark") if pref == "dark" else _t("menu_theme_light")
+        )
+        self._toast(_t("theme_switched_toast", theme=label, resolved=resolved))
 
     def _switch_lang(self, lang: str) -> None:
         if lang == current_lang():
@@ -285,137 +575,178 @@ class App(tk.Tk):
 
     # ---------- layout ----------
     def _build(self) -> None:
-        pad = {"padx": 6, "pady": 3}
+        outer = ttk.Frame(self, style="Sidebar.TFrame")
+        outer.pack(fill="both", expand=True)
 
-        # Top status row
-        status = ttk.LabelFrame(self, text=_t("status_section"))
-        status.pack(fill="x", **pad)
-        self.lbl_scheduler = ttk.Label(status, text=f"{_t('scheduler')}: ?")
-        self.lbl_opend = ttk.Label(status, text=f"{_t('opend')}: ?")
-        self.lbl_unlock = ttk.Label(status, text=f"{_t('trade')}: ?")
-        self.lbl_market = ttk.Label(status, text=f"{_t('market')}: ?")
-        self.lbl_clock = ttk.Label(status, text=f"{_t('et_prefix')} --:--", cursor="hand2")
+        # Left sidebar
+        self._sidebar = ttk.Frame(outer, style="Sidebar.TFrame", width=192)
+        self._sidebar.pack(side="left", fill="y")
+        self._sidebar.pack_propagate(False)
+
+        # 1-px divider between sidebar and content
+        ttk.Frame(outer, style="Divider.TFrame", width=1).pack(side="left", fill="y")
+
+        # Right content area
+        content = ttk.Frame(outer)
+        content.pack(side="left", fill="both", expand=True)
+
+        self._build_sidebar()
+        self._build_content(content)
+
+    def _nav_btn(self, parent, text: str, command, accent: bool = False) -> ttk.Button:
+        style = "NavAccent.TButton" if accent else "Nav.TButton"
+        btn = ttk.Button(parent, text=text, style=style, command=command)
+        btn.pack(fill="x", padx=8, pady=2)
+        return btn
+
+    def _accent_frame(self, parent, color: str) -> tk.Frame:
+        bar = tk.Frame(parent, height=3, bg=color)
+        bar._is_accent = True
+        bar.pack(fill="x")
+        return bar
+
+    def _build_sidebar(self) -> None:
+        sb = self._sidebar
+
+        # Logo block
+        ttk.Label(sb, text="MooMoo Trader", style="SidebarTitle.TLabel").pack(
+            anchor="w", padx=16, pady=(20, 2))
+        ttk.Label(sb, text="Auto Trading Bot", style="SidebarSub.TLabel").pack(
+            anchor="w", padx=16, pady=(0, 14))
+        ttk.Frame(sb, style="Divider.TFrame", height=1).pack(fill="x")
+
+        # Primary controls
+        ttk.Frame(sb, style="Sidebar.TFrame", height=10).pack()
+        self.btn_start      = self._nav_btn(sb, "▶  " + _t("btn_start"),    self.start_scheduler, accent=True)
+        self.btn_stop       = self._nav_btn(sb, "■  " + _t("btn_stop"),      self.stop_scheduler)
+        self.btn_scan       = self._nav_btn(sb, "⚡ " + _t("btn_scan"),      self.scan_now)
+        self.btn_logs       = self._nav_btn(sb, "📋 " + _t("btn_log"),       self.open_logs)
+
+        ttk.Frame(sb, style="Sidebar.TFrame", height=6).pack()
+        ttk.Frame(sb, style="Divider.TFrame", height=1).pack(fill="x")
+
+        # Views section
+        ttk.Label(sb, text="  VIEWS", style="SidebarSection.TLabel").pack(
+            anchor="w", pady=(8, 2))
+        self.btn_hist       = self._nav_btn(sb, "📈 " + _t("btn_history"),   self.open_history)
+        self.btn_bt         = self._nav_btn(sb, "🔬 " + _t("btn_backtest"),  self.open_backtest)
+        self.btn_equity     = self._nav_btn(sb, "📊 " + _t("btn_equity"),    self.open_equity)
+        self.btn_audit      = self._nav_btn(sb, "🔍 " + _t("btn_audit"),     self.open_audit)
+        self.btn_wl         = self._nav_btn(sb, "📋 " + _t("btn_watchlist"), self.open_watchlist)
+        self.btn_wl_refresh = self._nav_btn(sb, "🔄 Refresh WL",             self.refresh_watchlist)
+        self.btn_sect       = self._nav_btn(sb, "🗺  " + _t("btn_sectors"),  self.open_sectors)
+        self.btn_ml         = self._nav_btn(sb, "🤖 " + _t("btn_ml"),        self.open_ml)
+
+        self.btn_signal     = self._nav_btn(sb, "📡 Signal Reporter",         self.open_signal_reporter)
+
+        ttk.Frame(sb, style="Divider.TFrame", height=1).pack(fill="x", pady=(6, 0))
+        self.btn_help       = self._nav_btn(sb, "📚 Help",                   self.open_help)
+
+    def _build_content(self, parent) -> None:
+        px, py = 12, 5
+
+        # ── Status strip ─────────────────────────────────────────
+        sbar = ttk.Frame(parent, style="Card.TFrame")
+        sbar.pack(fill="x", padx=px, pady=(py, 4))
+        self.lbl_scheduler = ttk.Label(sbar, text=f"{_t('scheduler')}: ?",    style="StatusPill.TLabel")
+        self.lbl_opend     = ttk.Label(sbar, text=f"{_t('opend')}: ?",        style="StatusPill.TLabel")
+        self.lbl_unlock    = ttk.Label(sbar, text=f"{_t('trade')}: ?",        style="StatusPill.TLabel")
+        self.lbl_market    = ttk.Label(sbar, text=f"{_t('market')}: ?",       style="StatusPill.TLabel")
+        self.lbl_clock     = ttk.Label(sbar, text=f"{_t('et_prefix')} --:--", style="StatusPill.TLabel", cursor="hand2")
         self.lbl_clock.bind("<Button-1>", lambda _: self._force_clock_sync())
-        self.lbl_heart = ttk.Label(status, text=_t("last_scan_none"))
-        self.lbl_regime = ttk.Label(status, text=_t("regime_none"))
+        self.lbl_heart  = ttk.Label(sbar, text=_t("last_scan_none"), style="StatusPill.TLabel")
+        self.lbl_regime = ttk.Label(sbar, text=_t("regime_none"),    style="StatusPill.TLabel")
         for i, w in enumerate([self.lbl_scheduler, self.lbl_opend, self.lbl_unlock,
-                                self.lbl_market, self.lbl_clock, self.lbl_heart,
-                                self.lbl_regime]):
-            w.grid(row=0, column=i, padx=8, pady=6, sticky="w")
+                                self.lbl_market, self.lbl_clock, self.lbl_heart, self.lbl_regime]):
+            w.grid(row=0, column=i, padx=10, pady=8, sticky="w")
 
-        # ─── Budget & Performance card — the most-glanced numbers ───
-        # Layout: 3 columns
-        #   [ BUDGET (editable) ] [ DEPLOYED + bar ] [ P&L today + total ]
-        bud = ttk.LabelFrame(self, text="  💰 " + _t("budget_section") + "  ",
-                              style="Section.TLabelframe")
-        bud.pack(fill="x", padx=10, pady=6)
+        # ── 4 Stat cards ─────────────────────────────────────────
+        crd = ttk.Frame(parent)
+        crd.pack(fill="x", padx=px, pady=4)
+        for i in range(4):
+            crd.columnconfigure(i, weight=1, uniform="card")
 
-        # Column 0 — big editable budget number
-        col0 = ttk.Frame(bud)
-        col0.grid(row=0, column=0, padx=14, pady=8, sticky="w")
-        ttk.Label(col0, text=_t("budget_label_total"),
-                  style="Muted.TLabel").pack(anchor="w")
-        budget_row = ttk.Frame(col0)
+        # Card 0: Budget
+        c0 = ttk.Frame(crd, style="Card.TFrame")
+        c0.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self._accent_frame(c0, "#06b6d4")
+        i0 = ttk.Frame(c0, style="Card.TFrame")
+        i0.pack(fill="both", padx=14, pady=10)
+        ttk.Label(i0, text=_t("budget_label_total"), style="CardTitle.TLabel").pack(anchor="w")
+        budget_row = ttk.Frame(i0, style="Card.TFrame")
         budget_row.pack(anchor="w", pady=(2, 0))
-        self.lbl_budget = ttk.Label(budget_row, text="$—", style="Money.TLabel",
-                                     cursor="hand2")
+        self.lbl_budget = ttk.Label(budget_row, text="$—", style="CardValue.TLabel", cursor="hand2")
         self.lbl_budget.pack(side="left")
         self.lbl_budget.bind("<Button-1>", lambda _: self._edit_budget())
         ttk.Button(budget_row, text="✎", style="Icon.TButton", width=3,
-                   command=self._edit_budget).pack(side="left", padx=(8, 0))
+                   command=self._edit_budget).pack(side="left", padx=(6, 0))
 
-        # Column 1 — deployed + progress bar
-        col1 = ttk.Frame(bud)
-        col1.grid(row=0, column=1, padx=20, pady=8, sticky="ew")
-        ttk.Label(col1, text=_t("budget_label_deployed"),
-                  style="Muted.TLabel").pack(anchor="w")
-        self.lbl_invested = ttk.Label(col1, text="$— / $— (—%)",
-                                       style="MoneyMid.TLabel")
+        # Card 1: Deployed
+        c1 = ttk.Frame(crd, style="Card.TFrame")
+        c1.grid(row=0, column=1, sticky="ew", padx=(0, 5))
+        self._accent_frame(c1, "#7c3aed")
+        i1 = ttk.Frame(c1, style="Card.TFrame")
+        i1.pack(fill="both", padx=14, pady=10)
+        ttk.Label(i1, text=_t("budget_label_deployed"), style="CardTitle.TLabel").pack(anchor="w")
+        self.lbl_invested = ttk.Label(i1, text="$— / $—  (—%)", style="CardMid.TLabel")
         self.lbl_invested.pack(anchor="w", pady=(2, 4))
-        self.bar = ttk.Progressbar(col1, mode="determinate", maximum=100,
-                                    length=260,
-                                    style="Budget.Horizontal.TProgressbar")
+        self.bar = ttk.Progressbar(i1, mode="determinate", maximum=100, length=170,
+                                   style="Budget.Horizontal.TProgressbar")
         self.bar.pack(anchor="w")
 
-        # Column 2 — today + total PnL
-        col2 = ttk.Frame(bud)
-        col2.grid(row=0, column=2, padx=20, pady=8, sticky="e")
-        # Today
-        ttk.Label(col2, text=_t("budget_label_today_pnl"),
-                  style="Muted.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 8))
-        self.lbl_pnl_today = ttk.Label(col2, text="—", style="Stat.TLabel")
-        self.lbl_pnl_today.grid(row=0, column=1, sticky="w")
-        # Total
-        ttk.Label(col2, text=_t("budget_label_total_pnl"),
-                  style="Muted.TLabel").grid(row=1, column=0, sticky="e",
-                                              padx=(0, 8), pady=(4, 0))
-        self.lbl_pnl = ttk.Label(col2, text="—", style="Stat.TLabel")
-        self.lbl_pnl.grid(row=1, column=1, sticky="w", pady=(4, 0))
+        # Card 2: Today P&L
+        c2 = ttk.Frame(crd, style="Card.TFrame")
+        c2.grid(row=0, column=2, sticky="ew", padx=(0, 5))
+        self._accent_frame(c2, "#10b981")
+        i2 = ttk.Frame(c2, style="Card.TFrame")
+        i2.pack(fill="both", padx=14, pady=10)
+        ttk.Label(i2, text=_t("budget_label_today_pnl"), style="CardTitle.TLabel").pack(anchor="w")
+        self.lbl_pnl_today = ttk.Label(i2, text="—", style="CardValue.TLabel")
+        self.lbl_pnl_today.pack(anchor="w", pady=(2, 0))
 
-        bud.columnconfigure(1, weight=1)   # middle column stretches
+        # Card 3: Total P&L
+        c3 = ttk.Frame(crd, style="Card.TFrame")
+        c3.grid(row=0, column=3, sticky="ew")
+        self._accent_frame(c3, "#f59e0b")
+        i3 = ttk.Frame(c3, style="Card.TFrame")
+        i3.pack(fill="both", padx=14, pady=10)
+        ttk.Label(i3, text=_t("budget_label_total_pnl"), style="CardTitle.TLabel").pack(anchor="w")
+        self.lbl_pnl = ttk.Label(i3, text="—", style="CardValue.TLabel")
+        self.lbl_pnl.pack(anchor="w", pady=(2, 0))
 
-        # Account row
-        acct = ttk.LabelFrame(self, text=_t("account_section"))
-        acct.pack(fill="x", **pad)
-        self.lbl_cash = ttk.Label(acct, text=f"{_t('broker_cash')}: —")
-        self.lbl_positions = ttk.Label(acct, text=f"{_t('positions')}: —")
-        self.lbl_streak = ttk.Label(acct, text=f"{_t('loss_streak')}: —")
-        self.lbl_halted = ttk.Label(acct, text=f"{_t('halted')}: —", cursor="hand2")
+        # ── Account / status info row ─────────────────────────────
+        info = ttk.Frame(parent, style="Card.TFrame")
+        info.pack(fill="x", padx=px, pady=4)
+        self.lbl_cash      = ttk.Label(info, text=f"{_t('broker_cash')}: —",  style="InfoPill.TLabel")
+        self.lbl_positions = ttk.Label(info, text=f"{_t('positions')}: —",    style="InfoPill.TLabel")
+        self.lbl_streak    = ttk.Label(info, text=f"{_t('loss_streak')}: —",  style="InfoPill.TLabel")
+        self.lbl_halted    = ttk.Label(info, text=f"{_t('halted')}: —",       style="InfoPill.TLabel", cursor="hand2")
         self.lbl_halted.bind("<Button-1>", lambda _: self._reset_halt())
-        self.lbl_recon = ttk.Label(acct, text=f"{_t('reconcile')}: —")
-        for i, w in enumerate([self.lbl_cash, self.lbl_positions, self.lbl_streak, self.lbl_halted, self.lbl_recon]):
-            w.grid(row=0, column=i, padx=12, pady=6, sticky="w")
+        self.lbl_recon     = ttk.Label(info, text=f"{_t('reconcile')}: —",    style="InfoPill.TLabel")
+        self.lbl_ai        = ttk.Label(info, text=f"{_t('ai_model')}: —",     style="InfoPill.TLabel")
+        self.lbl_vix       = ttk.Label(info, text="VIX: —",                   style="InfoPill.TLabel")
+        self.lbl_env       = ttk.Label(info, text=f"{_t('env')}: —",          style="InfoPill.TLabel")
+        for i, w in enumerate([self.lbl_cash, self.lbl_positions, self.lbl_streak,
+                                self.lbl_halted, self.lbl_recon, self.lbl_ai,
+                                self.lbl_vix, self.lbl_env]):
+            w.grid(row=0, column=i, padx=8, pady=6, sticky="w")
 
-        # Config row (AI model + thresholds)
-        cfg = ttk.LabelFrame(self, text=_t("strategy_section"))
-        cfg.pack(fill="x", **pad)
-        # Two-row strategy panel — config knobs on row 0, runtime stats on row 1.
-        self.lbl_ai = ttk.Label(cfg, text=f"{_t('ai_model')}: —")
-        self.lbl_thresh = ttk.Label(cfg, text=f"{_t('entry_threshold')} —")
-        self.lbl_interval = ttk.Label(cfg, text=f"{_t('scan_every')} —")
-        self.lbl_hold = ttk.Label(cfg, text=f"{_t('max_hold')} —")
-        self.lbl_env = ttk.Label(cfg, text=f"{_t('env')}: —")
-        for i, w in enumerate([self.lbl_ai, self.lbl_thresh, self.lbl_interval,
-                                self.lbl_hold, self.lbl_env]):
-            w.grid(row=0, column=i, padx=6, pady=2, sticky="w")
-        # Row 1 — live runtime: VIX / ML / Strategy mix
-        self.lbl_vix = ttk.Label(cfg, text="VIX: —")
-        self.lbl_ml = ttk.Label(cfg, text="ML: —")
-        self.lbl_strat = ttk.Label(cfg, text="🎯 —")
-        for i, w in enumerate([self.lbl_vix, self.lbl_ml, self.lbl_strat]):
-            w.grid(row=1, column=i, padx=6, pady=2, sticky="w", columnspan=2)
+        # ── Strategy / config row ─────────────────────────────────
+        cfg2 = ttk.Frame(parent)
+        cfg2.pack(fill="x", padx=px, pady=(0, 4))
+        self.lbl_thresh   = ttk.Label(cfg2, text=f"{_t('entry_threshold')} —", style="Muted.TLabel")
+        self.lbl_interval = ttk.Label(cfg2, text=f"{_t('scan_every')} —",      style="Muted.TLabel")
+        self.lbl_hold     = ttk.Label(cfg2, text=f"{_t('max_hold')} —",        style="Muted.TLabel")
+        self.lbl_ml       = ttk.Label(cfg2, text="ML: —",                      style="Muted.TLabel")
+        self.lbl_strat    = ttk.Label(cfg2, text="🎯 —",                       style="Muted.TLabel")
+        for i, w in enumerate([self.lbl_thresh, self.lbl_interval, self.lbl_hold,
+                                self.lbl_ml, self.lbl_strat]):
+            w.grid(row=0, column=i, padx=8, pady=2, sticky="w")
 
-        # Controls
-        ctrl = ttk.Frame(self)
-        ctrl.pack(fill="x", **pad)
-        # Two rows of buttons — row 0 = scheduler control, row 1 = data windows.
-        self.btn_start = ttk.Button(ctrl, text=_t("btn_start"), command=self.start_scheduler)
-        self.btn_stop = ttk.Button(ctrl, text=_t("btn_stop"), command=self.stop_scheduler)
-        self.btn_scan = ttk.Button(ctrl, text=_t("btn_scan"), command=self.scan_now)
-        self.btn_logs = ttk.Button(ctrl, text=_t("btn_log"), command=self.open_logs)
-        for i, b in enumerate([self.btn_start, self.btn_stop, self.btn_scan, self.btn_logs]):
-            b.grid(row=0, column=i, padx=3, pady=2, sticky="ew")
-
-        self.btn_hist = ttk.Button(ctrl, text=_t("btn_history"), command=self.open_history)
-        self.btn_bt = ttk.Button(ctrl, text=_t("btn_backtest"), command=self.open_backtest)
-        self.btn_equity = ttk.Button(ctrl, text=_t("btn_equity"), command=self.open_equity)
-        self.btn_audit = ttk.Button(ctrl, text=_t("btn_audit"), command=self.open_audit)
-        self.btn_wl = ttk.Button(ctrl, text=_t("btn_watchlist"), command=self.open_watchlist)
-        self.btn_wl_refresh = ttk.Button(ctrl, text="🔄 Refresh WL",
-                                          command=self.refresh_watchlist)
-        self.btn_sect = ttk.Button(ctrl, text=_t("btn_sectors"), command=self.open_sectors)
-        self.btn_ml = ttk.Button(ctrl, text=_t("btn_ml"), command=self.open_ml)
-        row1 = [self.btn_hist, self.btn_bt, self.btn_equity, self.btn_audit,
-                self.btn_wl, self.btn_wl_refresh, self.btn_sect, self.btn_ml]
-        for i, b in enumerate(row1):
-            b.grid(row=1, column=i, padx=3, pady=2, sticky="ew")
-        # Make columns expand evenly so buttons fill the row.
-        for i in range(max(4, len(row1))):
-            ctrl.columnconfigure(i, weight=1, uniform="btn")
-
-        # Positions
-        pos = ttk.LabelFrame(self, text=_t("positions_section"))
-        pos.pack(fill="x", **pad)
+        # ── Positions table ───────────────────────────────────────
+        pos = ttk.LabelFrame(parent, text=_t("positions_section"),
+                             style="Section.TLabelframe")
+        pos.pack(fill="x", padx=px, pady=4)
         cols = ("symbol", "qty", "entry", "last", "stop", "tp", "atr", "pnl")
         col_headers = [_t("col_symbol"), _t("col_qty"), _t("col_entry"),
                        _t("col_last"), _t("col_stop"), _t("col_tp"),
@@ -425,23 +756,23 @@ class App(tk.Tk):
         for c, h, w in zip(cols, col_headers, widths):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="center")
-        # Colour tags for P&L
-        self.tree.tag_configure("win", foreground="#006600")
-        self.tree.tag_configure("loss", foreground="#aa0000")
+        self.tree.tag_configure("win",  foreground=THEME["success"])
+        self.tree.tag_configure("loss", foreground=THEME["danger"])
         self.tree.pack(fill="x", padx=6, pady=6)
 
-        # Right-click context menu for manual override.
+        # Right-click context menu
         self.pos_menu = tk.Menu(self, tearoff=0)
         self.pos_menu.add_command(label=_t("menu_close_now"), command=self._ctx_close)
         self.pos_menu.add_command(label=_t("menu_edit_stop"), command=self._ctx_edit_stop)
-        self.tree.bind("<Button-2>", self._on_pos_right_click)   # macOS right-click
-        self.tree.bind("<Button-3>", self._on_pos_right_click)   # Linux/Windows
-        self.tree.bind("<Control-Button-1>", self._on_pos_right_click)  # macOS ctrl-click
+        self.tree.bind("<Button-2>",          self._on_pos_right_click)
+        self.tree.bind("<Button-3>",          self._on_pos_right_click)
+        self.tree.bind("<Control-Button-1>",  self._on_pos_right_click)
 
-        # Log tail
-        logbox = ttk.LabelFrame(self, text=_t("log_section"))
-        logbox.pack(fill="both", expand=True, **pad)
-        self.log_text = tk.Text(logbox, wrap="word", height=14, font=("Menlo", 11))
+        # ── Log tail ─────────────────────────────────────────────
+        logbox = ttk.LabelFrame(parent, text=_t("log_section"),
+                                style="Section.TLabelframe")
+        logbox.pack(fill="both", expand=True, padx=px, pady=(4, py))
+        self.log_text = tk.Text(logbox, wrap="word", height=12, font=("Menlo", 11))
         ysb = ttk.Scrollbar(logbox, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=ysb.set, state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -546,9 +877,13 @@ class App(tk.Tk):
     def open_history(self) -> None:
         win = tk.Toplevel(self)
         win.title("Trading History")
-        win.geometry("780x440")
+        win.geometry("840x500")
+        _apply_theme(win)
+        ttk.Label(win, text="Per-scan + weekly digest of account state",
+                  background=THEME["bg"], foreground=THEME["muted"],
+                  font=("SF Pro", 11)).pack(anchor="w", padx=14, pady=(10, 4))
         nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
+        nb.pack(fill="both", expand=True, padx=10, pady=(4, 10))
 
         # All snapshots tab
         all_frame = ttk.Frame(nb)
@@ -750,11 +1085,9 @@ class App(tk.Tk):
             self.lbl_cash.configure(text=_t("broker_cash_waiting"))
         self.lbl_streak.configure(text=f"{_t('loss_streak')}: {state.get('loss_streak_days', 0)}d")
         if state.get("halted"):
-            self.lbl_halted.configure(
-                text=f"{_t('halted')}: {_t('halted_yes')}  ({_t('halted_reset_label')})"
-            )
+            self.lbl_halted.configure(text=_t("halted_label_yes"))
         else:
-            self.lbl_halted.configure(text=f"{_t('halted')}: {_t('halted_no')}")
+            self.lbl_halted.configure(text=_t("halted_label_no"))
         recon = read_json(RECONCILE_FILE)
         if recon:
             badge = "🟢" if recon.get("ok") else "⚠️"
@@ -888,6 +1221,9 @@ class App(tk.Tk):
     def open_ml(self) -> None:
         MLWindow(self)
 
+    def open_signal_reporter(self) -> None:
+        SignalReporterWindow(self)
+
     # ---------- right-click context menu actions ----------
     def _on_pos_right_click(self, event) -> None:
         row = self.tree.identify_row(event.y)
@@ -962,8 +1298,9 @@ class BacktestWindow(tk.Toplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("Backtest")
-        self.geometry("820x620")
+        self.geometry("880x660")
         self.resizable(True, True)
+        _apply_theme(self)
         self._running = False
         self._build()
         # Auto-load last results if available
@@ -971,39 +1308,54 @@ class BacktestWindow(tk.Toplevel):
             self._load_saved()
 
     def _build(self) -> None:
-        pad = {"padx": 8, "pady": 4}
+        pad = {"padx": 10, "pady": 6}
 
-        # Config bar
-        cfg = ttk.LabelFrame(self, text="Configuration")
+        # Configuration card
+        cfg = ttk.LabelFrame(self, text="  ⚙ Configuration  ",
+                              style="Section.TLabelframe")
         cfg.pack(fill="x", **pad)
 
-        ttk.Label(cfg, text="Days:").grid(row=0, column=0, padx=6, pady=4, sticky="e")
+        # Use a Frame inside so we control padding precisely
+        inner = ttk.Frame(cfg)
+        inner.pack(fill="x", padx=8, pady=4)
+
+        ttk.Label(inner, text="Days").grid(row=0, column=0, padx=4, pady=4, sticky="e")
         self.var_days = tk.StringVar(value="180")
-        days_cb = ttk.Combobox(cfg, textvariable=self.var_days, values=["60", "90", "180", "365"], width=6, state="readonly")
-        days_cb.grid(row=0, column=1, padx=4, pady=4, sticky="w")
+        ttk.Combobox(inner, textvariable=self.var_days,
+                     values=["60", "90", "180", "365"],
+                     width=6, state="readonly").grid(row=0, column=1, padx=(2, 14), pady=4, sticky="w")
 
-        ttk.Label(cfg, text="Timeframe:").grid(row=0, column=2, padx=6, sticky="e")
+        ttk.Label(inner, text="Timeframe").grid(row=0, column=2, padx=4, sticky="e")
         self.var_tf = tk.StringVar(value="HOUR_1")
-        tf_cb = ttk.Combobox(cfg, textvariable=self.var_tf, values=["HOUR_1", "DAILY"], width=8, state="readonly")
-        tf_cb.grid(row=0, column=3, padx=4, pady=4, sticky="w")
+        ttk.Combobox(inner, textvariable=self.var_tf,
+                     values=["HOUR_1", "DAILY"],
+                     width=10, state="readonly").grid(row=0, column=3, padx=(2, 14), pady=4, sticky="w")
 
-        ttk.Label(cfg, text="Threshold:").grid(row=0, column=4, padx=6, sticky="e")
+        ttk.Label(inner, text="Threshold").grid(row=0, column=4, padx=4, sticky="e")
         self.var_thresh = tk.StringVar(value="70")
-        ttk.Entry(cfg, textvariable=self.var_thresh, width=5).grid(row=0, column=5, padx=4, pady=4, sticky="w")
+        ttk.Entry(inner, textvariable=self.var_thresh, width=6).grid(row=0, column=5, padx=(2, 14), pady=4, sticky="w")
 
-        ttk.Label(cfg, text="Tickers (comma, blank=watchlist):").grid(row=0, column=6, padx=6, sticky="e")
+        ttk.Label(inner, text="Tickers").grid(row=0, column=6, padx=4, sticky="e")
         self.var_tickers = tk.StringVar(value="")
-        ttk.Entry(cfg, textvariable=self.var_tickers, width=22).grid(row=0, column=7, padx=4, pady=4, sticky="w")
+        e = ttk.Entry(inner, textvariable=self.var_tickers, width=24)
+        e.grid(row=0, column=7, padx=(2, 14), pady=4, sticky="w")
+        # Placeholder hint
+        ttk.Label(inner, text="(blank = use watchlist)",
+                  foreground=THEME["muted"], font=("SF Pro", 9)).grid(row=1, column=7, sticky="w", padx=2)
 
-        self.btn_run = ttk.Button(cfg, text="▶ Run Backtest", command=self._run)
-        self.btn_run.grid(row=0, column=8, padx=10, pady=4)
+        self.btn_run = ttk.Button(inner, text="▶  Run Backtest",
+                                   style="Primary.TButton", command=self._run)
+        self.btn_run.grid(row=0, column=8, padx=8, pady=4)
 
-        # Progress
+        # Progress bar
         prog = ttk.Frame(self)
-        prog.pack(fill="x", padx=8, pady=2)
-        self.lbl_prog = ttk.Label(prog, text="Ready. (Load previous results or click Run.)")
+        prog.pack(fill="x", padx=10, pady=(0, 4))
+        self.lbl_prog = ttk.Label(prog,
+                                   text="Ready — load previous results or run a new test.",
+                                   foreground=THEME["muted"], font=("SF Pro", 10))
         self.lbl_prog.pack(side="left")
-        self.progressbar = ttk.Progressbar(prog, mode="indeterminate", length=180)
+        self.progressbar = ttk.Progressbar(prog, mode="indeterminate", length=180,
+                                            style="Budget.Horizontal.TProgressbar")
         self.progressbar.pack(side="right", padx=6)
 
         # Notebook for results
@@ -1096,10 +1448,17 @@ class BacktestWindow(tk.Toplevel):
 
             n_tickers = len(tickers) or len(json.loads((ROOT / "config" / "watchlist.json").read_text())["tickers"])
 
+            # progress fires from BOTH phases — prefetch (small total ≈ n_tickers)
+            # and simulation (total = events ≈ n_tickers × bars, much larger).
+            # Use the magnitude of `total` to pick the right label so the user
+            # sees the phase shift instead of a frozen "Fetching X" during sim.
             def progress(cur, total, sym):
-                self.after(0, lambda c=cur, t=total, s=sym: self.lbl_prog.configure(
-                    text=f"Fetching {s}… ({c+1}/{t})"
-                ))
+                pct = int((cur + 1) / max(total, 1) * 100)
+                if total > n_tickers * 2:
+                    label = f"Simulating {sym}… ({pct}%)"
+                else:
+                    label = f"Fetching {sym}… ({cur+1}/{total})"
+                self.after(0, lambda l=label: self.lbl_prog.configure(text=l))
 
             result = run_backtest(cfg, progress_cb=progress)
             self.after(0, lambda: self._show_results(result))
@@ -1212,6 +1571,253 @@ class BacktestWindow(tk.Toplevel):
         )
 
 
+# ---------- Signal Reporter window ----------
+
+class SignalReporterWindow(tk.Toplevel):
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.title("Signal Reporter")
+        self.geometry("560x700")
+        _apply_theme(self)
+        self._build()
+        self._load_watchlist()
+        self._refresh_status()
+
+    def _build(self) -> None:
+        ttk.Label(
+            self,
+            text="Independent signal watchlist — sends Telegram signals every 30 min during peak hours.",
+            background=THEME["bg"], foreground=THEME["muted"],
+            wraplength=530, font=("SF Pro", 10),
+        ).pack(anchor="w", padx=14, pady=(10, 0))
+
+        # ── Scheduler controls ───────────────────────────────────────
+        ctrl = ttk.LabelFrame(self, text="  Scheduler  ", style="Section.TLabelframe")
+        ctrl.pack(fill="x", padx=12, pady=(8, 4))
+        inner = ttk.Frame(ctrl)
+        inner.pack(fill="x", padx=8, pady=8)
+
+        self.lbl_status = ttk.Label(inner, text="⚪ Stopped",
+                                     font=("SF Pro", 12, "bold"),
+                                     foreground=THEME["muted"])
+        self.lbl_status.pack(side="left", padx=(0, 12))
+
+        self.btn_sr_start = ttk.Button(inner, text="▶  Start",
+                                        style="Primary.TButton",
+                                        command=self._start)
+        self.btn_sr_start.pack(side="left", padx=(0, 4))
+        self.btn_sr_stop = ttk.Button(inner, text="■  Stop", command=self._stop)
+        self.btn_sr_stop.pack(side="left", padx=(0, 12))
+
+        ttk.Button(inner, text="📊 Premarket Now",
+                   command=self._run_premarket).pack(side="right", padx=(4, 0))
+        ttk.Button(inner, text="⚡ Intraday Now",
+                   command=self._run_intraday).pack(side="right", padx=4)
+
+        # ── Watchlist editor ────────────────────────────────────────
+        wl = ttk.LabelFrame(self, text="  Watchlist  ", style="Section.TLabelframe")
+        wl.pack(fill="x", padx=12, pady=4)
+
+        top = ttk.Frame(wl)
+        top.pack(fill="x", padx=8, pady=(6, 4))
+        ttk.Label(top, text="Symbol:", foreground=THEME["muted"]).pack(side="left", padx=(0, 4))
+        self.var_new = tk.StringVar()
+        e = ttk.Entry(top, textvariable=self.var_new, width=10, font=("Menlo", 11))
+        e.pack(side="left", padx=4)
+        e.bind("<Return>", lambda _: self._add_ticker())
+        ttk.Button(top, text="➕  Add",   command=self._add_ticker).pack(side="left", padx=2)
+        ttk.Button(top, text="🗑  Remove", command=self._remove_ticker).pack(side="left", padx=2)
+        ttk.Button(top, text="💾  Save", style="Primary.TButton",
+                   command=self._save_watchlist).pack(side="right")
+
+        list_frame = ttk.Frame(wl)
+        list_frame.pack(fill="x", padx=8, pady=(0, 4))
+        self.listbox = tk.Listbox(
+            list_frame, font=("Menlo", 12), selectmode="extended",
+            bg=THEME["card_bg"], fg=THEME["text"],
+            selectbackground=THEME["primary"], selectforeground="white",
+            relief="solid", borderwidth=1, highlightthickness=0,
+            activestyle="none", height=7,
+        )
+        lb_sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=lb_sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        lb_sb.pack(side="right", fill="y")
+
+        self.lbl_wl_status = ttk.Label(wl, text="",
+                                        background=THEME["bg"], foreground=THEME["muted"],
+                                        font=("SF Pro", 10))
+        self.lbl_wl_status.pack(anchor="w", padx=8, pady=(2, 8))
+
+        # ── Log tail ────────────────────────────────────────────────
+        log_frame = ttk.LabelFrame(self, text="  Log  ", style="Section.TLabelframe")
+        log_frame.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+
+        log_top = ttk.Frame(log_frame)
+        log_top.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(log_top, text="📂 Open File", style="Icon.TButton",
+                   command=lambda: subprocess.run(["open", str(SIGNAL_LOG_FILE)])).pack(side="right", padx=4)
+        ttk.Button(log_top, text="🔄", style="Icon.TButton",
+                   command=self._tail_log).pack(side="right")
+
+        self.log_text = tk.Text(
+            log_frame, wrap="word", height=10, font=("Menlo", 10),
+            bg=THEME["card_bg"], fg=THEME["text"],
+            relief="solid", borderwidth=1, highlightthickness=0, padx=6, pady=4,
+        )
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_sb.set, state="disabled")
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        log_sb.pack(side="right", fill="y", padx=(0, 8), pady=(0, 8))
+
+        self._tail_log()
+        self.after(5000, self._auto_refresh)
+
+    def _auto_refresh(self) -> None:
+        if not self.winfo_exists():
+            return
+        self._refresh_status()
+        self._tail_log()
+        self.after(5000, self._auto_refresh)
+
+    def _read_signal_pid(self) -> int | None:
+        try:
+            pid = int(SIGNAL_PID_FILE.read_text().strip())
+            return pid if is_process_alive(pid) else None
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def _refresh_status(self) -> None:
+        pid = self._read_signal_pid()
+        if pid:
+            self.lbl_status.configure(text=f"🟢 Running (PID {pid})",
+                                       foreground=THEME["success"])
+        else:
+            self.lbl_status.configure(text="⚪ Stopped", foreground=THEME["muted"])
+
+    def _start(self) -> None:
+        if self._read_signal_pid() is not None:
+            self.lbl_wl_status.configure(text="Signal reporter is already running")
+            return
+        SIGNAL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log_fd = open(SIGNAL_LOG_FILE, "a")
+        proc = subprocess.Popen(
+            [PYTHON, "-m", "src.signal_reporter", "run"],
+            cwd=str(ROOT), stdout=log_fd, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        SIGNAL_PID_FILE.write_text(str(proc.pid))
+        self.lbl_wl_status.configure(text=f"Started (PID {proc.pid})")
+        self._refresh_status()
+
+    def _stop(self) -> None:
+        pid = self._read_signal_pid()
+        if pid is None:
+            self.lbl_wl_status.configure(text="Signal reporter is not running")
+            return
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        for _ in range(10):
+            if not is_process_alive(pid):
+                break
+            time.sleep(0.3)
+        try:
+            SIGNAL_PID_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        self.lbl_wl_status.configure(text="Stopped")
+        self._refresh_status()
+
+    def _run_premarket(self) -> None:
+        self.lbl_wl_status.configure(text="Running premarket analysis…")
+        threading.Thread(target=self._do_run, args=("premarket",), daemon=True).start()
+
+    def _run_intraday(self) -> None:
+        self.lbl_wl_status.configure(text="Running intraday scan…")
+        threading.Thread(target=self._do_run, args=("intraday",), daemon=True).start()
+
+    def _do_run(self, mode: str) -> None:
+        SIGNAL_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                [PYTHON, "-m", "src.signal_reporter", mode],
+                cwd=str(ROOT),
+                stdout=open(SIGNAL_LOG_FILE, "a"),
+                stderr=subprocess.STDOUT,
+                timeout=180,
+            )
+            self.after(0, lambda: self.lbl_wl_status.configure(
+                text=f"✓ {mode.capitalize()} done — check Telegram"
+            ))
+        except subprocess.TimeoutExpired:
+            self.after(0, lambda: self.lbl_wl_status.configure(text=f"⚠ {mode} timed out"))
+        except Exception as e:
+            self.after(0, lambda: self.lbl_wl_status.configure(text=f"⚠ {mode} error: {e}"))
+        self.after(0, self._tail_log)
+
+    def _load_watchlist(self) -> None:
+        if not SIGNAL_WL_FILE.exists():
+            self.lbl_wl_status.configure(text="No signal watchlist file found")
+            return
+        try:
+            data = json.loads(SIGNAL_WL_FILE.read_text())
+            for t in data.get("tickers", []):
+                self.listbox.insert("end", t)
+            self.lbl_wl_status.configure(text=f"Loaded {self.listbox.size()} tickers")
+        except Exception as e:
+            self.lbl_wl_status.configure(text=f"Load error: {e}")
+
+    def _add_ticker(self) -> None:
+        sym = self.var_new.get().strip().upper()
+        if not sym:
+            return
+        if sym in set(self.listbox.get(0, "end")):
+            self.lbl_wl_status.configure(text=f"{sym} already in list")
+            return
+        self.listbox.insert("end", sym)
+        self.var_new.set("")
+        self.lbl_wl_status.configure(text=f"Added {sym}  — click Save to persist")
+
+    def _remove_ticker(self) -> None:
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        for i in reversed(sel):
+            self.listbox.delete(i)
+        self.lbl_wl_status.configure(text=f"Removed {len(sel)} ticker(s)  — click Save to persist")
+
+    def _save_watchlist(self) -> None:
+        tickers = list(self.listbox.get(0, "end"))
+        try:
+            SIGNAL_WL_FILE.write_text(json.dumps({"tickers": tickers}, indent=2))
+            self.lbl_wl_status.configure(text=f"✓ Saved {len(tickers)} tickers")
+        except Exception as e:
+            self.lbl_wl_status.configure(text=f"Save failed: {e}")
+
+    def _tail_log(self) -> None:
+        if not SIGNAL_LOG_FILE.exists():
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.insert("1.0", f"Log file not found: {SIGNAL_LOG_FILE}\nRun premarket or intraday to generate output.")
+            self.log_text.configure(state="disabled")
+            return
+        try:
+            with open(SIGNAL_LOG_FILE, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 6000))
+                tail = f.read().decode(errors="replace")
+        except OSError:
+            return
+        body = "\n".join(tail.splitlines()[-100:])
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert("1.0", body)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+
 # ---------- helpers ----------
 
 def _confirm(parent, title: str, msg: str) -> bool:
@@ -1256,30 +1862,38 @@ class EquityWindow(tk.Toplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("Equity Curve")
-        self.geometry("900x600")
+        self.geometry("960x640")
+        _apply_theme(self)
         self._build()
         self._refresh()
 
     def _build(self) -> None:
+        # Toolbar
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=6, pady=4)
-        ttk.Label(top, text="Source:").pack(side="left")
+        top.pack(fill="x", padx=12, pady=(10, 6))
+        ttk.Label(top, text="Source:",
+                  foreground=THEME["muted"]).pack(side="left", padx=(0, 4))
         self.var_src = tk.StringVar(value="closed_trades")
         ttk.Combobox(top, textvariable=self.var_src,
                      values=["closed_trades", "snapshot_history"],
-                     width=20, state="readonly").pack(side="left", padx=6)
-        ttk.Button(top, text="🔄 Refresh", command=self._refresh).pack(side="left", padx=4)
-        self.lbl_stats = ttk.Label(top, text="—", font=("SF Pro", 11))
+                     width=20, state="readonly").pack(side="left", padx=4)
+        ttk.Button(top, text="🔄 Refresh",
+                   command=self._refresh).pack(side="left", padx=4)
+        self.lbl_stats = ttk.Label(top, text="—",
+                                    font=("Menlo", 11, "bold"),
+                                    foreground=THEME["text_strong"])
         self.lbl_stats.pack(side="right", padx=8)
 
-        # Embed matplotlib figure
+        # Embed matplotlib figure with our background colour so the chart
+        # frame blends with the window theme.
         import matplotlib
         matplotlib.use("TkAgg")
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        self.fig = Figure(figsize=(8, 4.8), dpi=100)
+        self.fig = Figure(figsize=(8, 4.8), dpi=100, facecolor=THEME["bg"])
         self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True,
+                                          padx=12, pady=(0, 12))
 
     def _refresh(self) -> None:
         src = self.var_src.get()
@@ -1328,25 +1942,41 @@ class EquityWindow(tk.Toplevel):
 
     def _plot_equity(self, equity: list[float], labels: list[str]) -> None:
         ax = self.fig.add_subplot(111)
-        ax.plot(equity, linewidth=1.6, color="#1f6feb")
+        # White plotting area on the themed window background.
+        ax.set_facecolor(THEME["card_bg"])
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        ax.spines["left"].set_color(THEME["border"])
+        ax.spines["bottom"].set_color(THEME["border"])
+
+        ax.plot(equity, linewidth=2.0, color=THEME["primary"],
+                solid_capstyle="round")
         ax.fill_between(range(len(equity)), equity, 0,
                         where=[e >= 0 for e in equity],
-                        color="#1f6feb", alpha=0.10)
-        # Drawdown shading
-        peak = 0
+                        color=THEME["primary"], alpha=0.10)
+
+        # Drawdown shading on a secondary axis.
+        peak = 0.0
         dd = []
         for e in equity:
             peak = max(peak, e)
             dd.append(e - peak)
         ax2 = ax.twinx()
-        ax2.fill_between(range(len(dd)), dd, 0, color="#d33", alpha=0.18, label="Drawdown")
-        ax2.set_ylabel("Drawdown ($)", color="#aa3333")
-        ax2.tick_params(axis="y", labelcolor="#aa3333")
+        for spine in ("top", "right", "left", "bottom"):
+            ax2.spines[spine].set_visible(False)
+        ax2.fill_between(range(len(dd)), dd, 0,
+                         color=THEME["danger"], alpha=0.15, label="Drawdown")
+        ax2.set_ylabel("Drawdown ($)", color=THEME["danger"], fontsize=10)
+        ax2.tick_params(axis="y", labelcolor=THEME["danger"], labelsize=9)
 
-        ax.set_ylabel("Cumulative PnL ($)")
-        ax.set_xlabel("Trades / snapshots →")
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color="#888", linewidth=0.7)
+        ax.set_ylabel("Cumulative PnL ($)", fontsize=10,
+                       color=THEME["text_strong"])
+        ax.set_xlabel("Trades / Snapshots →", fontsize=10,
+                       color=THEME["muted"])
+        ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.7)
+        ax.axhline(0, color=THEME["muted"], linewidth=0.8, alpha=0.6)
+        ax.tick_params(colors=THEME["muted"], labelsize=9)
+
         if labels and len(labels) > 8:
             step = max(1, len(labels) // 8)
             ax.set_xticks(range(0, len(labels), step))
@@ -1361,25 +1991,31 @@ class AuditWindow(tk.Toplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("AI Decisions & Audit Log")
-        self.geometry("900x600")
+        self.geometry("960x640")
+        _apply_theme(self)
         self._build()
         self._refresh()
 
     def _build(self) -> None:
+        # Toolbar
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=6, pady=4)
-        ttk.Button(top, text="🔄 Refresh", command=self._refresh).pack(side="left", padx=4)
-        ttk.Label(top, text="  Filter:").pack(side="left")
+        top.pack(fill="x", padx=12, pady=(10, 6))
+        ttk.Button(top, text="🔄 Refresh",
+                   command=self._refresh).pack(side="left", padx=(0, 8))
+        ttk.Label(top, text="Filter:",
+                  foreground=THEME["muted"]).pack(side="left", padx=(4, 4))
         self.var_filter = tk.StringVar(value="all")
         ttk.Combobox(top, textvariable=self.var_filter,
                      values=["all", "buy", "skip", "error"],
                      width=10, state="readonly").pack(side="left", padx=4)
         self.var_filter.trace_add("write", lambda *_: self._refresh())
-        self.lbl_summary = ttk.Label(top, text="—", font=("SF Pro", 11))
+        self.lbl_summary = ttk.Label(top, text="—",
+                                      font=("Menlo", 11, "bold"),
+                                      foreground=THEME["text_strong"])
         self.lbl_summary.pack(side="right", padx=8)
 
         nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=6, pady=4)
+        nb.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
         # Tab 1: Decisions table
         t1 = ttk.Frame(nb)
@@ -1394,9 +2030,9 @@ class AuditWindow(tk.Toplevel):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tree.tag_configure("buy", foreground="#006600")
-        self.tree.tag_configure("skip", foreground="#666666")
-        self.tree.tag_configure("error", foreground="#aa0000")
+        self.tree.tag_configure("buy",   foreground=THEME["success"])
+        self.tree.tag_configure("skip",  foreground=THEME["muted"])
+        self.tree.tag_configure("error", foreground=THEME["danger"])
 
         # Tab 2: Skip-gate summary
         t2 = ttk.Frame(nb)
@@ -1453,30 +2089,58 @@ class WatchlistWindow(tk.Toplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("Watchlist Editor")
-        self.geometry("420x540")
+        self.geometry("460x580")
+        _apply_theme(self)
         self._build()
         self._load()
 
     def _build(self) -> None:
+        # Header hint
+        ttk.Label(self,
+                  text="Edit candidate tickers. Auto-refreshed weekly from S&P 500.",
+                  background=THEME["bg"], foreground=THEME["muted"],
+                  font=("SF Pro", 10)).pack(anchor="w", padx=14, pady=(10, 0))
+
+        # Toolbar
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=8, pady=6)
-        ttk.Label(top, text="Symbol:").pack(side="left")
+        top.pack(fill="x", padx=14, pady=(6, 4))
+        ttk.Label(top, text="Symbol:",
+                  foreground=THEME["muted"]).pack(side="left", padx=(0, 4))
         self.var_new = tk.StringVar()
-        e = ttk.Entry(top, textvariable=self.var_new, width=12)
+        e = ttk.Entry(top, textvariable=self.var_new, width=10,
+                       font=("Menlo", 11))
         e.pack(side="left", padx=4)
         e.bind("<Return>", lambda _: self._add())
-        ttk.Button(top, text="➕ Add", command=self._add).pack(side="left", padx=4)
-        ttk.Button(top, text="🗑 Remove", command=self._remove).pack(side="left", padx=4)
-        ttk.Button(top, text="💾 Save", command=self._save).pack(side="right", padx=4)
+        ttk.Button(top, text="➕  Add",
+                   command=self._add).pack(side="left", padx=2)
+        ttk.Button(top, text="🗑  Remove",
+                   command=self._remove).pack(side="left", padx=2)
+        ttk.Button(top, text="💾  Save",
+                   style="Primary.TButton",
+                   command=self._save).pack(side="right")
 
-        self.list = tk.Listbox(self, font=("Menlo", 12), selectmode="extended")
-        sb = ttk.Scrollbar(self, orient="vertical", command=self.list.yview)
+        # Listbox in its own frame for clean borders
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=(6, 6))
+        self.list = tk.Listbox(list_frame, font=("Menlo", 12),
+                                selectmode="extended",
+                                bg=THEME["card_bg"], fg=THEME["text"],
+                                selectbackground=THEME["primary"],
+                                selectforeground="white",
+                                relief="solid", borderwidth=1,
+                                highlightthickness=0,
+                                activestyle="none")
+        sb = ttk.Scrollbar(list_frame, orient="vertical",
+                            command=self.list.yview)
         self.list.configure(yscrollcommand=sb.set)
-        self.list.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=4)
-        sb.pack(side="right", fill="y", pady=4)
+        self.list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
 
-        self.lbl_status = ttk.Label(self, text="", font=("SF Pro", 10))
-        self.lbl_status.pack(side="bottom", fill="x", padx=8, pady=2)
+        self.lbl_status = ttk.Label(self, text="",
+                                     background=THEME["bg"],
+                                     foreground=THEME["muted"],
+                                     font=("SF Pro", 10))
+        self.lbl_status.pack(side="bottom", fill="x", padx=14, pady=(2, 10))
 
     def _load(self) -> None:
         if not WATCHLIST_FILE.exists():
@@ -1542,7 +2206,8 @@ class SectorHeatmapWindow(tk.Toplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("Sector Heat-map")
-        self.geometry("820x540")
+        self.geometry("860x580")
+        _apply_theme(self)
         self._build()
 
     def _build(self) -> None:
@@ -1556,7 +2221,7 @@ class SectorHeatmapWindow(tk.Toplevel):
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        self.canvas = tk.Canvas(frame, bg="#f6f7f9", highlightthickness=0)
+        self.canvas = tk.Canvas(frame, bg=THEME["card_bg"], highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
         scrollbar.pack(side="right", fill="y")
@@ -1719,32 +2384,47 @@ class MLWindow(tk.Toplevel):
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.title("ML Model")
-        self.geometry("760x600")
+        self.geometry("820x660")
+        _apply_theme(self)
         self._build()
         self._refresh()
 
     def _build(self) -> None:
+        # Header strip
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=8, pady=6)
-        self.lbl_status = ttk.Label(top, text="—", font=("SF Pro", 12, "bold"))
+        top.pack(fill="x", padx=14, pady=(12, 6))
+        self.lbl_status = ttk.Label(top, text="—",
+                                     font=("SF Pro", 13, "bold"),
+                                     foreground=THEME["text_strong"])
         self.lbl_status.pack(side="left")
-        ttk.Button(top, text="🔄 Refresh", command=self._refresh).pack(side="right", padx=4)
-        ttk.Button(top, text="🧠 Train Now", command=self._train).pack(side="right", padx=4)
+        ttk.Button(top, text="🧠  Train Now",
+                   style="Primary.TButton",
+                   command=self._train).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="🔄 Refresh",
+                   command=self._refresh).pack(side="right", padx=4)
 
         # Notebook: Overview + Calibration
         nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=6, pady=4)
+        nb.pack(fill="both", expand=True, padx=12, pady=(4, 12))
 
         # Tab 1: Overview (metrics + feature importance)
         tab_ov = ttk.Frame(nb)
         nb.add(tab_ov, text=_t("ml_tab_overview"))
-        self.txt_metrics = tk.Text(tab_ov, height=8, font=("Menlo", 11), wrap="word")
-        self.txt_metrics.pack(fill="x", padx=4, pady=4)
+        self.txt_metrics = tk.Text(tab_ov, height=8, font=("Menlo", 11),
+                                    wrap="word",
+                                    bg=THEME["card_bg"], fg=THEME["text"],
+                                    relief="solid", borderwidth=1,
+                                    highlightthickness=0, padx=8, pady=6)
+        self.txt_metrics.pack(fill="x", padx=6, pady=6)
         self.txt_metrics.configure(state="disabled")
         ttk.Label(tab_ov, text="Feature importance (top 20)",
-                  font=("SF Pro", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 0))
-        self.fi_canvas = tk.Canvas(tab_ov, bg="white", height=380)
-        self.fi_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+                  font=("SF Pro", 11, "bold"),
+                  foreground=THEME["text_strong"]).pack(anchor="w",
+                                                         padx=10, pady=(8, 2))
+        self.fi_canvas = tk.Canvas(tab_ov, bg=THEME["card_bg"], height=380,
+                                    relief="solid", borderwidth=1,
+                                    highlightthickness=0)
+        self.fi_canvas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         # Cache the last feature_importance dict so the canvas can redraw
         # itself on window resize (otherwise bars vanish when user enlarges
         # the window after first paint).
@@ -1757,20 +2437,25 @@ class MLWindow(tk.Toplevel):
         # Tab 2: Calibration (predicted proba vs actual outcome)
         tab_cal = ttk.Frame(nb)
         nb.add(tab_cal, text=_t("ml_tab_calibration"))
-        self.lbl_calib_brier = ttk.Label(tab_cal, text="—", font=("SF Pro", 11, "bold"))
-        self.lbl_calib_brier.pack(anchor="w", padx=8, pady=(8, 0))
+        self.lbl_calib_brier = ttk.Label(tab_cal, text="—",
+                                          font=("SF Pro", 12, "bold"),
+                                          foreground=THEME["text_strong"])
+        self.lbl_calib_brier.pack(anchor="w", padx=12, pady=(10, 0))
         ttk.Label(tab_cal, text=_t("ml_calibration_title"),
-                  font=("SF Pro", 11)).pack(anchor="w", padx=8)
+                  foreground=THEME["muted"],
+                  font=("SF Pro", 11)).pack(anchor="w", padx=12, pady=(2, 4))
         cal_cols = ("range", "n", "mean_proba", "winrate", "diff", "mean_r")
         cal_widths = (110, 60, 100, 90, 80, 80)
-        self.cal_tree = ttk.Treeview(tab_cal, columns=cal_cols, show="headings", height=8)
+        self.cal_tree = ttk.Treeview(tab_cal, columns=cal_cols,
+                                      show="headings", height=8)
         for c, w in zip(cal_cols, cal_widths):
             self.cal_tree.heading(c, text=c.upper())
             self.cal_tree.column(c, width=w, anchor="center")
-        self.cal_tree.pack(fill="x", padx=8, pady=8)
-        self.lbl_calib_note = ttk.Label(tab_cal, text="", wraplength=720,
-                                         font=("SF Pro", 10), foreground="#555")
-        self.lbl_calib_note.pack(anchor="w", padx=8, pady=8)
+        self.cal_tree.pack(fill="x", padx=12, pady=8)
+        self.lbl_calib_note = ttk.Label(tab_cal, text="", wraplength=760,
+                                         font=("SF Pro", 10),
+                                         foreground=THEME["muted"])
+        self.lbl_calib_note.pack(anchor="w", padx=12, pady=8)
 
     def _refresh(self) -> None:
         if not self.META_FILE.exists():
@@ -1916,6 +2601,170 @@ class MLWindow(tk.Toplevel):
         self.txt_metrics.configure(state="disabled")
         if ok:
             self._refresh()
+
+
+# ---------- Help / Glossary window ----------
+
+class HelpWindow(tk.Toplevel):
+    """In-app glossary + feature documentation.
+
+    Left side: tree of categories → terms (from src/glossary.py).
+    Right side: scrollable formatted text with the term's explanation.
+    """
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.title("Help · Glossary")
+        self.geometry("980x680")
+        _apply_theme(self)
+        self._build()
+        self._populate_tree()
+
+    def _build(self) -> None:
+        # Header strip
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=14, pady=(12, 6))
+        ttk.Label(header, text="📚 词条与功能说明",
+                  font=("SF Pro", 14, "bold"),
+                  foreground=THEME["text_strong"]).pack(side="left")
+        ttk.Label(header,
+                  text="点左边目录看每个功能 / 指标 / 算法的详细解释",
+                  foreground=THEME["muted"],
+                  font=("SF Pro", 10)).pack(side="left", padx=(12, 0))
+
+        # PanedWindow — drag the divider to resize
+        paned = ttk.PanedWindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        # Left: category tree
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+        self.tree = ttk.Treeview(left, show="tree", height=24)
+        self.tree.column("#0", width=280, anchor="w")
+        tree_sb = ttk.Scrollbar(left, orient="vertical",
+                                 command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        tree_sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # Right: detail pane
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+        self.txt = tk.Text(right, wrap="word", padx=20, pady=18,
+                            font=("SF Pro", 11),
+                            bg=THEME["card_bg"], fg=THEME["text"],
+                            relief="solid", borderwidth=1,
+                            highlightthickness=0,
+                            spacing1=2, spacing3=6)
+        txt_sb = ttk.Scrollbar(right, orient="vertical",
+                                command=self.txt.yview)
+        self.txt.configure(yscrollcommand=txt_sb.set, state="disabled")
+        self.txt.pack(side="left", fill="both", expand=True)
+        txt_sb.pack(side="right", fill="y")
+
+        # Configure text tags for formatting
+        self._configure_tags()
+
+    def _configure_tags(self) -> None:
+        c = THEME
+        self.txt.tag_configure("h1",
+            font=("SF Pro", 18, "bold"),
+            foreground=c["text_strong"], spacing3=12)
+        self.txt.tag_configure("h2",
+            font=("SF Pro", 12, "bold"),
+            foreground=c["primary"], spacing1=12, spacing3=4)
+        self.txt.tag_configure("subtitle",
+            font=("SF Pro", 11, "italic"),
+            foreground=c["muted"], spacing3=10)
+        self.txt.tag_configure("body",
+            font=("SF Pro", 11), foreground=c["text"], spacing3=4)
+        self.txt.tag_configure("code",
+            font=("Menlo", 10),
+            foreground=c["text_strong"],
+            background=c["tree_head_bg"],
+            lmargin1=20, lmargin2=20, spacing1=4, spacing3=4)
+        self.txt.tag_configure("value",
+            font=("Menlo", 11, "bold"),
+            foreground=c["success"], spacing3=8)
+
+    def _populate_tree(self) -> None:
+        from src.glossary import GLOSSARY
+        first_item = None
+        for cat, entries in GLOSSARY.items():
+            cat_id = self.tree.insert("", "end", text=cat, open=True)
+            for term in entries:
+                item = self.tree.insert(cat_id, "end", text=term,
+                                         values=(cat, term))
+                if first_item is None:
+                    first_item = item
+        # Select the first entry so the user sees content immediately
+        if first_item is not None:
+            self.tree.selection_set(first_item)
+            self.tree.focus(first_item)
+            self._on_select(None)
+
+    def _on_select(self, _event) -> None:
+        from src.glossary import get_entry
+        sel = self.tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        values = self.tree.item(item, "values")
+        if not values or len(values) < 2:
+            return   # selected a category header, not an entry
+        category, term = values[0], values[1]
+        entry = get_entry(category, term)
+        if entry is None:
+            return
+        self._render(term, entry)
+
+    def _render(self, term: str, entry: dict) -> None:
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+
+        # Title
+        self.txt.insert("end", f"{term}\n", ("h1",))
+        # English subtitle if present and different
+        name = entry.get("name") or ""
+        if name and name != term:
+            self.txt.insert("end", f"{name}\n", ("subtitle",))
+
+        # Summary
+        summary = entry.get("summary") or ""
+        if summary:
+            self.txt.insert("end", "概述\n", ("h2",))
+            self.txt.insert("end", summary + "\n", ("body",))
+
+        # Explain
+        explain = entry.get("explain") or ""
+        if explain:
+            self.txt.insert("end", "说明\n", ("h2",))
+            # Lines with leading spaces or code-like chars get code style.
+            for line in explain.split("\n"):
+                if line.startswith("  ") or line.lstrip().startswith(("•", "→", "=", "▶")):
+                    self.txt.insert("end", line + "\n", ("code",))
+                else:
+                    self.txt.insert("end", line + "\n", ("body",))
+
+        # Where used
+        where = entry.get("where") or ""
+        if where:
+            self.txt.insert("end", "在系统里用在哪\n", ("h2",))
+            for line in where.split("\n"):
+                if line.startswith("  ") or "/" in line and "." in line:
+                    self.txt.insert("end", line + "\n", ("code",))
+                else:
+                    self.txt.insert("end", line + "\n", ("body",))
+
+        # Current value
+        value = entry.get("value") or ""
+        if value:
+            self.txt.insert("end", "当前设置\n", ("h2",))
+            self.txt.insert("end", value + "\n", ("value",))
+
+        self.txt.configure(state="disabled")
+        self.txt.yview_moveto(0)
 
 
 if __name__ == "__main__":

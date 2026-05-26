@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import math
@@ -27,6 +28,16 @@ from typing import Optional
 import pandas as pd
 
 log = logging.getLogger(__name__)
+
+# Hard wall-clock cap on a single MooMoo kline fetch. Without this, the SDK's
+# request_history_kline can block forever when OpenD's socket goes silent —
+# the whole prefetch loop hangs on whichever ticker tripped it.
+#
+# Budget: get_kline can internally sleep up to ~30s waiting on the 55-calls-
+# per-30s rate limiter, plus the actual SDK round-trip (1-2s healthy, up to
+# ~32s on the documented retry-after-rate-limit path). 60s leaves comfortable
+# headroom for legitimate slow calls while still fast-failing a true hang.
+_FETCH_TIMEOUT_SEC = 60.0
 
 WATCHLIST_FILE = Path(__file__).parent.parent / "config" / "watchlist.json"
 RESULTS_FILE = Path(__file__).parent.parent / "data" / "backtest_results.json"
@@ -225,6 +236,7 @@ def backtest_ticker(
     commission = cfg.commission_per_trade
     trades: list[Trade] = []
     active: Optional[Trade] = None
+    _lookback = warm_up + 20   # fixed-size window — all TA indicators fit within warm_up bars
 
     # DD circuit breaker — uses the SHARED PortfolioState so DD is measured
     # at the account level (same definition as live risk_manager). Falls back
@@ -256,7 +268,7 @@ def backtest_ticker(
         )
 
     for i in range(warm_up, len(df_full) - 1):
-        window = df_full.iloc[: i + 1]
+        window = df_full.iloc[max(0, i + 1 - _lookback): i + 1]
         bar = df_full.iloc[i]
         bar_date = str(df_full.index[i].date())
         hi = float(bar["high"])
@@ -265,7 +277,6 @@ def backtest_ticker(
         # --- manage open position with realistic exit fills ---
         if active is not None:
             bars_held = i - active.entry_bar
-            active_slip = active.exit_price  # placeholder; reuse field below
             exit_slip = (cfg.base_slip_bp + cfg.atr_slip_k * 0) / 10000.0  # base only for exits
             # If we have ATR info from entry, scale; we stored it via stop_loss distance.
             atr_est = (active.entry_price - active.stop_loss) / max(cfg.sl_atr_mult, 1e-9)
@@ -293,7 +304,7 @@ def backtest_ticker(
                 active.exit_date = bar_date
                 active.exit_reason = "MAX_HOLD"
 
-            if active.exit_price:
+            if active.exit_reason:
                 _finalise(active)
                 trades.append(active)
                 # DD tracker — book the realised PnL into shared portfolio state.
@@ -316,7 +327,7 @@ def backtest_ticker(
 
         # MTF + gap + regime gates using daily df at the entry day
         if daily_df is not None and not daily_df.empty:
-            d_until = daily_df.loc[daily_df.index <= df_full.index[i]]
+            d_until = daily_df.loc[daily_df.index <= df_full.index[i]].tail(100)
             if len(d_until) >= 2:
                 if cfg.apply_mtf_gate and cfg.timeframe == "HOUR_1":
                     ok, _ = daily_trend_bullish(d_until)
@@ -329,7 +340,7 @@ def backtest_ticker(
 
         # Regime gate (SPY 200-SMA) — block entries when SPY in BEAR
         if cfg.apply_regime_gate and spy_daily is not None and not spy_daily.empty:
-            s_until = spy_daily.loc[spy_daily.index <= df_full.index[i]]
+            s_until = spy_daily.loc[spy_daily.index <= df_full.index[i]].tail(250)
             if len(s_until) >= 200:
                 regime = regime_mod.assess(s_until)
                 if regime.block_new_entries:
@@ -415,7 +426,7 @@ def backtest_ticker(
 
 # ---------- time-stepped portfolio simulator (live-parity) ----------
 
-def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
+def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) -> dict:
     """Portfolio-level backtest — processes all tickers' bars by timestamp.
 
     Unlike `backtest_ticker` (per-ticker sequential), this iterates a single
@@ -446,6 +457,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
     warm_up = _warm_up(cfg)
     max_hold = _max_hold_bars(cfg)
     commission = cfg.commission_per_trade
+    _lookback = warm_up + 20   # fixed-size window — all TA indicators fit within warm_up bars
 
     # ---------- build the chronological event stream ----------
     events: list[tuple] = []
@@ -491,7 +503,15 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
         open_trades.pop(sym, None)
 
     # ---------- main loop ----------
-    for ts, sym, i in events:
+    # Progress: fire every ~2% of events so the GUI shows movement during the
+    # simulation phase (not just the prefetch phase). Without this the label
+    # is frozen at "Fetching <last ticker>" for the entire simulation, which
+    # looks identical to a hang.
+    total_events = len(events)
+    progress_step = max(1, total_events // 50)
+    for evt_idx, (ts, sym, i) in enumerate(events):
+        if progress_cb is not None and evt_idx % progress_step == 0:
+            progress_cb(evt_idx, total_events, sym)
         df = per_ticker[sym]["intraday"]
         daily_df = per_ticker[sym]["daily"]
         bar = df.iloc[i]
@@ -523,7 +543,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
                 active.exit_date = bar_date
                 active.exit_reason = "MAX_HOLD"
 
-            if active.exit_price:
+            if active.exit_reason:
                 _close(active, sym)
             continue   # already has (or had) position on this bar — no new entry
 
@@ -533,7 +553,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
             continue
 
         # --- score the bar (trend + optional MR) ---
-        window = df.iloc[: i + 1]
+        window = df.iloc[max(0, i + 1 - _lookback): i + 1]
         try:
             sig_trend = evaluate(sym, window)
             if cfg.apply_mr_strategy:
@@ -548,7 +568,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
 
         # --- gates: MTF + gap + regime + ML ---
         if daily_df is not None and not daily_df.empty:
-            d_until = daily_df.loc[daily_df.index <= df.index[i]]
+            d_until = daily_df.loc[daily_df.index <= df.index[i]].tail(100)
             if len(d_until) >= 2:
                 if cfg.apply_mtf_gate and cfg.timeframe == "HOUR_1":
                     ok, _ = daily_trend_bullish(d_until)
@@ -560,7 +580,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict) -> dict:
                         continue
 
         if cfg.apply_regime_gate and spy_daily is not None and not spy_daily.empty:
-            s_until = spy_daily.loc[spy_daily.index <= df.index[i]]
+            s_until = spy_daily.loc[spy_daily.index <= df.index[i]].tail(250)
             if len(s_until) >= 200:
                 regime = regime_mod.assess(s_until)
                 if regime.block_new_entries:
@@ -730,12 +750,43 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
     per_ticker: dict[str, dict] = {}
     spy_daily = None
 
+    # Watchdog: future.result(timeout=) forces a TimeoutError when the SDK
+    # call goes silent, instead of blocking forever. Background: caught this
+    # with LRCX where the underlying socket read hung — there's no built-in
+    # SDK timeout.
+    #
+    # CRITICAL: on timeout we must replace the executor — the stuck thread
+    # will keep occupying the single worker slot otherwise, queueing every
+    # subsequent fetch behind it. shutdown(wait=False) abandons the hung
+    # thread (it dies with the process); a fresh executor gives us a fresh
+    # worker slot.
+    executor_holder = {
+        "ex": concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kline-fetch"
+        )
+    }
+
+    def _fetch(sym, **kwargs):
+        ex = executor_holder["ex"]
+        future = ex.submit(c.get_kline, sym, **kwargs)
+        try:
+            return future.result(timeout=_FETCH_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            # Abandon the hung worker, spin up a fresh executor for the next call.
+            ex.shutdown(wait=False)
+            executor_holder["ex"] = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kline-fetch"
+            )
+            raise RuntimeError(
+                f"get_kline({sym}) hung > {_FETCH_TIMEOUT_SEC}s — OpenD silent; skipping"
+            )
+
     c = MoomooClient()
     try:
         if cfg.apply_regime_gate:
             try:
-                spy_daily = c.get_kline("SPY", bars=max(cfg.days + 250, 350),
-                                        ktype=KLType.K_DAY)
+                spy_daily = _fetch("SPY", bars=max(cfg.days + 250, 350),
+                                   ktype=KLType.K_DAY)
                 log.info("[prefetch] SPY daily: %d bars", len(spy_daily))
             except Exception as e:
                 log.warning("[prefetch] SPY fetch failed: %s", e)
@@ -744,28 +795,31 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
             if progress_cb:
                 progress_cb(idx, len(tickers), sym)
             try:
-                df = c.get_kline(sym, bars=total_bars, ktype=kltype)
+                df = _fetch(sym, bars=total_bars, ktype=kltype)
                 if len(df) < _warm_up(cfg) + 20:
                     log.warning("[prefetch] %s: only %d bars — skipping", sym, len(df))
                     continue
                 daily_df = None
                 if cfg.apply_mtf_gate or cfg.apply_gap_gate:
                     try:
-                        daily_df = c.get_kline(sym, bars=max(cfg.days + 60, 250),
-                                               ktype=KLType.K_DAY)
+                        daily_df = _fetch(sym, bars=max(cfg.days + 60, 250),
+                                          ktype=KLType.K_DAY)
                     except Exception as e:
                         log.warning("[prefetch] daily fetch failed for %s: %s", sym, e)
                 per_ticker[sym] = {"intraday": df, "daily": daily_df}
             except Exception as e:
                 log.warning("[prefetch] %s failed: %s", sym, e)
     finally:
+        # wait=False so a still-hung future doesn't block shutdown; the leaked
+        # worker thread will die when the process exits.
+        executor_holder["ex"].shutdown(wait=False)
         c.close()
 
     log.info("[prefetch] complete: %d tickers cached", len(per_ticker))
     return {"tf": tf, "kltype": kltype, "spy_daily": spy_daily, "per_ticker": per_ticker}
 
 
-def simulate_with_cache(cfg: BacktestConfig, cache: dict) -> dict:
+def simulate_with_cache(cfg: BacktestConfig, cache: dict, progress_cb=None) -> dict:
     """Run the simulation phase only, using pre-fetched data.
 
     Delegates to the TIME-STEPPED portfolio simulator (`simulate_time_stepped`)
@@ -779,7 +833,7 @@ def simulate_with_cache(cfg: BacktestConfig, cache: dict) -> dict:
     _orig = os.environ.get("TIMEFRAME", "")
     os.environ["TIMEFRAME"] = cfg.timeframe
     try:
-        return simulate_time_stepped(cfg, cache)
+        return simulate_time_stepped(cfg, cache, progress_cb=progress_cb)
     finally:
         if _orig:
             os.environ["TIMEFRAME"] = _orig
@@ -794,9 +848,12 @@ def run_backtest(
     """One-shot: fetch + simulate. Equivalent to prefetch_data + simulate_with_cache.
 
     Kept for backwards compatibility with the GUI, CLI, and any external callers.
+    The same progress_cb fires during BOTH phases — the callback's (cur, total,
+    label) args mean ticker-being-fetched during prefetch and event-being-replayed
+    during the simulation (label = symbol whose bar is currently being scored).
     """
     cache = prefetch_data(cfg, progress_cb=progress_cb)
-    result = simulate_with_cache(cfg, cache)
+    result = simulate_with_cache(cfg, cache, progress_cb=progress_cb)
     # Log per-symbol trade counts for parity with the old behaviour.
     by_sym: dict[str, int] = {}
     for t in result["trades"]:
