@@ -534,7 +534,10 @@ def scan_once() -> None:
             except Exception as e:
                 log.exception("open_position failed for %s: %s", sig.symbol, e)
                 audit.record("error", symbol=sig.symbol, reason=str(e))
-                notifier.send(notifier.skip_msg(sig.symbol, f"exec error: {e}"))
+                # Buffer into the end-of-scan summary (line ~545) instead of
+                # firing one Telegram per failure — keeps the chat readable
+                # when several executions trip the same broker-side issue.
+                scan_skips.append((sig.symbol, "exec_error"))
 
     # Send one skip-summary per scan instead of one message per candidate.
     if scan_skips:
