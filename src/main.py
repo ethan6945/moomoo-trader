@@ -17,9 +17,10 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from moomoo import KLType
 
 from . import (
-    adaptive_sizing, ai_validator, audit, blacklist, clock, cron_state,
+    adaptive_sizing, ai_validator, audit, blacklist, clock, cron_state, db,
     executor, history, indicators, kill_switch, notifier, portfolio,
-    regime as regime_mod, risk_manager, strategy_mr, watchlist_updater,
+    regime as regime_mod, risk_manager, strategy_momentum, strategy_mr,
+    watchlist_updater,
 )
 from .config import settings
 from .earnings import earnings_block
@@ -380,15 +381,23 @@ def scan_once() -> None:
                 # Look-ahead audit — never score on a still-forming intraday bar.
                 df = _drop_forming_bar(df, settings.timeframe)
                 # Independent strategies: each can submit if its own score
-                # clears the floor.
+                # clears the floor. 2026-05-29: added strategy_momentum
+                # (stricter breakout setup) — sized identically to trend, just
+                # a different filter mix biased toward explosive setups.
+                # Mean-revert gated by MR_ENABLED (combo sweep showed it was
+                # net-negative in current bull-skewed watchlist).
                 sig_trend = indicators.evaluate(sym, df)
-                sig_mr = strategy_mr.evaluate(sym, df)
+                sig_mom = strategy_momentum.evaluate(sym, df)
                 if sig_trend.score >= threshold_floor:
                     ranked.append(sig_trend)
-                if sig_mr.score >= threshold_floor:
-                    ranked.append(sig_mr)
+                if sig_mom.score >= threshold_floor:
+                    ranked.append(sig_mom)
+                if settings.mr_enabled:
+                    sig_mr = strategy_mr.evaluate(sym, df)
+                    if sig_mr.score >= threshold_floor:
+                        ranked.append(sig_mr)
                 if ml_active:
-                    proba = ml_predict.predict_proba(df)
+                    proba = ml_predict.predict_proba(df, symbol=sym)
                     if proba is not None:
                         ml_scores[sym] = proba
             except Exception as e:
@@ -396,6 +405,26 @@ def scan_once() -> None:
 
         ranked.sort(key=lambda s: s.score, reverse=True)
         log.info("top 5: %s", [(s.symbol, s.score) for s in ranked[:5]])
+
+        # ----- Portfolio-full notification (edge-triggered) -----
+        # Compute current unique-symbol count (matches risk_manager's
+        # MAX_POSITIONS semantics: 1 ticker = 1 slot regardless of stacks).
+        held_syms = set(symbols) | set(pending_symbols)
+        currently_full = len(held_syms) >= settings.max_positions
+        was_full = bool(risk_manager._load_state().get("portfolio_full_notified"))
+        if currently_full and not was_full:
+            notifier.send(
+                f"📦 仓位已满 {len(held_syms)}/{settings.max_positions} — "
+                f"暂停寻新单（仍会扫加仓机会）。\n"
+                f"持仓: {', '.join(sorted(held_syms))}"
+            )
+            db.update_state({"portfolio_full_notified": True})
+        elif not currently_full and was_full:
+            db.update_state({"portfolio_full_notified": False})
+
+        # Per-scan cap on brand-new tickers (stacking add-ons exempt).
+        new_names_opened = 0
+        new_names_limit = settings.max_new_names_per_scan
 
         # (Regime / halt / drawdown kill switches already evaluated above
         # via kill_switch.evaluate() — by this point we're cleared to trade.)
@@ -421,6 +450,18 @@ def scan_once() -> None:
             if sig.score < threshold_floor:
                 break
 
+            # Concentration gate — once per-scan new-names budget is spent,
+            # only stacking add-ons (already-held symbol) may proceed. Silently
+            # skip extras (don't audit or Telegram-summarise — it's by design).
+            is_stack_candidate = sig.symbol in held_syms
+            if not is_stack_candidate and new_names_opened >= new_names_limit:
+                continue
+
+            # Stacking add-ons require the rule score to clear full threshold —
+            # don't pyramid on a marginal setup, even if base setup was strong.
+            if is_stack_candidate and sig.score < settings.entry_threshold:
+                continue
+
             # "Marginal" = rule score in [threshold-10, threshold). These setups
             # still enter the funnel but get sized down via conviction.
             marginal_setup = sig.score < settings.entry_threshold
@@ -430,6 +471,15 @@ def scan_once() -> None:
                 log.info("Skip %s [%s]: %s", _sig.symbol, gate, reason)
                 audit.record("skip", symbol=_sig.symbol, gate=gate,
                              reason=reason, score=_sig.score)
+                # Silence "max positions" / "stacking gate" reasons from the
+                # Telegram skip summary — they're routine, not actionable.
+                if gate == "risk" and (
+                    "max positions" in reason
+                    or "max stacks" in reason
+                    or "unrealised" in reason
+                    or "stacking disabled" in reason
+                ):
+                    return
                 scan_skips.append((_sig.symbol, gate))
 
             # --- Context fetches (daily df for MTF/gap, ML proba already cached) ---
@@ -488,7 +538,12 @@ def scan_once() -> None:
             conviction = setup_conviction * ml_conviction
 
             # --- Layer 3: AI verdict (Gemini + Tavily news, independent veto) ---
-            if ai_budget <= 0:
+            # Stacking add-ons skip AI consult — we've already done the diligence
+            # on the original entry, and the AI budget should reserve for fresh
+            # names where context might differ. (Audit 2026-05-28.)
+            if is_stack_candidate:
+                ai_pass, ai_score, ai_reason = True, 60, "stack — AI re-check skipped"
+            elif ai_budget <= 0:
                 ai_pass, ai_score, ai_reason = True, 50, "AI budget exhausted — neutral"
             else:
                 ai_pass, ai_score, ai_reason = ai_validator.validate(sig)
@@ -518,6 +573,9 @@ def scan_once() -> None:
 
             try:
                 executor.open_position(c, sig, qty, ml_proba=ml_proba)
+                if not is_stack_candidate:
+                    new_names_opened += 1
+                    held_syms.add(sig.symbol)
                 audit.record("buy", symbol=sig.symbol, score=sig.score,
                              reason=ai_reason,
                              extra={"qty": qty, "price": sig.price,
@@ -526,6 +584,7 @@ def scan_once() -> None:
                                     "ml_proba": round(ml_proba, 3) if ml_proba is not None else None,
                                     "conviction": conviction,
                                     "setup_quality": "marginal" if marginal_setup else "full",
+                                    "is_stack": is_stack_candidate,
                                     "strategy": getattr(sig, "strategy", "trend")})
                 notifier.send(notifier.signal_msg(sig, ai_reason, qty))
                 cash -= qty * sig.price

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytz
@@ -26,6 +26,37 @@ from .indicators import Signal
 from .moomoo_client import MoomooClient
 
 ORDER_TIMEOUT_MIN = 5    # cancel unfilled BUY orders after this many minutes
+
+
+def _business_days_between(start: datetime, end: datetime) -> int:
+    """Count weekdays (Mon-Fri) minus NYSE holidays between `start` (exclusive)
+    and `end` (inclusive).
+
+    Backtest measures max_hold in TRADING bars (HOUR_1 → 7 bars / day × 7 days
+    = 49 hour-bars ≈ 7 trading days). Live executor used calendar days, which
+    means a Mon→next Mon trade was 7 calendar days but only 5 trading days —
+    so live closed 2 trading days earlier than backtest and ate the rebalance
+    cost on otherwise-winning swings.
+
+    2026-05-28: extended to subtract NYSE holidays so 1-day drift around the
+    ~10 yearly holidays doesn't leak into max_hold counting.
+    """
+    if end <= start:
+        return 0
+    # Lazy import to avoid main→executor circular ref at module load.
+    from .main import _nyse_holidays
+    days = 0
+    d = start.date()
+    last = end.date()
+    # Holiday lookup spans at most one year — pull once.
+    holidays = _nyse_holidays(d.year)
+    if last.year != d.year:
+        holidays = holidays | _nyse_holidays(last.year)
+    while d < last:
+        d += timedelta(days=1)
+        if d.weekday() < 5 and d not in holidays:
+            days += 1
+    return days
 
 
 def place_bracket(
@@ -67,30 +98,18 @@ def _load_open_trades() -> dict:
 
 
 def _save_open_trades(trades: dict) -> None:
-    """Atomic replace of the open_trades table. Also mirrors to legacy JSON
-    for any reader that still touches the file directly."""
-    with db.transaction() as c:
-        c.execute("DELETE FROM open_trades")
-        for sym, t in trades.items():
-            c.execute("""
-                INSERT INTO open_trades
-                (symbol, qty, entry_price, stop_loss, take_profit, atr,
-                 half_closed, buy_order_id, stop_order_id, tp_order_id,
-                 opened_at, extra)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                sym, int(t.get("qty", 0)),
-                float(t.get("entry_price", 0)),
-                float(t.get("stop_loss", 0)),
-                float(t.get("take_profit", 0)),
-                float(t.get("atr") or 0),
-                1 if t.get("half_closed") else 0,
-                t.get("buy_order_id"),
-                t.get("stop_order_id"),
-                t.get("tp_order_id"),
-                t.get("opened_at") or datetime.utcnow().isoformat(),
-                None,
-            ))
+    """Replace open_trades table with the supplied dict. Routes through
+    `db.upsert_open_trade` so v2 columns + the `extra` JSON blob (stacks,
+    high/low water marks, etc.) are preserved across save/load cycles."""
+    existing = set(db.load_open_trades().keys())
+    incoming = set(trades.keys())
+    for sym in existing - incoming:
+        db.delete_open_trade(sym)
+    for sym, t in trades.items():
+        # Ensure symbol key matches dict key.
+        t = dict(t)
+        t["symbol"] = sym
+        db.upsert_open_trade(t)
     # Legacy JSON mirror (kept until all GUI readers migrate; cheap to write).
     try:
         OPEN_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -103,43 +122,102 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
                   ml_proba: float | None = None) -> dict:
     """Buy at limit. REAL → attach OCO bracket (STOP + TP); SIMULATE → soft-track.
 
+    If a trade record for this symbol already exists, this is a STACK entry
+    (pyramid add-on): merge into the existing position with a weighted-avg
+    entry, raise stop/TP to the new signal's levels, and re-place OCO so the
+    bracket protects the full combined qty.
+
     Captures `ml_proba` and `strategy` at entry so they can be matched against
     actual outcome (R-multiple, MFE/MAE) at close-time → enables calibration."""
+    trades = _load_open_trades()
+    existing = trades.get(signal.symbol)
+    is_stack = existing is not None and int(existing.get("qty", 0)) > 0
+
     buy_order_id = client.place_limit_order(
         signal.symbol, qty, signal.price, TrdSide.BUY
     )
 
-    stop_order_id, tp_order_id = None, None
-    if settings.moomoo_trade_env == "REAL":
-        stop_order_id, tp_order_id = place_bracket(
-            client, signal.symbol, qty, signal.stop_loss, signal.take_profit
-        )
-        if not (stop_order_id and tp_order_id):
-            log.warning("Bracket incomplete for %s (stop=%s tp=%s) — soft tracking active as fallback",
-                        signal.symbol, stop_order_id, tp_order_id)
-    else:
-        log.info("SIMULATE: soft stop @ $%.2f & TP @ $%.2f tracked locally",
-                 signal.stop_loss, signal.take_profit)
+    if is_stack:
+        old_qty = int(existing["qty"])
+        old_entry = float(existing["entry_price"])
+        new_total_qty = old_qty + qty
+        new_avg_entry = (old_qty * old_entry + qty * signal.price) / new_total_qty
+        # Stop/TP trail UP only — never weaken protection on the original lot.
+        new_stop = max(float(existing.get("stop_loss", 0)), signal.stop_loss)
+        new_tp = max(float(existing.get("take_profit", 0)), signal.take_profit)
+        stacks = int(existing.get("stacks", 1)) + 1
 
-    trade = {
-        "symbol": signal.symbol,
-        "qty": qty,
-        "entry_price": signal.price,
-        "stop_loss": signal.stop_loss,
-        "take_profit": signal.take_profit,
-        "atr": signal.atr,
-        "half_closed": False,
-        "buy_order_id": buy_order_id,
-        "stop_order_id": stop_order_id,
-        "tp_order_id": tp_order_id,
-        "opened_at": datetime.utcnow().isoformat(),
-        # Water-marks start at the entry price — updated each manage tick.
-        "high_water": signal.price,
-        "low_water": signal.price,
-        "ml_proba_entry": ml_proba,
-        "strategy": getattr(signal, "strategy", "trend"),
-    }
-    trades = _load_open_trades()
+        # On REAL, replace the OCO bracket so it covers the new combined qty.
+        stop_order_id = existing.get("stop_order_id")
+        tp_order_id = existing.get("tp_order_id")
+        if settings.moomoo_trade_env == "REAL":
+            for oid in (stop_order_id, tp_order_id):
+                if oid:
+                    try:
+                        client.cancel_order(oid)
+                    except Exception as e:
+                        log.warning("cancel old bracket leg %s failed: %s", oid, e)
+            stop_order_id, tp_order_id = place_bracket(
+                client, signal.symbol, new_total_qty, new_stop, new_tp
+            )
+            if not (stop_order_id and tp_order_id):
+                log.warning("Re-bracket incomplete for stack %s — soft tracking fallback",
+                            signal.symbol)
+
+        trade = dict(existing)
+        trade.update({
+            "symbol": signal.symbol,
+            "qty": new_total_qty,
+            "entry_price": new_avg_entry,
+            "stop_loss": new_stop,
+            "take_profit": new_tp,
+            "atr": signal.atr,
+            "buy_order_id": buy_order_id,
+            "stop_order_id": stop_order_id,
+            "tp_order_id": tp_order_id,
+            "stacks": stacks,
+            "last_stack_at": datetime.utcnow().isoformat(),
+            "last_stack_qty": qty,
+            "last_stack_price": signal.price,
+        })
+        # Refresh water-marks to current price for the new combined lot.
+        trade["high_water"] = max(float(trade.get("high_water") or signal.price), signal.price)
+        log.info("STACK #%d on %s: +%d @ $%.2f → total %d, avg $%.2f, stop $%.2f, tp $%.2f",
+                 stacks, signal.symbol, qty, signal.price,
+                 new_total_qty, new_avg_entry, new_stop, new_tp)
+    else:
+        stop_order_id, tp_order_id = None, None
+        if settings.moomoo_trade_env == "REAL":
+            stop_order_id, tp_order_id = place_bracket(
+                client, signal.symbol, qty, signal.stop_loss, signal.take_profit
+            )
+            if not (stop_order_id and tp_order_id):
+                log.warning("Bracket incomplete for %s (stop=%s tp=%s) — soft tracking active as fallback",
+                            signal.symbol, stop_order_id, tp_order_id)
+        else:
+            log.info("SIMULATE: soft stop @ $%.2f & TP @ $%.2f tracked locally",
+                     signal.stop_loss, signal.take_profit)
+
+        trade = {
+            "symbol": signal.symbol,
+            "qty": qty,
+            "entry_price": signal.price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "atr": signal.atr,
+            "half_closed": False,
+            "buy_order_id": buy_order_id,
+            "stop_order_id": stop_order_id,
+            "tp_order_id": tp_order_id,
+            "opened_at": datetime.utcnow().isoformat(),
+            # Water-marks start at the entry price — updated each manage tick.
+            "high_water": signal.price,
+            "low_water": signal.price,
+            "ml_proba_entry": ml_proba,
+            "strategy": getattr(signal, "strategy", "trend"),
+            "stacks": 1,
+        }
+
     trades[signal.symbol] = trade
     _save_open_trades(trades)
     return trade
@@ -269,7 +347,7 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
             # Bracket alive — only thing the bot still owns is max-hold timeout.
             try:
                 opened = datetime.fromisoformat(trade["opened_at"])
-                age_days = (datetime.utcnow() - opened).days
+                age_days = _business_days_between(opened, datetime.utcnow())
             except (KeyError, ValueError):
                 age_days = 0
             if age_days >= _settings.max_hold_days:
@@ -313,7 +391,7 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
 
         # Max-hold force close.
         opened = datetime.fromisoformat(trade["opened_at"])
-        age_days = (datetime.utcnow() - opened).days
+        age_days = _business_days_between(opened, datetime.utcnow())
         if age_days >= _settings.max_hold_days:
             client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
             pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
@@ -334,14 +412,30 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
                                 "qty": half, "pnl": pnl})
 
         # Trailing stop after first TP.
+        # Bug fix 2026-05-28: bound the new stop strictly BELOW current price
+        # by 0.5×ATR. Without this the EMA20 can sit right at (or above) `last`,
+        # which causes an immediate stop-out on the very next scan (we just
+        # raised the stop above price). The ATR buffer also avoids stopping out
+        # on routine intra-bar noise.
+        # 2026-05-29: also guard against NaN ema20/atr14 — happens when df has
+        # < 20 bars (new IPO, halt resumption, etc.). Skip silently instead of
+        # crashing the manage loop.
         if trade["half_closed"]:
+            import math
             df = client.get_kline(symbol, bars=30)
             import pandas_ta_classic as ta
             ema20 = float(ta.ema(df["close"], length=20).iloc[-1])
-            new_stop = max(trade["stop_loss"], round(ema20, 2))
-            if new_stop > trade["stop_loss"]:
-                trade["stop_loss"] = new_stop
-                actions.append({"type": "trail", "symbol": symbol, "new_stop": new_stop})
+            atr14 = float(ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1])
+            if math.isnan(ema20) or math.isnan(atr14):
+                log.debug("trailing stop: %s has NaN ema/atr — skip this cycle", symbol)
+            else:
+                buffer = 0.5 * atr14 if atr14 > 0 else 0.0
+                ceiling = last - buffer    # never park the stop within 0.5 ATR of price
+                candidate = round(min(ema20, ceiling), 2)
+                new_stop = max(trade["stop_loss"], candidate)
+                if new_stop > trade["stop_loss"]:
+                    trade["stop_loss"] = new_stop
+                    actions.append({"type": "trail", "symbol": symbol, "new_stop": new_stop})
 
     _save_open_trades(trades)
     return actions

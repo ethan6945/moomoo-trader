@@ -633,9 +633,10 @@ class App(QMainWindow):
             act.triggered.connect(lambda checked, n=name: self._switch_theme(n))
             theme_menu.addAction(act)
 
-        help_act = QAction(_t("menu_help"), self)
-        help_act.triggered.connect(self.open_help)
-        bar.addAction(help_act)
+        help_menu = bar.addMenu(_t("menu_help"))
+        help_menu.addAction(_t("menu_help"), self.open_help)
+        help_menu.addSeparator()
+        help_menu.addAction("🔑 API Keys", self.open_api_keys)
 
     def _switch_lang(self, lang: str):
         if lang == current_lang():
@@ -735,11 +736,6 @@ class App(QMainWindow):
         self._nav(lay, "📡 Signal Reporter",          self.open_signal_reporter)
 
         lay.addStretch(1)
-
-        div3 = Divider()
-        div3.setFixedHeight(1)
-        lay.addWidget(div3)
-        self._nav(lay, "📚 Help", self.open_help)
         lay.addSpacing(8)
 
     def _build_content(self, lay: QVBoxLayout):
@@ -983,6 +979,9 @@ class App(QMainWindow):
 
     def open_signal_reporter(self):
         SignalReporterDialog(self).show()
+
+    def open_api_keys(self):
+        ApiKeysDialog(self).show()
 
     def open_help(self):
         HelpDialog(self).show()
@@ -2246,6 +2245,152 @@ class SignalReporterDialog(QDialog):
         self._timer.stop(); super().closeEvent(event)
 
 
+# ── API Keys Dialog ────────────────────────────────────────────────────────
+
+class ApiKeysDialog(QDialog):
+    """Read / write API keys in .env without touching a text editor."""
+
+    # (env_key, label, is_secret, placeholder, hint)
+    _FIELDS = [
+        ("GEMINI_API_KEYS",   "Gemini API Keys",    True,  "AIza...",
+         "Comma-separated — add multiple keys for failover"),
+        ("GEMINI_MODEL",      "Gemini Model",        False, "gemini-2.5-flash",
+         "Model ID used for AI analysis"),
+        ("TAVILY_API_KEY",    "Tavily API Key",      True,  "tvly-...",
+         "Used for news fetching (optional)"),
+        ("TELEGRAM_TOKEN",    "Telegram Bot Token",  True,  "123456:ABC...",
+         "Bot token from @BotFather"),
+        ("TELEGRAM_CHAT_ID",  "Telegram Chat ID",    False, "-100123456789",
+         "Your personal or group chat ID"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("API Keys")
+        self.resize(560, 480)
+        self._widgets: dict[str, QLineEdit] = {}
+        self._build()
+        self._load()
+
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setSpacing(12)
+
+        hdr = QLabel("🔑  API Keys")
+        hdr.setStyleSheet(f"color: {T['text_strong']}; font-size: 14px; font-weight: bold;")
+        outer.addWidget(hdr)
+
+        note = QLabel("Changes are written to <b>.env</b>. "
+                      "Restart the scheduler for new values to take effect.")
+        note.setStyleSheet(f"color: {T['muted']}; font-size: 10px;")
+        note.setWordWrap(True)
+        outer.addWidget(note)
+
+        grid = QWidget()
+        gl = QGridLayout(grid)
+        gl.setContentsMargins(0, 4, 0, 4)
+        gl.setHorizontalSpacing(10)
+        gl.setVerticalSpacing(6)
+        gl.setColumnStretch(1, 1)
+
+        for row, (env_key, label, is_secret, placeholder, hint) in enumerate(self._FIELDS):
+            lbl = QLabel(label + ":")
+            lbl.setStyleSheet(f"color: {T['text']}; font-size: 11px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setFixedWidth(150)
+
+            le = QLineEdit()
+            le.setPlaceholderText(placeholder)
+            le.setToolTip(hint)
+            if is_secret:
+                le.setEchoMode(QLineEdit.EchoMode.Password)
+
+            field_row = QWidget()
+            fr_lay = QHBoxLayout(field_row)
+            fr_lay.setContentsMargins(0, 0, 0, 0)
+            fr_lay.setSpacing(4)
+            fr_lay.addWidget(le)
+
+            if is_secret:
+                toggle = QPushButton("👁")
+                toggle.setFixedWidth(30)
+                toggle.setCheckable(True)
+                toggle.setStyleSheet("border: none; background: transparent; font-size: 13px;")
+                toggle.setToolTip("Show / hide")
+                toggle.toggled.connect(
+                    lambda checked, w=le: w.setEchoMode(
+                        QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+                    )
+                )
+                fr_lay.addWidget(toggle)
+
+            hint_lbl = QLabel(hint)
+            hint_lbl.setStyleSheet(f"color: {T['muted']}; font-size: 9px;")
+
+            gl.addWidget(lbl,       row * 2,     0)
+            gl.addWidget(field_row, row * 2,     1)
+            gl.addWidget(hint_lbl,  row * 2 + 1, 1)
+
+            self._widgets[env_key] = le
+
+        outer.addWidget(grid)
+        outer.addStretch(1)
+
+        bot = QWidget()
+        bl = QHBoxLayout(bot)
+        bl.setContentsMargins(0, 0, 0, 0)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setStyleSheet(f"color: {T['muted']}; font-size: 10px;")
+        bl.addWidget(self.lbl_status, 1)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        bl.addWidget(btn_cancel)
+
+        btn_save = PrimaryButton("💾 Save")
+        btn_save.clicked.connect(self._save)
+        bl.addWidget(btn_save)
+
+        outer.addWidget(bot)
+
+    def _load(self):
+        env_path = ROOT / ".env"
+        if not env_path.exists():
+            self.lbl_status.setText("⚠ .env not found")
+            return
+        env: dict[str, str] = {}
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                env[k.strip()] = v.strip()
+        for env_key, le in self._widgets.items():
+            le.setText(env.get(env_key, ""))
+
+    def _save(self):
+        env_path = ROOT / ".env"
+        if not env_path.exists():
+            env_path.write_text("")
+        lines = env_path.read_text().splitlines()
+
+        for env_key, le in self._widgets.items():
+            val = le.text().strip()
+            found = False
+            for i, line in enumerate(lines):
+                stripped = line.lstrip()
+                if stripped.startswith(env_key + "=") or stripped.startswith("#" + env_key + "="):
+                    lines[i] = f"{env_key}={val}"
+                    found = True
+                    break
+            if not found:
+                lines.append(f"{env_key}={val}")
+
+        env_path.write_text("\n".join(lines) + "\n")
+        self.lbl_status.setText("✓ Saved — restart scheduler to apply")
+        self.lbl_status.setStyleSheet(f"color: {T['success']}; font-size: 10px;")
+
+
 # ── Help Dialog ────────────────────────────────────────────────────────────
 
 class HelpDialog(QDialog):
@@ -2265,7 +2410,7 @@ class HelpDialog(QDialog):
         sub = QLabel("点左边目录查看每个功能 / 指标 / 算法的详细解释")
         sub.setStyleSheet(f"color: {T['muted']}; font-size: 10px;")
         hl.addWidget(title); hl.addSpacing(12); hl.addWidget(sub); hl.addStretch(1)
-        lay.addWidget(hdr)
+        lay.addWidget(hdr, 0)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -2276,7 +2421,7 @@ class HelpDialog(QDialog):
         self.txt = QTextEdit(); self.txt.setReadOnly(True)
         splitter.addWidget(self.txt)
         splitter.setStretchFactor(1, 3)
-        lay.addWidget(splitter)
+        lay.addWidget(splitter, 1)
 
     def _populate_tree(self):
         try:
@@ -2284,9 +2429,10 @@ class HelpDialog(QDialog):
         except Exception:
             return
         first = None
-        for cat, entries in GLOSSARY.items():
-            cat_item = QTreeWidgetItem(self.tree, [cat])
-            cat_item.setExpanded(True)
+        for i, (cat, entries) in enumerate(GLOSSARY.items()):
+            label = f"{cat}  ({len(entries)})"
+            cat_item = QTreeWidgetItem(self.tree, [label])
+            cat_item.setExpanded(i == 0)
             for term in entries:
                 item = QTreeWidgetItem(cat_item, [term])
                 item.setData(0, Qt.ItemDataRole.UserRole, (cat, term))
@@ -2310,28 +2456,33 @@ class HelpDialog(QDialog):
 
     def _render(self, term: str, entry: dict):
         c = T
-        html = f"""
-<h2 style="color:{c['text_strong']}; margin-bottom:4px;">{term}</h2>
-"""
-        name = entry.get("name","")
+        html = f'<h2 style="color:{c["text_strong"]}; margin-bottom:2px; margin-top:4px;">{term}</h2>'
+
+        name = entry.get("name", "")
         if name and name != term:
-            html += f'<p style="color:{c["muted"]}; font-style:italic; margin-top:0;">{name}</p>'
+            html += f'<p style="color:{c["muted"]}; font-style:italic; margin-top:0; margin-bottom:4px;">{name}</p>'
+
+        summary = entry.get("summary", "")
+        if summary:
+            html += f'<p style="color:{c["primary"]}; font-weight:bold; margin-top:2px; margin-bottom:8px;">{summary}</p>'
+
         def section(title, content):
             if not content: return ""
             lines_html = ""
             for line in content.split("\n"):
+                if not line.strip():
+                    continue
                 if line.startswith("  ") or line.lstrip().startswith(("•","→","=","▶")):
                     lines_html += f'<code style="background:{c["sidebar_bg"]}; color:{c["text_strong"]}; display:block; padding:2px 6px; border-radius:3px; margin:1px 0; font-family:Menlo,monospace; font-size:11px;">{line}</code>'
                 else:
                     lines_html += f'<p style="color:{c["text"]}; margin:2px 0;">{line}</p>'
-            return f'<p style="color:{c["primary"]}; font-weight:bold; margin-top:12px; margin-bottom:4px;">{title}</p>{lines_html}'
+            return f'<p style="color:{c["primary"]}; font-weight:bold; margin-top:10px; margin-bottom:3px;">{title}</p>{lines_html}'
 
-        html += section("概述", entry.get("summary",""))
-        html += section("说明", entry.get("explain",""))
-        html += section("在系统里用在哪", entry.get("where",""))
+        html += section("说明", entry.get("explain", ""))
+        html += section("在系统里用在哪", entry.get("where", ""))
         if entry.get("value"):
-            html += f'<p style="color:{c["primary"]}; font-weight:bold; margin-top:12px;">当前设置</p>'
-            html += f'<p style="color:{c["success"]}; font-family:Menlo,monospace; font-weight:bold;">{entry["value"]}</p>'
+            html += f'<p style="color:{c["primary"]}; font-weight:bold; margin-top:10px; margin-bottom:3px;">当前设置</p>'
+            html += f'<p style="color:{c["success"]}; font-family:Menlo,monospace; font-weight:bold; margin-top:0;">{entry["value"]}</p>'
         self.txt.setHtml(html)
         self.txt.moveCursor(QTextCursor.MoveOperation.Start)
 

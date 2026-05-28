@@ -19,6 +19,9 @@ import pandas as pd
 import pandas_ta_classic as ta
 
 # Fixed order — DO NOT reorder without retraining. Models depend on column order.
+# 2026-05-28: added 5 macro/time features (vix_level, vix_change_5, hour_of_day,
+# is_opening_hour, is_closing_hour). Models trained before this date are
+# incompatible — retrain via `scripts/train_lgbm_compare.py`.
 FEATURE_NAMES: List[str] = [
     # Trend / EMA structure
     "ema9_over_ema21",       # ratio
@@ -57,6 +60,32 @@ FEATURE_NAMES: List[str] = [
     # Trend strength
     "adx_14",
     "roc_10",                # rate of change 10 bars
+    # ── 2026-05-28 keep: macro (VIX) ──
+    # Provides 36% of model gain — by far the biggest alpha source.
+    "vix_level",             # current VIX level (forward-filled if intraday)
+    "vix_change_5",          # 5-bar VIX % change (rising VIX = rising fear)
+    # ── Time-of-day (kept for active-model compat; importance ~0.1%) ──
+    # 2026-05-29 review showed these scored near-zero in LightGBM gain. They
+    # stay in FEATURE_NAMES so the currently-saved model.joblib (trained with
+    # 35 features) still loads. Next clean retrain can drop them safely.
+    "hour_of_day",
+    "is_opening_hour",
+    "is_closing_hour",
+    # ── 2026-05-29: SEC EDGAR Form 4 insider activity ──
+    # `insider_30d_net_log` is sign(net_$) × log1p(|net_$|), so a huge
+    # exec sale and a small one are on the same scale. Net positive = recent
+    # buying (rare for big-cap tech, strong signal when it happens), net
+    # negative = recent selling (mostly stock comp diversification, weaker
+    # signal but still informative).
+    "insider_30d_net_log",
+    # ── 2026-05-28 v2 attempt (REMOVED 2026-05-28): gap + atr-ratio + sector RS ──
+    # Tried `daily_open_gap_pct`, `atr_5_over_atr_20`, `rs_vs_sector_5d`.
+    # AUC went up slightly (0.630 → 0.640) but BACKTEST $/day DROPPED from
+    # $31.63 → $28.51 (-10%) and May 2026 lost $700. The features added noise
+    # at the edges (high-conviction setups got vetoed). The compute code is
+    # still in compute_features so the columns are produced — they're just not
+    # in FEATURE_NAMES, so models won't read them. Re-enable individually if
+    # you want to A/B-test each feature alone.
 ]
 
 N_FEATURES = len(FEATURE_NAMES)
@@ -156,6 +185,95 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     adx_df = ta.adx(h, l, c, length=14)
     out["adx_14"] = adx_df.iloc[:, 0] if adx_df is not None and not adx_df.empty else pd.Series(np.nan, index=df.index)
     out["roc_10"] = ta.roc(c, length=10)
+
+    # --- Macro: VIX level + slope ---
+    # The 'vix' column must be pre-joined onto df by the caller (training scripts
+    # fetch VIX history via yfinance and forward-fill into HOUR_1 bars; predict.py
+    # injects the live VIX snapshot). When absent we fall back to 15.0 (neutral)
+    # so feature pipeline never crashes — model still gets a sensible default.
+    if "vix" in df.columns:
+        vix_series = df["vix"].astype(float)
+    else:
+        vix_series = pd.Series(15.0, index=df.index)
+    out["vix_level"] = vix_series
+    out["vix_change_5"] = vix_series.pct_change(5).fillna(0.0)
+
+    # --- Time-of-day ---
+    # For HOUR_1 bars on US equities, df.index hours range 9–15 (ET). Models
+    # learn time-of-day biases: opening hours are noisy, midday quieter, close
+    # often trend-continuation. Daily bars don't have meaningful intraday hours
+    # so we default the columns to 12 (midday) when not a datetime index or
+    # daily timeframe.
+    if isinstance(df.index, pd.DatetimeIndex):
+        hours = df.index.hour
+        out["hour_of_day"] = pd.Series(hours, index=df.index, dtype=float)
+        out["is_opening_hour"] = pd.Series((hours <= 10).astype(float), index=df.index)
+        out["is_closing_hour"] = pd.Series((hours >= 15).astype(float), index=df.index)
+    else:
+        out["hour_of_day"] = pd.Series(12.0, index=df.index)
+        out["is_opening_hour"] = pd.Series(0.0, index=df.index)
+        out["is_closing_hour"] = pd.Series(0.0, index=df.index)
+
+    # --- Daily open gap (proxy for pre-market move) ---
+    # For each bar, look up that day's first-bar open vs the prior day's last
+    # close. Every hourly bar within the same day sees the SAME gap value —
+    # which is the right semantics (the gap is a daily-level event the model
+    # should know about regardless of which intraday bar it's looking at).
+    #
+    # We deliberately use ALL bars (including the first) to compute "today's"
+    # open; on hourly data the very first row is the 09:30 ET bar, which is
+    # what we want.
+    if isinstance(df.index, pd.DatetimeIndex):
+        # Group by trading date to find first-open and last-close per day.
+        bar_dates = pd.Series(df.index.date, index=df.index)
+        daily_first_open = o.groupby(bar_dates).transform("first")
+        daily_last_close_prior = c.groupby(bar_dates).transform("last").shift()
+        # Map back: every bar of a day gets that day's first open and the
+        # previous day's last close (same for all bars within the day).
+        # We need the PRIOR day's close — get it via per-day reduction.
+        per_day_close = c.groupby(bar_dates).last()
+        per_day_open = o.groupby(bar_dates).first()
+        prev_close = per_day_close.shift(1)
+        gap = (per_day_open - prev_close) / prev_close.where(prev_close > 0, 1)
+        # Broadcast back to bar level via date map.
+        gap_by_date = gap.to_dict()
+        out["daily_open_gap_pct"] = pd.Series(
+            [gap_by_date.get(d, np.nan) for d in df.index.date],
+            index=df.index,
+        )
+    else:
+        # Daily timeframe: gap = today's open vs yesterday's close.
+        out["daily_open_gap_pct"] = (o - c.shift(1)) / c.shift(1)
+
+    # --- ATR ratio (volatility regime) ---
+    atr5 = ta.atr(h, l, c, length=5)
+    atr20 = ta.atr(h, l, c, length=20)
+    out["atr_5_over_atr_20"] = _safe_div(atr5, atr20, 1.0)
+
+    # --- Sector relative strength (5-bar) ---
+    # Caller pre-joins the sector ETF close as 'sector_close' column. Computed
+    # as: ticker 5-bar return MINUS sector ETF 5-bar return. Positive = ticker
+    # outperforming its sector. Default 0.0 when column is missing — the
+    # feature becomes a non-discriminator (model treats it as noise).
+    if "sector_close" in df.columns:
+        sector = df["sector_close"].astype(float)
+        out["rs_vs_sector_5d"] = c.pct_change(5) - sector.pct_change(5)
+        out["rs_vs_sector_5d"] = pd.Series(out["rs_vs_sector_5d"], index=df.index).fillna(0.0)
+    else:
+        out["rs_vs_sector_5d"] = pd.Series(0.0, index=df.index)
+
+    # --- SEC EDGAR insider activity (rolling 30-day signed log dollars) ---
+    # Caller pre-joins `insider_30d_net_log` per bar by forward-filling the
+    # ticker's daily insider rolling series onto the HOUR_1 index. Missing
+    # column → 0.0 (neutral).
+    if "insider_30d_net_log" in df.columns:
+        out["insider_30d_net_log"] = (
+            pd.Series(df["insider_30d_net_log"], index=df.index)
+            .astype(float)
+            .fillna(0.0)
+        )
+    else:
+        out["insider_30d_net_log"] = pd.Series(0.0, index=df.index)
 
     # Assemble in canonical order
     feat_df = pd.DataFrame({k: pd.Series(out[k], index=df.index) for k in FEATURE_NAMES})

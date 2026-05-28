@@ -43,9 +43,217 @@ from typing import Optional
 import pandas as pd
 from moomoo import KLType
 
-from .config import settings
-from . import news_fetcher, notifier
+from .config import settings, gemini_cascade
+from . import finbert_sentiment, news_fetcher, notifier
 from .moomoo_client import client as _moomoo_client
+
+
+# ─── Context helpers (macro + sector + insider + pre-market) ──────────────────
+# Wiring these into the premarket card lets the trader see at a glance:
+#   • Is the broader market risk-on or risk-off (VIX + SPY)?
+#   • Is this name leading or lagging its sector?
+#   • Is earnings imminent?
+#   • Liquidity OK?
+#   • Pre-market price action?
+#   • Recent insider activity?
+
+# sector → ETF lookup — now shared with ml.features; import the single source
+# of truth from src.sector so the signal card and the ML feature use identical
+# ETF picks.
+from .sector import SECTOR_TO_ETF as _SECTOR_TO_ETF  # noqa: E402
+
+
+def _vix_label(vix: float) -> str:
+    """Color-coded VIX bucket label. Matches the live risk_manager bands:
+    25 = halve sizes, 35 = quarter sizes."""
+    if vix > 35:
+        return "🔴 crisis"
+    if vix > 25:
+        return "🟡 elevated"
+    if vix > 20:
+        return "🟡 cautious"
+    return "🟢 benign"
+
+
+def _snap_chg(c, sym: str) -> dict | None:
+    """Return a snapshot dict {last, prev, chg_pct} for `sym` or None."""
+    try:
+        snap = c.get_snapshot(sym)
+        last = float(snap.get("last_price") or 0)
+        prev = float(snap.get("prev_close_price") or 0)
+        if last <= 0 or prev <= 0:
+            return None
+        return {"last": last, "prev": prev,
+                "chg_pct": round((last / prev - 1) * 100, 2)}
+    except Exception as e:
+        log.debug("snapshot %s failed: %s", sym, e)
+        return None
+
+
+def _sector_snap(c, ticker: str) -> dict | None:
+    """Look up ticker's sector and return that sector ETF's snapshot.
+
+    None when ticker has no sector mapping or ETF data unavailable.
+    """
+    from .sector import get_sector
+    sector = get_sector(ticker)
+    etf = _SECTOR_TO_ETF.get(sector)
+    if not etf:
+        return None
+    snap = _snap_chg(c, etf)
+    if snap is None:
+        return None
+    snap.update({"etf": etf, "sector": sector})
+    return snap
+
+
+def _earnings_info(symbol: str) -> dict | None:
+    """Days-until-next-earnings + ISO date. Uses the cache in earnings.py."""
+    from datetime import date
+    from .earnings import get_next_earnings
+    next_date = get_next_earnings(symbol)
+    if not next_date:
+        return None
+    try:
+        d = date.fromisoformat(next_date)
+    except ValueError:
+        return None
+    return {"date": next_date, "days_until": (d - date.today()).days}
+
+
+def _premarket(symbol: str) -> dict | None:
+    """yfinance pre-market quote, available 04:00–09:30 ET only.
+
+    yfinance keys: preMarketPrice / preMarketChangePercent. Returns None when
+    outside the pre-market window or when the field isn't populated.
+    """
+    try:
+        import yfinance as yf
+        info = yf.Ticker(symbol).info
+        pre_price = info.get("preMarketPrice")
+        pre_change = info.get("preMarketChangePercent")
+        if pre_price and pre_change is not None:
+            return {"price": float(pre_price),
+                    "change_pct": float(pre_change)}
+    except Exception as e:
+        log.debug("pre-market fetch %s failed: %s", symbol, e)
+    return None
+
+
+def _insider_30d(symbol: str) -> dict | None:
+    """Last-30-day insider activity from yfinance.
+
+    Returns {buys, sells, buy_value, sell_value, net_value}.
+    None if no data (ETFs, mutual funds, missing).
+    """
+    try:
+        import yfinance as yf
+        from datetime import date, timedelta
+        trans = yf.Ticker(symbol).insider_transactions
+        if trans is None or trans.empty:
+            return None
+        cutoff = pd.to_datetime(date.today() - timedelta(days=30))
+        # yfinance's "Start Date" can be datetime or string — be tolerant.
+        trans = trans.copy()
+        trans["Start Date"] = pd.to_datetime(trans["Start Date"], errors="coerce")
+        recent = trans[trans["Start Date"] >= cutoff]
+        if recent.empty:
+            return {"buys": 0, "sells": 0, "buy_value": 0.0,
+                    "sell_value": 0.0, "net_value": 0.0}
+        buys_mask = recent["Transaction"].astype(str).str.contains(
+            "Purchase", case=False, na=False)
+        sells_mask = recent["Transaction"].astype(str).str.contains(
+            "Sale", case=False, na=False)
+        buy_val = float(recent.loc[buys_mask, "Value"].sum() or 0)
+        sell_val = float(recent.loc[sells_mask, "Value"].sum() or 0)
+        return {
+            "buys": int(buys_mask.sum()),
+            "sells": int(sells_mask.sum()),
+            "buy_value": buy_val,
+            "sell_value": sell_val,
+            "net_value": buy_val - sell_val,
+        }
+    except Exception as e:
+        log.debug("insider fetch %s failed: %s", symbol, e)
+        return None
+
+
+def _build_context_block(ticker_chg_pct: float, vix: float | None,
+                         spy: dict | None, sector: dict | None,
+                         earnings: dict | None, premkt: dict | None,
+                         insider: dict | None, spread_pct: float | None
+                         ) -> str:
+    """Assemble the 'Macro & Context' multi-line block. Lines with no data
+    are omitted so the card stays compact for low-info names."""
+    lines: list[str] = []
+
+    # Line 1 — VIX state + SPY chg + ticker vs SPY relative strength.
+    vix_part = f"VIX {vix:.1f} {_vix_label(vix)}" if vix is not None else "VIX n/a"
+    if spy is not None:
+        rs = ticker_chg_pct - spy["chg_pct"]
+        rs_tag = "强势" if rs > 0.5 else ("弱势" if rs < -0.5 else "持平")
+        spy_part = f"SPY {spy['chg_pct']:+.2f}%"
+        rs_part = f"vs SPY {rs:+.2f}% {rs_tag}"
+        lines.append(f"📊 {vix_part} | {spy_part} | {rs_part}")
+    else:
+        lines.append(f"📊 {vix_part}")
+
+    # Line 2 — Earnings countdown (always show if data exists).
+    if earnings is not None:
+        d = earnings["days_until"]
+        if 0 <= d <= 5:
+            emoji = "⚠️"   # tight window — caller may want to skip the trade
+        elif d < 0:
+            emoji = "🕓"   # past — should be refreshed by cache TTL
+        else:
+            emoji = "📅"
+        lines.append(f"{emoji} Earnings: {d}d ({earnings['date']})")
+
+    # Line 3 — Sector ETF strength + relative.
+    if sector is not None:
+        diff = ticker_chg_pct - sector["chg_pct"]
+        if diff > 0.3:
+            tag = "强势"
+        elif diff < -0.3:
+            tag = "弱势"
+        else:
+            tag = "同步"
+        lines.append(
+            f"🏭 Sector {sector['etf']}({sector['sector']}) "
+            f"{sector['chg_pct']:+.2f}% — vs sector {diff:+.2f}% {tag}"
+        )
+
+    # Line 4 — Liquidity + pre-market action.
+    parts: list[str] = []
+    if spread_pct is not None and spread_pct > 0:
+        if spread_pct < 0.05:
+            qual = "优"
+        elif spread_pct < 0.15:
+            qual = "良"
+        else:
+            qual = "⚠ 差"
+        parts.append(f"spread {spread_pct:.2f}% {qual}")
+    if premkt is not None:
+        arrow = "📈" if premkt["change_pct"] >= 0 else "📉"
+        parts.append(f"Pre-mkt ${premkt['price']:.2f} {arrow}{premkt['change_pct']:+.2f}%")
+    if parts:
+        lines.append("💧 " + " | ".join(parts))
+
+    # Line 5 — Insider 30d (only show if any activity).
+    if insider is not None and (insider["buys"] + insider["sells"] > 0):
+        if insider["net_value"] > 0:
+            emoji, tag = "🟢", "净买入"
+        elif insider["net_value"] < 0:
+            emoji, tag = "🔴", "净卖出"
+        else:
+            emoji, tag = "⚪️", "持平"
+        net_m = insider["net_value"] / 1e6
+        lines.append(
+            f"👔 Insider 30d: {emoji} {insider['buys']} buys / "
+            f"{insider['sells']} sells — {tag} ${net_m:+.1f}M"
+        )
+
+    return "\n".join(lines)
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +368,13 @@ def _bollinger(close: pd.Series, period=20) -> dict:
 
 
 def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k=9, d=3) -> dict:
+    """Stochastic %K/%D with relaxed cross thresholds.
+
+    Original logic only fired cross_up when k < 35 / cross_down when k > 65.
+    Audit (2026-05-28): in trending markets, valid stoch crosses commonly occur
+    above 50 — restricting to <35 / >65 silently skipped half the signals.
+    Loosened to <50 / >50 so we catch in-trend rotations too.
+    """
     ll  = low.rolling(k).min()
     hh  = high.rolling(k).max()
     kv  = 100 * (close - ll) / (hh - ll + 1e-9)
@@ -171,8 +386,8 @@ def _stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k=9, d=3) -> 
     return {
         "k":          k_n,
         "d":          d_n,
-        "cross_up":   bool(kp < dp and k_n > d_n and k_n < 35),
-        "cross_down": bool(kp > dp and k_n < d_n and k_n > 65),
+        "cross_up":   bool(kp < dp and k_n > d_n and k_n < 50),
+        "cross_down": bool(kp > dp and k_n < d_n and k_n > 50),
         "oversold":   k_n < 20,
         "overbought": k_n > 80,
     }
@@ -251,10 +466,14 @@ def _score(price, rsi, macd, ema9, ema21, boll, vol, stoch, vwap, mom
     elif price < vwap * 0.997:  sell += 1
 
     # Bollinger Bands
+    # 2026-05-28: relaxed pct_b thresholds from 0.08/0.92 → 0.15/0.85.
+    # Original 0.08 needed price almost touching the band — fired so rarely
+    # that the score signal was effectively binary. 0.15/0.85 captures the
+    # "near band" zone where mean-reversion is statistically meaningful.
     if boll["breakout"] == "up":    buy += 2;  alerts.append("BB突破上轨")
     elif boll["breakout"] == "down": sell += 2; alerts.append("BB跌破下轨")
-    elif boll["pct_b"] < 0.08:  buy  += 1
-    elif boll["pct_b"] > 0.92:  sell += 1
+    elif boll["pct_b"] < 0.15:  buy  += 1
+    elif boll["pct_b"] > 0.85:  sell += 1
 
     # Volume surge
     if vol["surge"]:
@@ -301,12 +520,7 @@ def _call_gemini(prompt: str) -> Optional[dict]:
     if not keys:
         return None
 
-    primary = settings.gemini_model or "gemini-2.5-flash"
-    seen: set[str] = set()
-    cascade = [m for m in [primary, "gemini-2.5-flash", "gemini-2.5-flash-lite"]
-               if not (m in seen or seen.add(m))]  # type: ignore[func-returns-value]
-
-    for model_name in cascade:
+    for model_name in gemini_cascade():
         for key in keys:
             for attempt in range(2):
                 try:
@@ -319,11 +533,13 @@ def _call_gemini(prompt: str) -> Optional[dict]:
                 except Exception as e:
                     err = str(e)
                     if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                        # Quota exhausted for this key+model → try next key.
                         break
                     if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
                         time.sleep(4)
                         continue
                     break
+        # All keys failed / quota'd for this model → outer loop tries next (lighter) model.
     return None
 
 
@@ -390,38 +606,68 @@ def _gemini_signal(tech: dict, ticker_news: list, macro_news: list) -> dict:
 
 # ─── 盘前全面分析（完整卡片，带 AI）────────────────────────────────────────
 
-def _build_premarket_card(tech: dict, ai: dict) -> str:
-    score  = int(ai.get("score", 5))
+def _ai_num(ai: dict, key: str, default: float = 0.0) -> float:
+    """Get a numeric field from AI response, treating None/missing as default."""
+    v = ai.get(key)
+    return float(v) if v is not None else default
+
+
+_FINBERT_LABEL_EMOJI = {"positive": "🟢", "neutral": "⚪️", "negative": "🔴"}
+
+
+def _finbert_line(sentiment: Optional[dict]) -> str:
+    """One-liner for the premarket card. Empty string if FinBERT unavailable."""
+    if not sentiment or sentiment.get("n_headlines", 0) == 0:
+        return ""
+    emoji = _FINBERT_LABEL_EMOJI.get(sentiment["label"], "⚪️")
+    n = sentiment["n_headlines"]
+    return (
+        f"🧪 FinBERT {emoji} *{sentiment['label']}* "
+        f"net={sentiment['score_net']:+.2f}  "
+        f"(P{sentiment['n_pos']}/N{sentiment['n_neu']}/M{sentiment['n_neg']} of {n})\n"
+    )
+
+
+def _build_premarket_card(tech: dict, ai: dict,
+                          sentiment: Optional[dict] = None,
+                          context_block: str = "") -> str:
+    score  = int(ai.get("score") or 5)
     act_e  = ACTION_EMOJI.get(ai.get("action", "观望"), "🟡")
     risk_e = RISK_EMOJI.get(ai.get("risk_level", "中"), "🟡")
     conf_e = CONF_EMOJI.get(ai.get("confidence", "中"), "✋")
-    arrow  = "📈" if tech["chg1"] >= 0 else "📉"
+    chg1   = tech.get("chg1") or 0.0
+    arrow  = "📈" if chg1 >= 0 else "📉"
+    finbert_line = _finbert_line(sentiment)
+    # Context block is optional — empty string when nothing was fetchable.
+    context_section = f"\n{context_block}\n" if context_block else ""
 
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"*{tech['ticker']}* {tech['company']} | "
-        f"${tech['price']} {arrow} {tech['chg1']:+.2f}%\n"
+        f"${tech['price']} {arrow} {chg1:+.2f}%\n"
         f"\n"
         f"{act_e} *{ai.get('action', '?')}*  {_score_bar(score)}\n"
         f"   {ai.get('reason', '')}\n"
+        f"{context_section}"
         f"\n"
         f"⏱ 持仓 {ai.get('hold_period', '?')} | "
         f"{risk_e} 风险 {ai.get('risk_level', '?')} | "
         f"{conf_e} 信心 {ai.get('confidence', '?')}\n"
         f"\n"
-        f"🎯 入场 ${ai.get('entry_low', 0):.2f} ~ ${ai.get('entry_high', 0):.2f}\n"
-        f"📍 目标1 *${ai.get('target_1', 0)}* | 目标2 *${ai.get('target_2', 0)}*\n"
-        f"🛑 止损 *${ai.get('stop_loss', 0)}*\n"
+        f"🎯 入场 ${_ai_num(ai, 'entry_low'):.2f} ~ ${_ai_num(ai, 'entry_high'):.2f}\n"
+        f"📍 目标1 *${_ai_num(ai, 'target_1'):.2f}* | 目标2 *${_ai_num(ai, 'target_2'):.2f}*\n"
+        f"🛑 止损 *${_ai_num(ai, 'stop_loss'):.2f}*\n"
         f"\n"
         f"📊 技术 买{tech['buy_score']}/10 | 卖{tech['sell_score']}/10\n"
         f"   RSI={tech['rsi']} · MACD={tech['macd']['hist']:+.3f} · BB%B={tech['boll']['pct_b']}\n"
-        f"   VWAP=${tech['vwap']} · Vol {tech['vol']['ratio']}x · 动能{tech['mom']:+.2f}%\n"
+        f"   VWAP=${tech['vwap']} · Vol {tech['vol']['ratio']}x · 动能{tech.get('mom', 0):+.2f}%\n"
         f"   支撑${tech['sr']['support']} · 压力${tech['sr']['resistance']} · ATR={tech['atr']}\n"
         f"   ⚡ {' · '.join(tech['alerts']) if tech['alerts'] else '无警报'}\n"
         f"\n"
-        f"📰 {ai.get('news_impact', '-')}\n"
-        f"🔮 {ai.get('catalyst', '-')}\n"
-        f"💡 {ai.get('summary', '-')}\n"
+        f"{finbert_line}"
+        f"📰 {ai.get('news_impact') or '-'}\n"
+        f"🔮 {ai.get('catalyst') or '-'}\n"
+        f"💡 {ai.get('summary') or '-'}\n"
         f"🤖 {ai.get('_model', 'unknown')}"
     )
 
@@ -501,10 +747,28 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
     high  = df["high"]
     low   = df["low"]
     vol   = df["volume"]
-    price = round(float(close.iloc[-1]), 2)
 
-    chg1 = round((price / float(df_d["close"].iloc[-2]) - 1) * 100, 2) \
-           if (df_d is not None and len(df_d) >= 2) else 0.0
+    # Use real-time snapshot for current price and daily change.
+    # request_history_kline only returns completed bars, so close.iloc[-1] may be
+    # 5–15 min stale during trading hours. Snapshot gives the live last price.
+    price = round(float(close.iloc[-1]), 2)  # fallback
+    chg1  = 0.0
+    try:
+        snap  = c.get_snapshot(sym)
+        last  = float(snap.get("last_price") or 0)
+        prev  = float(snap.get("prev_close_price") or 0)
+        if last > 0:
+            price = round(last, 2)
+        if last > 0 and prev > 0:
+            chg1 = round((last / prev - 1) * 100, 2)
+    except Exception as snap_err:
+        log.debug("signal_reporter: snapshot fallback for %s: %s", sym, snap_err)
+        # chg1 fallback using daily kline
+        if df_d is not None and len(df_d) >= 2:
+            prev_close = float(df_d["close"].iloc[-1])
+            if prev_close > 0:
+                chg1 = round((price / prev_close - 1) * 100, 2)
+
     chg5 = round((price / float(df_d["close"].iloc[-6]) - 1) * 100, 2) \
            if (df_d is not None and len(df_d) >= 6) else 0.0
 
@@ -571,15 +835,62 @@ def run_premarket() -> None:
     results    = []
     df_d_cache: dict = {}
 
+    finbert_on = finbert_sentiment.is_available()
+    if finbert_on:
+        log.info("signal_reporter premarket: FinBERT enabled — will score news headlines")
+
     with _moomoo_client() as c:
+        # Fetch macro context ONCE per premarket — SPY snapshot + VIX. These
+        # are shared across every ticker card so each one shows the same
+        # market backdrop.
+        spy_snap = _snap_chg(c, "SPY")
+        try:
+            vix_value = c.get_vix()
+            log.info("signal_reporter premarket: VIX=%.1f, SPY %s",
+                     vix_value, f"{spy_snap['chg_pct']:+.2f}%" if spy_snap else "n/a")
+        except Exception as e:
+            log.warning("VIX fetch failed: %s — defaulting to 15.0", e)
+            vix_value = 15.0
+
         for sym in watchlist:
             tech = _fetch_tech(c, sym, KLType.K_15M, 120, df_d_cache)
             if not tech:
                 log.warning("signal_reporter: skip %s (data insufficient)", sym)
                 continue
             ticker_news = news_fetcher.fetch_ticker_news(sym)
+            # FinBERT — score the same headlines Gemini sees. Optional layer:
+            # if the import isn't available we silently skip (UI just omits the
+            # line). FinBERT is offline-only after first model download.
+            sentiment = None
+            if finbert_on and ticker_news:
+                headlines = [n.get("title", "") for n in ticker_news[:8]]
+                sentiment = finbert_sentiment.score_headlines(headlines)
+            # Macro & per-ticker context. yfinance fetches (pre-market, insider)
+            # add ~1-2s/ticker; acceptable since premarket runs once/day.
+            sector_data = _sector_snap(c, sym)
+            earnings_data = _earnings_info(sym)
+            premkt_data = _premarket(sym)
+            insider_data = _insider_30d(sym)
+            spread_pct = None
+            try:
+                spread_pct = c.get_spread_pct(sym)
+            except Exception:
+                pass
+            context_block = _build_context_block(
+                ticker_chg_pct=tech.get("chg1", 0) or 0,
+                vix=vix_value,
+                spy=spy_snap,
+                sector=sector_data,
+                earnings=earnings_data,
+                premkt=premkt_data,
+                insider=insider_data,
+                spread_pct=spread_pct,
+            )
             ai = _gemini_signal(tech, ticker_news, macro_news)
-            results.append({"tech": tech, "ai": ai})
+            results.append({
+                "tech": tech, "ai": ai, "sentiment": sentiment,
+                "context_block": context_block,
+            })
             time.sleep(0.3)
 
     if not results:
@@ -588,7 +899,9 @@ def run_premarket() -> None:
 
     results.sort(key=lambda r: -int(r["ai"].get("score", 5)))
     for r in results:
-        notifier.send(_build_premarket_card(r["tech"], r["ai"]))
+        notifier.send(_build_premarket_card(
+            r["tech"], r["ai"], r.get("sentiment"),
+            context_block=r.get("context_block", "")))
     notifier.send(_build_premarket_summary(results))
     log.info("signal_reporter premarket done — %d cards", len(results))
 
@@ -694,11 +1007,13 @@ def run_loop() -> None:
     import pytz
     from apscheduler.schedulers.blocking import BlockingScheduler
 
+    # Only FileHandler here — the GUI redirects stdout to signal_reporter.log when
+    # launching via subprocess.Popen(stdout=open(SIGNAL_LOG_FILE)), which would
+    # cause every line to appear twice if we also had a StreamHandler.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s | %(message)s",
         handlers=[
-            logging.StreamHandler(),
             logging.FileHandler(settings.root / "logs" / "signal_reporter.log"),
         ],
     )
@@ -759,6 +1074,15 @@ def main() -> None:
     """
     import sys
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
+
+    # For direct one-shot calls (premarket/intraday) the scheduler's basicConfig
+    # is never called, so we set up logging here so warnings have timestamps.
+    if cmd in ("premarket", "intraday"):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s | %(message)s",
+            handlers=[logging.StreamHandler()],
+        )
 
     if cmd == "run":
         run_loop()

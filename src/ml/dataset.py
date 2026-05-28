@@ -85,11 +85,22 @@ def label_bars(df: pd.DataFrame, cfg: LabelConfig = LabelConfig()) -> pd.Series:
 def build_dataset(
     klines_by_symbol: dict[str, pd.DataFrame],
     cfg: LabelConfig = LabelConfig(),
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    sort_chronological: bool = True,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """Concatenate features + labels across all tickers.
 
-    Returns (X, y, symbol_index) — symbol_index is parallel to X/y for
-    walk-forward by-symbol sampling later.
+    Returns (X, y, symbol_index, ts_index) — all four arrays share the same
+    integer row index after reset_index, so a slice like `X.iloc[:n_train]`
+    aligns with `y.iloc[:n_train]`, `syms.iloc[:n_train]`, and
+    `ts.iloc[:n_train]`.
+
+    Args:
+      sort_chronological: when True (default 2026-05-29), the concatenated
+        rows are sorted by their bar timestamp BEFORE returning. The previous
+        version concatenated ticker-by-ticker and used a 70/15/15 row split
+        — which gave a 'leave-some-tickers-out' validation rather than a
+        time-series split. Sorting by ts makes _time_split a true OOS test
+        on the most recent 15% of bars across ALL tickers.
     """
     X_frames: list[pd.DataFrame] = []
     y_frames: list[pd.Series] = []
@@ -111,12 +122,26 @@ def build_dataset(
         sym_frames.append(pd.Series(sym, index=feats.loc[mask].index, name="symbol"))
 
     if not X_frames:
-        return (pd.DataFrame(columns=FEATURE_NAMES),
-                pd.Series(dtype=int),
-                pd.Series(dtype=str))
+        empty = pd.DataFrame(columns=FEATURE_NAMES)
+        return (empty, pd.Series(dtype=int),
+                pd.Series(dtype=str), pd.Series(dtype="datetime64[ns]"))
 
-    X = pd.concat(X_frames).reset_index(drop=False).rename(columns={"index": "ts"})
-    y = pd.concat(y_frames).reset_index(drop=True)
+    X_raw = pd.concat(X_frames)
+    # Capture the index as a series, then drop the index for clean ops. We
+    # can't rely on `rename(columns={"index": "ts"})` because pandas keeps
+    # the original index name when it can — for kline frames that's
+    # "time_key", which silently breaks the lookup further down.
+    ts = pd.to_datetime(X_raw.index).to_series().reset_index(drop=True)
+    X = X_raw.reset_index(drop=True)
+    y_concat = pd.concat(y_frames).reset_index(drop=True)
     syms = pd.concat(sym_frames).reset_index(drop=True)
-    X = X.drop(columns=["ts"]) if "ts" in X.columns else X
-    return X[FEATURE_NAMES], y, syms
+
+    if sort_chronological:
+        # Sort by ts, keeping all parallel arrays aligned.
+        order = ts.argsort().values
+        X = X.iloc[order].reset_index(drop=True)
+        y_concat = y_concat.iloc[order].reset_index(drop=True)
+        syms = syms.iloc[order].reset_index(drop=True)
+        ts = ts.iloc[order].reset_index(drop=True)
+
+    return X[FEATURE_NAMES], y_concat, syms, ts

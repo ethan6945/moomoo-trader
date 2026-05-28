@@ -80,6 +80,14 @@ def _drawdown_risk_multiplier() -> float:
     return 1.0
 
 
+# Auto-release a sticky DD halt after this many calendar days. Without this
+# the live bot (and the backtester) sat halted after a single bad month
+# because peak_equity stays high and no new trades = equity stays flat = DD
+# never recovers naturally. 7 days lets a regime change play out while
+# bounding the damage of being out of the market for too long.
+HALT_AUTO_RELEASE_DAYS = 7
+
+
 def current_drawdown_pct() -> float:
     """Account-level drawdown as a percent, computed from peak_equity in state.
 
@@ -95,6 +103,46 @@ def current_drawdown_pct() -> float:
     if equity >= peak:
         return 0.0
     return (peak - equity) / peak * 100
+
+
+def _check_halt_auto_release(state: dict) -> tuple[float, bool]:
+    """Check if a sticky DD halt should be auto-released.
+
+    Returns (current_dd_pct, was_released). When the halt has been active
+    for >= HALT_AUTO_RELEASE_DAYS, we reset peak_equity to current equity so
+    DD drops to 0 and trading resumes. Logged so the user can see when it
+    fires (rare event in practice — most halts recover via TP within 7d).
+    """
+    from datetime import datetime, timezone, timedelta
+    dd_pct = current_drawdown_pct()
+    halt_at = state.get("halt_started_at")
+    if not halt_at:
+        return dd_pct, False
+    try:
+        started = datetime.fromisoformat(halt_at)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = datetime.now(timezone.utc) - started
+        if elapsed >= timedelta(days=HALT_AUTO_RELEASE_DAYS):
+            # Auto-release: reset peak to CURRENT equity so DD = 0. Other
+            # risk multipliers (size_cut at 10% DD, adaptive Sortino, loss
+            # streak) still scale qty down — the DD halt is a hard stop, not
+            # a soft brake.
+            realized = float(state.get("realized_pnl_total") or 0.0)
+            new_peak = max(settings.account_usd + realized, 1.0)
+            def _apply(_s):
+                return {"peak_equity": new_peak, "halt_started_at": None}
+            db.atomic_state(_apply)
+            log.warning(
+                "DD halt auto-released after %.1f days — peak reset from $%.0f to $%.0f",
+                elapsed.total_seconds() / 86400,
+                state.get("peak_equity", 0),
+                new_peak,
+            )
+            return 0.0, True
+    except (ValueError, TypeError) as e:
+        log.debug("halt timer parse error: %s", e)
+    return dd_pct, False
 
 
 def _dd_size_multiplier() -> float:
@@ -151,6 +199,98 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     return base
 
 
+def _can_stack_onto(signal: Signal, held: pd.DataFrame) -> tuple[bool, str]:
+    """Gate for adding another entry to a symbol we already hold.
+
+    Requires:
+      • current stack count < MAX_STACKS_PER_SYMBOL
+      • unrealised R-multiple ≥ STACK_MIN_R_MULTIPLE (only add to winners)
+    """
+    if settings.max_stacks_per_symbol <= 1:
+        return False, "stacking disabled (MAX_STACKS_PER_SYMBOL ≤ 1)"
+
+    open_trades = db.load_open_trades()
+    rec = open_trades.get(signal.symbol)
+    if not rec:
+        # Held at broker but no local trade record — refuse to stack blindly.
+        return False, f"no local trade record for {signal.symbol} (skip stack)"
+
+    stacks = int(rec.get("stacks", 1))
+    if stacks >= settings.max_stacks_per_symbol:
+        return False, (f"max stacks ({settings.max_stacks_per_symbol}) "
+                       f"reached for {signal.symbol}")
+
+    entry = float(rec.get("entry_price", 0) or 0)
+    stop = float(rec.get("stop_loss", 0) or 0)
+    r_unit = entry - stop
+    if r_unit <= 0:
+        return False, f"invalid R unit for {signal.symbol} (entry {entry} / stop {stop})"
+
+    # Use broker's last price for the symbol if available, else fall back to
+    # the live signal price (close of latest scoring bar — same magnitude).
+    last_px = float(signal.price)
+    if not held.empty:
+        row = held[held["code"].str.split(".").str[-1] == signal.symbol]
+        if not row.empty:
+            np = float(row.iloc[0].get("nominal_price") or 0)
+            if np > 0:
+                last_px = np
+
+    r_now = (last_px - entry) / r_unit
+    if r_now < settings.stack_min_r_multiple:
+        return False, (f"{signal.symbol} unrealised {r_now:.2f}R < "
+                       f"{settings.stack_min_r_multiple}R (need profit to stack)")
+
+    return True, "ok"
+
+
+# SL cooldown — how long (in HOURS) we refuse to re-enter a name we just
+# stopped out of. Baseline 142-day audit: 29 "rebleed" losses worth -$425
+# came from re-buying the same ticker within 3 days of a stop. 24h is long
+# enough to let the reason for the stop play out, short enough that a true
+# multi-day swing setup can still be entered the next trading day.
+SL_COOLDOWN_HOURS = 24
+
+
+def in_sl_cooldown(symbol: str, hours: int = SL_COOLDOWN_HOURS
+                   ) -> tuple[bool, str]:
+    """Check if `symbol` recently hit SL — caller refuses entry if True.
+
+    2026-05-29 fix: do all comparison in tz-aware UTC. The previous version
+    called `astimezone(tz=None)` which converts to SYSTEM LOCAL time, then
+    compared with `datetime.utcnow()` (naive UTC) — producing 4-12 hour drift
+    depending on the user's timezone. On a Malaysia laptop the cooldown would
+    have either never fired (8h ahead, 'elapsed' negative) or fired forever.
+    """
+    from datetime import datetime, timedelta, timezone
+    last = db.last_sl_close_for_symbol(symbol)
+    if not last:
+        return False, "no prior SL"
+    ts = last.get("ts") or ""
+    if not ts:
+        return False, "no SL timestamp"
+    try:
+        sl_dt = datetime.fromisoformat(ts)
+        # Normalize to UTC. ts comes from `datetime.now(NY).isoformat()`
+        # (tz-aware) for new rows; legacy migrations may be naive — in that
+        # case we conservatively assume the stamp was UTC, so cooldown will be
+        # at worst a few hours OFF, never inverted.
+        if sl_dt.tzinfo is None:
+            sl_dt = sl_dt.replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        elapsed = now_utc - sl_dt
+        if elapsed < timedelta(hours=hours):
+            remaining = timedelta(hours=hours) - elapsed
+            mins = int(remaining.total_seconds() / 60)
+            return True, (
+                f"SL cooldown: stopped out {int(elapsed.total_seconds()/3600)}h ago, "
+                f"resume in {mins // 60}h{mins % 60:02d}m"
+            )
+    except (ValueError, TypeError) as e:
+        log.debug("SL cooldown parse error for %s: %s", symbol, e)
+    return False, "cooldown elapsed"
+
+
 def can_open_new(
     signal: Signal,
     positions: pd.DataFrame,
@@ -166,19 +306,47 @@ def can_open_new(
     if state.get("halted"):
         return False, "trading halted (daily/streak)"
 
-    # Account-level DD halt — independent of daily/streak. Recovers automatically
-    # once peak-to-current DD drops back under the size-cut threshold (10%).
-    dd_pct = current_drawdown_pct()
+    # SL cooldown — block re-entry on a name that just stopped out. Only
+    # applies to brand-new entries; stacking adds onto an EXISTING profitable
+    # position so the SL pattern doesn't apply.
+    held = positions[positions["qty"].astype(float) > 0] if not positions.empty else positions
+    held_symbols = set(held["code"].str.split(".").str[-1].tolist()) if not held.empty else set()
+    if signal.symbol not in held_symbols:
+        cooling, cool_reason = in_sl_cooldown(signal.symbol)
+        if cooling:
+            return False, cool_reason
+
+    # Account-level DD halt — independent of daily/streak.
+    # Auto-releases after HALT_AUTO_RELEASE_DAYS (7d) so a single bad month
+    # doesn't lock trading out for the rest of the year.
+    dd_pct, released = _check_halt_auto_release(state)
     if dd_pct >= settings.dd_halt_pct:
+        # First time hitting halt → stamp the start time so the auto-release
+        # timer starts. Subsequent checks see the timestamp and check elapsed.
+        from datetime import datetime, timezone
+        if not state.get("halt_started_at"):
+            stamp = datetime.now(timezone.utc).isoformat()
+            db.atomic_state(lambda _s: {"halt_started_at": stamp})
+            log.warning("DD halt triggered: %.1f%% — 7d auto-release timer started",
+                        dd_pct)
         return False, (f"DD halt: account drawdown {dd_pct:.1f}% "
-                       f"≥ DD_HALT_PCT {settings.dd_halt_pct:.0f}%")
+                       f"≥ DD_HALT_PCT {settings.dd_halt_pct:.0f}% — auto-release in ≤7d")
 
     held = positions[positions["qty"].astype(float) > 0] if not positions.empty else positions
-    if len(held) + len(pending_symbols) >= settings.max_positions:
-        return False, f"max positions ({settings.max_positions}) reached (incl. pending)"
+    held_symbols = held["code"].str.split(".").str[-1].tolist() if not held.empty else []
+    is_stack = signal.symbol in held_symbols
 
-    if not held.empty and signal.symbol in held["code"].str.split(".").str[-1].tolist():
-        return False, f"already holding {signal.symbol}"
+    # Brand-new ticker: enforce MAX_POSITIONS cap. Stacking onto an existing
+    # name doesn't count — it's the same broker position with bigger qty.
+    if not is_stack:
+        unique_names = len(set(held_symbols) | set(pending_symbols))
+        if unique_names >= settings.max_positions:
+            return False, f"max positions ({settings.max_positions}) reached (incl. pending)"
+    else:
+        # Stacking path — gated by stacks-count + min unrealised R-multiple.
+        ok, reason = _can_stack_onto(signal, held)
+        if not ok:
+            return False, reason
 
     if signal.symbol in pending_symbols:
         return False, f"buy order for {signal.symbol} already pending"

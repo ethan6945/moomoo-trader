@@ -88,7 +88,10 @@ class BacktestConfig:
     apply_regime_gate: bool = True  # need SPY > 200SMA at entry bar (BULL/NEUTRAL)
     apply_sector_gate: bool = True  # cap concurrent positions per sector (MAX_PER_SECTOR)
     apply_ml_gate: bool = True      # require ML proba ≥ ML_VETO_THRESHOLD if model exists
-    apply_mr_strategy: bool = True  # also run mean-reversion strategy in parallel
+    # 2026-05-29: defaults to False because combo sweep proved MR was a net
+    # drag on this watchlist ($23→$27/day when disabled). Flip on for chop-
+    # heavy regimes if a regime-detection layer ever lands.
+    apply_mr_strategy: bool = False  # was True until 2026-05-29
     # DD circuit breaker — exposed for backtest realism + the live risk_manager
     # uses the same knobs. Per the 142-day backtest (Nov 2025 –22% peak DD),
     # cutting size when DD breaches 10% materially softens the regime-change
@@ -102,6 +105,10 @@ class BacktestConfig:
     apply_max_positions: bool = True
     # Diagnostics — counts get returned in metrics so we know what filtered
     track_skip_reasons: bool = True
+    # SL cooldown — block re-entry on a name we just stopped out of.
+    # Defaults match the live risk_manager.SL_COOLDOWN_HOURS so backtest ≈ live.
+    # Set to 0 to disable (matches pre-fix behaviour).
+    sl_cooldown_hours: int = 24
 
 
 # ---------- shared portfolio state (DD breaker) ----------
@@ -124,6 +131,13 @@ class PortfolioState:
     starting_capital: float
     realized_pnl: float = 0.0
     peak_equity: float = 0.0
+    # Halt timer — when DD ≥ dd_halt_pct, record the bar timestamp. After
+    # `halt_auto_release_days` we forget the peak and let DD reset to 0, so a
+    # stuck halt never blocks the simulator (or the live bot) forever.
+    # See `is_halted()` for the release logic.
+    halt_started_at: object = None     # pd.Timestamp | None
+
+    HALT_AUTO_RELEASE_DAYS: float = 7.0
 
     def __post_init__(self) -> None:
         # Peak starts at the seed capital — DD is always measured from a
@@ -143,6 +157,37 @@ class PortfolioState:
     def record(self, pnl: float) -> None:
         self.realized_pnl += pnl
         self.peak_equity = max(self.peak_equity, self.equity)
+
+    def is_halted(self, current_ts, dd_halt_pct: float) -> bool:
+        """Return True if new entries should be refused right now.
+
+        Auto-release: once a halt has been active for `HALT_AUTO_RELEASE_DAYS`,
+        we reset peak_equity to the CURRENT equity. This forgets the
+        underwater mark so DD drops to 0 — letting trading resume. Other risk
+        guards (size_cut at 10% DD, adaptive sizing by Sortino, loss-streak)
+        keep size reasonable; the DD halt is a hard stop, not a soft brake.
+
+        Without this fix the 360-day backtest sat halted for 9 months after
+        one bad month locked the peak above current equity permanently.
+        """
+        # Already halted — check the timer.
+        if self.halt_started_at is not None:
+            days_halted = (current_ts - self.halt_started_at).total_seconds() / 86400
+            if days_halted >= self.HALT_AUTO_RELEASE_DAYS:
+                # Force-release: peak = current equity so DD = 0.
+                self.peak_equity = max(self.equity, 1.0)
+                self.halt_started_at = None
+                return False
+            # If DD naturally recovered below the halt line, release early.
+            if self.dd_pct < dd_halt_pct:
+                self.halt_started_at = None
+                return False
+            return True
+        # Not halted — check if we should be.
+        if self.dd_pct >= dd_halt_pct:
+            self.halt_started_at = current_ts
+            return True
+        return False
 
 
 # ---------- helpers ----------
@@ -221,7 +266,7 @@ def backtest_ticker(
     from .indicators import check_gap, daily_trend_bullish, evaluate
     from . import regime as regime_mod
     if cfg.apply_mr_strategy:
-        from . import strategy_mr
+        from . import strategy_momentum, strategy_mr
     ml_pred = None
     if cfg.apply_ml_gate:
         try:
@@ -441,7 +486,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
     from . import regime as regime_mod
     from .config import settings as _settings
     if cfg.apply_mr_strategy:
-        from . import strategy_mr
+        from . import strategy_momentum, strategy_mr
     ml_pred = None
     if cfg.apply_ml_gate:
         try:
@@ -473,6 +518,8 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
     portfolio = PortfolioState(starting_capital=cfg.account_usd)
     open_trades: dict[str, Trade] = {}
     closed_trades: list[Trade] = []
+    # Per-symbol last SL time — used to enforce SL cooldown identically to live.
+    last_sl_at: dict[str, pd.Timestamp] = {}
 
     # Cache spy/regime lookups & daily-by-date lookups to avoid recomputing.
     daily_lookup: dict[str, dict] = {}
@@ -496,11 +543,14 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
             (t.exit_price - t.entry_price) / t.entry_price * 100, 2
         )
 
-    def _close(active: Trade, sym: str) -> None:
+    def _close(active: Trade, sym: str, exit_ts: pd.Timestamp) -> None:
         _finalise(active)
         closed_trades.append(active)
         portfolio.record(active.pnl)
         open_trades.pop(sym, None)
+        # Stamp the SL time so the cooldown gate can refuse re-entry.
+        if active.exit_reason == "SL":
+            last_sl_at[sym] = exit_ts
 
     # ---------- main loop ----------
     # Progress: fire every ~2% of events so the GUI shows movement during the
@@ -544,7 +594,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
                 active.exit_reason = "MAX_HOLD"
 
             if active.exit_reason:
-                _close(active, sym)
+                _close(active, sym, ts)
             continue   # already has (or had) position on this bar — no new entry
 
         # --- (B) try to open a new position ---
@@ -552,13 +602,23 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
         if cfg.apply_max_positions and len(open_trades) >= _settings.max_positions:
             continue
 
+        # SL cooldown — refuse re-entry on a name we just stopped out of.
+        # Mirrors `risk_manager.in_sl_cooldown` in live.
+        if cfg.sl_cooldown_hours > 0 and sym in last_sl_at:
+            elapsed_hours = (ts - last_sl_at[sym]).total_seconds() / 3600
+            if elapsed_hours < cfg.sl_cooldown_hours:
+                continue
+
         # --- score the bar (trend + optional MR) ---
         window = df.iloc[max(0, i + 1 - _lookback): i + 1]
         try:
             sig_trend = evaluate(sym, window)
             if cfg.apply_mr_strategy:
                 sig_mr = strategy_mr.evaluate(sym, window)
-                sig = sig_trend if sig_trend.score >= sig_mr.score else sig_mr
+                sig_mom = strategy_momentum.evaluate(sym, window)
+                # Pick the highest-scoring of the three.
+                candidates = [sig_trend, sig_mr, sig_mom]
+                sig = max(candidates, key=lambda s: s.score)
             else:
                 sig = sig_trend
         except Exception:
@@ -588,19 +648,20 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
 
         if ml_pred is not None:
             try:
-                proba = ml_pred.predict_proba(window)
+                proba = ml_pred.predict_proba(window, symbol=sym)
                 if proba is not None and proba < ml_pred.ML_VETO_THRESHOLD:
                     continue
             except Exception:
                 pass
 
         # --- DD circuit breaker (TRUE portfolio-level now that we're chronological) ---
+        # is_halted() also handles the 7-day auto-release so a stuck halt
+        # doesn't lock the simulator for months.
         qty_mult = 1.0
         if cfg.apply_dd_breaker:
-            dd_pct = portfolio.dd_pct
-            if dd_pct >= cfg.dd_halt_pct:
-                continue   # halt new entries until equity recovers
-            if dd_pct >= cfg.dd_size_cut_pct:
+            if portfolio.is_halted(ts, cfg.dd_halt_pct):
+                continue   # halt active — refuse new entries this bar
+            if portfolio.dd_pct >= cfg.dd_size_cut_pct:
                 qty_mult = 0.5
 
         # --- realistic limit-buy fill ---
@@ -650,7 +711,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
         active.exit_price = round(float(last["close"]) * (1 - eod_slip), 2)
         active.exit_date = str(df.index[-1].date())
         active.exit_reason = "EOD"
-        _close(active, sym)
+        _close(active, sym, df.index[-1])
 
     metrics = compute_metrics(closed_trades, cfg)
     log.info("[time-step] done — %d trades, final DD=%.2f%%, equity=$%.2f",
@@ -814,6 +875,119 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
         # worker thread will die when the process exits.
         executor_holder["ex"].shutdown(wait=False)
         c.close()
+
+    # ── 2026-05-28: join VIX history into each intraday df so the ML model's
+    # macro features (vix_level, vix_change_5) read real values during backtest.
+    # MooMoo's API doesn't serve VIX kline; we use yfinance for the daily series
+    # and forward-fill (with a 1-day shift to avoid look-ahead).
+    #
+    # Bug fix 2026-05-29: buffer was `cfg.days + 60` calendar days, but the
+    # OHLCV pull is `cfg.days * 7 + 80` HOUR_1 bars ≈ `cfg.days * 1.6` calendar
+    # days back (more than 360 days for HOUR_1 timeframe). Insufficient VIX
+    # buffer caused the early backtest bars to fall back to VIX=15.0 (neutral),
+    # making the ML gate veto most signals and starving the 360-day run to
+    # just 19 trades total. Padding generously: 3× cfg.days handles
+    # HOUR_1 + reasonable warm-up.
+    try:
+        import yfinance as yf
+        from datetime import date as _date, timedelta as _td
+        end_d = _date.today()
+        start_d = end_d - _td(days=cfg.days * 3 + 60)
+        vix_raw = yf.download("^VIX", start=start_d, end=end_d, interval="1d",
+                              progress=False, auto_adjust=True)
+        if not vix_raw.empty:
+            if isinstance(vix_raw.columns, pd.MultiIndex):
+                vix_raw.columns = [c[0] for c in vix_raw.columns]
+            vix_daily = pd.DataFrame(
+                {"vix": vix_raw["Close"].astype(float)}, index=vix_raw.index)
+            # Shift forward 1 day → bar reads yesterday's VIX close.
+            vix_daily.index = pd.to_datetime(vix_daily.index).tz_localize(None).normalize() \
+                              + pd.Timedelta(days=1)
+            for sym, bundle in per_ticker.items():
+                df = bundle["intraday"]
+                df_dates = pd.to_datetime(df.index).tz_localize(None).normalize()
+                df["vix"] = vix_daily.reindex(df_dates, method="ffill")["vix"].values
+                df["vix"] = df["vix"].ffill().fillna(15.0)
+            log.info("[prefetch] joined VIX history onto %d tickers", len(per_ticker))
+        else:
+            log.warning("[prefetch] VIX history empty — using neutral 15.0")
+            for bundle in per_ticker.values():
+                bundle["intraday"]["vix"] = 15.0
+    except Exception as e:
+        log.warning("[prefetch] VIX join failed: %s — using neutral 15.0", e)
+        for bundle in per_ticker.values():
+            bundle["intraday"]["vix"] = 15.0
+
+    # ── 2026-05-29: join SEC EDGAR insider history (rolling 30-day net log $).
+    # Powers the `insider_30d_net_log` feature. Cached to data/sec_edgar/ so
+    # subsequent backtests don't re-fetch.
+    try:
+        from .sec_edgar import insider_rolling_30d_net
+        for sym, bundle in per_ticker.items():
+            try:
+                ins_df = insider_rolling_30d_net(sym, days=max(cfg.days + 60, 730))
+            except Exception as e:
+                log.debug("[prefetch] insider %s failed: %s", sym, e)
+                bundle["intraday"]["insider_30d_net_log"] = 0.0
+                continue
+            if ins_df.empty:
+                bundle["intraday"]["insider_30d_net_log"] = 0.0
+                continue
+            # Shift +1 day so bar reads yesterday's rolling net (no look-ahead).
+            ins_shifted = ins_df.copy()
+            ins_shifted.index = ins_shifted.index + pd.Timedelta(days=1)
+            df = bundle["intraday"]
+            bar_dates = pd.to_datetime(df.index).tz_localize(None).normalize()
+            df["insider_30d_net_log"] = (
+                ins_shifted["insider_30d_net_log"]
+                .reindex(bar_dates, method="ffill")
+                .ffill().fillna(0.0)
+                .values
+            )
+        log.info("[prefetch] joined SEC EDGAR insider history")
+    except Exception as e:
+        log.warning("[prefetch] insider join failed: %s — feature defaults to 0", e)
+        for bundle in per_ticker.values():
+            bundle["intraday"]["insider_30d_net_log"] = 0.0
+
+    # ── 2026-05-28 v2: join sector-ETF close per ticker for `rs_vs_sector_5d`.
+    # Fetches each unique sector ETF once (same MooMoo path), then re-indexes
+    # onto each ticker's bar index. Missing data → 'sector_close' = NaN; the
+    # feature falls back to 0 in compute_features, so backtest survives.
+    try:
+        from .sector import SECTOR_TO_ETF, get_sector
+        c2 = MoomooClient()
+        unique_etfs = sorted({
+            SECTOR_TO_ETF[s] for s in (get_sector(t) for t in per_ticker.keys())
+            if s in SECTOR_TO_ETF
+        })
+        sector_etf_data: dict[str, pd.DataFrame] = {}
+        try:
+            for etf in unique_etfs:
+                try:
+                    sector_etf_data[etf] = c2.get_kline(etf, bars=total_bars, ktype=kltype)
+                except Exception as e:
+                    log.warning("[prefetch] sector ETF %s failed: %s", etf, e)
+        finally:
+            c2.close()
+        for sym, bundle in per_ticker.items():
+            etf = SECTOR_TO_ETF.get(get_sector(sym))
+            df = bundle["intraday"]
+            if etf and etf in sector_etf_data:
+                df["sector_close"] = (
+                    sector_etf_data[etf]["close"]
+                    .reindex(df.index, method="ffill")
+                    .ffill().bfill()
+                    .values
+                )
+            else:
+                df["sector_close"] = float("nan")
+        log.info("[prefetch] joined %d sector ETFs onto ticker bars",
+                 len(sector_etf_data))
+    except Exception as e:
+        log.warning("[prefetch] sector-ETF join failed: %s — feature defaults to 0", e)
+        for bundle in per_ticker.values():
+            bundle["intraday"]["sector_close"] = float("nan")
 
     log.info("[prefetch] complete: %d tickers cached", len(per_ticker))
     return {"tf": tf, "kltype": kltype, "spy_daily": spy_daily, "per_ticker": per_ticker}
@@ -985,6 +1159,12 @@ def main() -> None:
         tp_atr_mult=settings.tp_atr_mult,
         sl_atr_mult=settings.sl_atr_mult,
         max_gap_pct=settings.max_gap_pct,
+        # Bug fix 2026-05-29: pull DD circuit knobs from .env too. Without this
+        # the backtest hardcoded dd_halt_pct=15 even when .env said 18, causing
+        # a permanent halt early in the 360-day backtest as a temporary 16% DD
+        # locked all future entries.
+        dd_size_cut_pct=settings.dd_size_cut_pct,
+        dd_halt_pct=settings.dd_halt_pct,
     )
 
     print(f"\nRunning backtest: {cfg.timeframe}, {cfg.days} days, threshold={cfg.threshold}")

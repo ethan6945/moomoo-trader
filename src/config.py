@@ -27,7 +27,7 @@ class Settings:
     gemini_keys: tuple = tuple(
         k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()
     )
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     tavily_key: str = os.getenv("TAVILY_API_KEY", "")
 
@@ -47,6 +47,15 @@ class Settings:
     max_positions: int = _int("MAX_POSITIONS", 5)
     max_position_pct: float = _float("MAX_POSITION_PCT", 0.20)
     daily_drawdown_stop: float = _float("DAILY_DRAWDOWN_STOP", 0.03)
+
+    # Concentration mode — open fewer new names per scan, pyramid into winners.
+    # Per-scan cap on brand-new tickers (does NOT limit add-ons to existing names).
+    max_new_names_per_scan: int = _int("MAX_NEW_NAMES_PER_SCAN", 2)
+    # How many entries (incl. initial) one symbol may stack. 1 = stacking off.
+    max_stacks_per_symbol: int = _int("MAX_STACKS_PER_SYMBOL", 5)
+    # Add-on gate: existing position must be at least this many R in profit
+    # before a new stack entry is allowed. Prevents averaging-down on losers.
+    stack_min_r_multiple: float = _float("STACK_MIN_R_MULTIPLE", 0.5)
 
     entry_threshold: float = _float("ENTRY_SCORE_THRESHOLD", 70)
     scan_interval_min: int = _int("SCAN_INTERVAL_MIN", 15)
@@ -70,7 +79,33 @@ class Settings:
     ml_enabled: bool = os.getenv("ML_ENABLED", "true").lower() in ("1", "true", "yes")
     ml_blend_weight: float = _float("ML_BLEND_WEIGHT", 0.30)   # 0=ignore ML, 1=ML-only
 
+    # 2026-05-29 combo-sweep finding: mean-revert strategy was net-negative in
+    # current bull-skewed watchlist (cost ~$4/day vs trend+momentum only).
+    # Disable by default. Set MR_ENABLED=true to re-enable for sideways regimes.
+    mr_enabled: bool = os.getenv("MR_ENABLED", "false").lower() in ("1", "true", "yes")
+
     root: Path = ROOT
 
 
 settings = Settings()
+
+# Free-tier model cascade: strongest → lightest.
+# GEMINI_MODEL is tried first; on 429 the cascade continues downward.
+# User can override the starting model via GEMINI_MODEL env var
+# (e.g. "gemini-2.5-pro" if they want the strongest available).
+GEMINI_FREE_CASCADE = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+
+def gemini_cascade() -> list[str]:
+    """Full cascade starting from the configured model, deduped."""
+    primary = settings.gemini_model or "gemini-2.5-flash"
+    seen: set[str] = set()
+    result = []
+    for m in [primary] + GEMINI_FREE_CASCADE:
+        if m not in seen:
+            seen.add(m)
+            result.append(m)
+    return result

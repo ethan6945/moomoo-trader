@@ -31,6 +31,12 @@ log = logging.getLogger(__name__)
 TRADE_PHASE_START_MIN = 9 * 60 + 45    # 09:45 ET
 TRADE_PHASE_END_MIN = 15 * 60 + 30     # 15:30 ET
 
+# Friday no-new-entries cutoff — weekend gap risk on swing positions.
+# After this time on Friday we still MANAGE open positions (stops + tps still
+# fire) but refuse to open new names. Existing positions can still close out
+# normally. 2026-05-28: added per audit recommendation.
+FRIDAY_CUTOFF_MIN = 14 * 60      # 14:00 ET
+
 
 @dataclass(frozen=True)
 class KillSwitchVerdict:
@@ -61,6 +67,18 @@ def evaluate(regime_block_new: bool, regime_label: str, regime_note: str,
             reason=f"outside trade phase ({now:%H:%M} ET, allowed 09:45-15:30)",
             gate="trade_phase",
         )
+
+    # Friday no-new-entries cutoff — avoid weekend gap risk on a 7-day max-hold
+    # swing. Existing positions still managed by manage_open_trades; we only
+    # block NEW entries here.
+    if now.weekday() == 4:   # 4 = Friday
+        minutes = now.hour * 60 + now.minute
+        if minutes >= FRIDAY_CUTOFF_MIN:
+            return KillSwitchVerdict(
+                can_trade=False,
+                reason=f"Friday after {FRIDAY_CUTOFF_MIN // 60:02d}:00 ET — no new entries (weekend gap protection)",
+                gate="friday_cutoff",
+            )
 
     if regime_block_new:
         return KillSwitchVerdict(

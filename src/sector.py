@@ -35,6 +35,13 @@ SECTOR_MAP: dict[str, str] = {
     "WDC":  "semis",                 # Western Digital — HDD/SSD storage
     "STX":  "semis",                 # Seagate — storage
     "SMCI": "semis",                 # Super Micro — AI servers tied to chip demand
+    "LRCX": "semis",                 # Lam Research — semi equipment (added 2026-05-29)
+    "MCHP": "semis",                 # Microchip Technology (added 2026-05-29)
+    "AMAT": "semis",                 # Applied Materials — semi equipment
+    "KLAC": "semis",                 # KLA Corporation — semi equipment
+    "MRVL": "semis",                 # Marvell — chip design
+    "NXPI": "semis",                 # NXP Semiconductors
+    "ADI":  "semis",                 # Analog Devices
 
     # ─── Healthcare / biotech ───
     "MRNA": "healthcare",            # Moderna
@@ -77,11 +84,34 @@ SECTOR_MAP: dict[str, str] = {
 }
 
 # At most this many positions in the same sector bucket at once.
-# With MAX_POSITIONS=10 + MAX_POSITION_PCT=10%, cap of 4 lets a strong
-# sector run up to 40% while still requiring at least 3 different sectors
-# for a fully-deployed account. Watchlist skews tech/semis (~80%), so
-# capping at 2 left too many good signals on the table.
-MAX_PER_SECTOR = 4
+# 2026-05-28: bumped to 5 (was 4) because MAX_POSITIONS dropped to 5 and our
+# top winners are semis-heavy (SNDK, MU, INTC, LRCX, AMD, SWKS, SNDK, WDC).
+# A cap of 4 blocked the 5th semis pick even when we wanted to be fully loaded.
+MAX_PER_SECTOR = 5
+
+
+# Sector → tracking-ETF map. Used by:
+#   • signal_reporter for "vs sector strength" context line
+#   • ml.features for the rs_vs_sector_5d feature
+# Sectors without a clean single-ETF proxy fall back to a near-cousin
+# (auto/mobility → XLY consumer discretionary).
+SECTOR_TO_ETF: dict[str, str] = {
+    "tech":        "XLK",
+    "semis":       "SMH",
+    "consumer":    "XLY",
+    "finance":     "XLF",
+    "healthcare":  "XLV",
+    "energy":      "XLE",
+    "industrial":  "XLI",
+    "auto":        "XLY",   # auto is index-level consumer discretionary
+    "mobility":    "XLY",   # Uber/ABNB land here too
+}
+
+
+def get_sector_etf(symbol: str) -> str | None:
+    """Return the sector-tracking ETF for `symbol`, or None if unknown."""
+    sector = get_sector(symbol)
+    return SECTOR_TO_ETF.get(sector)
 
 
 def get_sector(symbol: str) -> str:

@@ -1,4 +1,6 @@
 {
-  "_comment": "Signal reporter watchlist — managed via: python -m src.main signal add TICKER / remove TICKER / list",
-  "tickers": ["MU", "SNDK", "NVDA", "AMD", "TSLA", "META"]
+  "tickers": [
+    "MU",
+    "SNDK"
+  ]
 }

@@ -73,6 +73,18 @@ def reconcile(broker_positions: pd.DataFrame) -> dict:
     #   • both orphan AND ghost simultaneously = our records are out of sync in both directions
     #   • a single orphan or single ghost = warn but allow trading (low risk: just record drift)
     severe = bool(mismatches) or (bool(orphans) and bool(ghosts))
+    # 2026-05-28: 2-strike halt rule — paper trading routinely shows transient
+    # mismatches when MooMoo's broker side hasn't caught up to a just-placed
+    # order. Halting on a single observation produced false stops in paper.
+    # Now we increment a streak counter; halt only fires after 2 consecutive
+    # severe reconciles. A clean reconcile resets the counter.
+    severe_streak = int(db.get_state().get("reconcile_severe_streak", 0) or 0)
+    if severe:
+        severe_streak += 1
+    else:
+        severe_streak = 0
+    db.update_state({"reconcile_severe_streak": severe_streak})
+    halt_now = severe and severe_streak >= 2
 
     result = {
         "ts": datetime.now(NY).isoformat(),
@@ -88,14 +100,19 @@ def reconcile(broker_positions: pd.DataFrame) -> dict:
         ),
     }
 
-    # Auto-halt on severe drift — better to skip a few good trades than to
-    # double-down on broken state.
-    if severe:
+    # Auto-halt on severe drift — but only after 2 consecutive observations,
+    # so a one-off paper-trading hiccup doesn't shut down trading.
+    if halt_now:
         try:
             db.atomic_state(lambda s: {"halted": True})
-            log.warning("Severe reconcile drift → halted=True (resolve via GUI then click 'Halted' to reset)")
+            log.warning("Severe reconcile drift (streak=%d) → halted=True "
+                        "(resolve via GUI then click 'Halted' to reset)",
+                        severe_streak)
         except Exception as e:
             log.error("auto-halt on reconcile failed: %s", e)
+    elif severe:
+        log.warning("Reconcile severe (streak=%d) — watching but not halted yet",
+                    severe_streak)
 
     RECONCILE_FILE.parent.mkdir(parents=True, exist_ok=True)
     RECONCILE_FILE.write_text(json.dumps(result, indent=2))

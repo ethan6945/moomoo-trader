@@ -640,7 +640,6 @@ class App(tk.Tk):
         self.btn_signal     = self._nav_btn(sb, "📡 Signal Reporter",         self.open_signal_reporter)
 
         ttk.Frame(sb, style="Divider.TFrame", height=1).pack(fill="x", pady=(6, 0))
-        self.btn_help       = self._nav_btn(sb, "📚 Help",                   self.open_help)
 
     def _build_content(self, parent) -> None:
         px, py = 12, 5

@@ -34,7 +34,7 @@ from typing import Optional
 import optuna
 
 from .backtest import BacktestConfig, prefetch_data, simulate_with_cache
-from .config import settings
+from .config import settings  # noqa: F401 (re-exported)
 
 # Suppress Optuna's experimental warnings — TPE is fine.
 warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
@@ -102,12 +102,15 @@ def _evaluate_params(
 
 def _make_objective(base_cfg: BacktestConfig, n_folds: int, min_trades: int, cache: dict):
     def objective(trial: optuna.Trial) -> float:
+        # 2026-05-28: widened ranges to span the new W3 aggressive regime.
+        # Old bounds (tp 1-3 / sl 1.5-3.5) couldn't reach the actual optimum
+        # of tp=6.0 / sl=3.25 — Optuna was searching the wrong neighbourhood.
         params = {
-            "threshold":       trial.suggest_int("threshold", 60, 80, step=2),
-            "tp_atr_mult":     trial.suggest_float("tp_atr_mult", 1.0, 3.0, step=0.25),
-            "sl_atr_mult":     trial.suggest_float("sl_atr_mult", 1.5, 3.5, step=0.25),
+            "threshold":       trial.suggest_int("threshold", 55, 72, step=1),
+            "tp_atr_mult":     trial.suggest_float("tp_atr_mult", 3.5, 8.0, step=0.5),
+            "sl_atr_mult":     trial.suggest_float("sl_atr_mult", 2.5, 4.0, step=0.25),
             "max_gap_pct":     trial.suggest_float("max_gap_pct", 2.0, 5.0, step=0.5),
-            "base_slip_bp":    trial.suggest_float("base_slip_bp", 1.0, 5.0, step=0.5),
+            "base_slip_bp":    trial.suggest_float("base_slip_bp", 1.0, 3.0, step=0.5),
         }
         try:
             stats = _evaluate_params(base_cfg, params, n_folds, cache)

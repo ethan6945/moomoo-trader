@@ -87,7 +87,7 @@ def train_model(
 ) -> tuple[xgb.XGBClassifier, dict]:
     """Train XGBoost, return (model, metrics). Saves nothing — caller persists."""
     label_cfg = label_cfg or LabelConfig()
-    X, y, syms = build_dataset(klines, label_cfg)
+    X, y, syms, _ts = build_dataset(klines, label_cfg)
     log.info("dataset size: %d rows, positive rate %.1f%%", len(X), y.mean() * 100 if len(y) else 0)
 
     if len(X) < 500:

@@ -27,7 +27,12 @@ OPEN_TRADES_FILE = settings.root / "data" / "open_trades.json"
 TRADE_LOG_FILE = settings.root / "data" / "trades.jsonl"   # legacy mirror
 NY = pytz.timezone("America/New_York")
 
-PORTFOLIO_HEAT_PCT = 0.08   # 8% account cap on total open risk
+# Was 0.08 when RISK_PER_TRADE=2% — that capped total open risk at $360, which
+# blocked the 2nd or 3rd position the moment we moved to 5% risk × 5 positions
+# (theoretical max 25% heat). Raised to 0.20 so up to 4 simultaneous full-risk
+# positions can coexist. The DD_HALT_PCT in .env (18%) is the real circuit
+# breaker — heat cap is a softer "don't go silly" guard.
+PORTFOLIO_HEAT_PCT = 0.20   # was 0.08 — scales with new 5% RISK_PER_TRADE
 
 
 def current_open_risk() -> float:

@@ -369,7 +369,21 @@ def get_open_trade(symbol: str) -> dict | None:
     return _row_to_trade_dict(r) if r else None
 
 
+_OPEN_TRADE_COLUMNS = {
+    "symbol", "qty", "entry_price", "stop_loss", "take_profit", "atr",
+    "half_closed", "buy_order_id", "stop_order_id", "tp_order_id",
+    "opened_at", "high_water", "low_water", "ml_proba_entry", "strategy",
+    "extra",
+}
+
+
 def upsert_open_trade(trade: dict) -> None:
+    # Auto-collect any non-column keys (e.g. `stacks`, `last_stack_at`)
+    # into the `extra` JSON blob so forward-compat fields survive round-trips.
+    extra = dict(trade.get("extra") or {}) if isinstance(trade.get("extra"), dict) else {}
+    for k, v in trade.items():
+        if k not in _OPEN_TRADE_COLUMNS:
+            extra[k] = v
     with transaction() as c:
         c.execute("""
             INSERT INTO open_trades
@@ -403,7 +417,7 @@ def upsert_open_trade(trade: dict) -> None:
             trade.get("low_water"),
             trade.get("ml_proba_entry"),
             trade.get("strategy") or "trend",
-            json.dumps(trade.get("extra")) if trade.get("extra") else None,
+            json.dumps(extra, default=str) if extra else None,
         ))
 
 
@@ -431,6 +445,16 @@ def _row_to_trade_dict(r: sqlite3.Row) -> dict:
     for k in ("high_water", "low_water", "ml_proba_entry", "strategy"):
         if k in keys:
             out[k] = r[k]
+    # Merge `extra` JSON (used for forward-compat fields like `stacks`,
+    # `entries`, etc.) so the dict matches what callers stored.
+    if "extra" in keys and r["extra"]:
+        try:
+            extra = json.loads(r["extra"])
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    out.setdefault(k, v)
+        except (json.JSONDecodeError, TypeError):
+            pass
     return out
 
 
@@ -589,6 +613,25 @@ def closed_trades(limit: int = 200) -> list[dict]:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def last_sl_close_for_symbol(symbol: str) -> dict | None:
+    """Return the most recent SL-class close (SL or SL_BRACKET) for `symbol`.
+
+    Used by `risk_manager.in_sl_cooldown` to refuse re-entry on a name that
+    just stopped out — the 142-day audit found 29 rebleed losses worth -$425
+    when the bot bought the same ticker the very next bar after a stop.
+    """
+    with conn() as c:
+        row = c.execute(
+            """
+            SELECT * FROM closed_trades
+            WHERE symbol = ? AND exit_reason IN ('SL', 'SL_BRACKET')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 # ---------- history ----------
