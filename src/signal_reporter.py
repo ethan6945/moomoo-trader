@@ -75,19 +75,64 @@ def _vix_label(vix: float) -> str:
     return "🟢 benign"
 
 
-def _snap_chg(c, sym: str) -> dict | None:
-    """Return a snapshot dict {last, prev, chg_pct} for `sym` or None."""
+def _is_premarket_now() -> bool:
+    """True when current NY time is in 04:00-09:30 ET (US pre-market window).
+
+    Why this matters: MooMoo's snapshot `last_price` does NOT refresh during
+    pre-market for most subscription tiers — it still holds yesterday's regular
+    session close until 9:30 ET. If we display `last_price` as "current price"
+    at 08:30 ET, the card shows yesterday's close + yesterday's daily change,
+    which doesn't match what the user observes in actual pre-market trading.
+    Solution: in this window, prefer `pre_price` / compute chg vs prev_close.
+    """
+    import pytz
+    from datetime import datetime
+    now = datetime.now(pytz.timezone("America/New_York"))
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return 4 * 60 <= minutes < 9 * 60 + 30
+
+
+def _live_snap(c, sym: str) -> dict | None:
+    """Return {price, prev, chg_pct, src} where src ∈ {'pre','last'}.
+
+    In pre-market hours: use snapshot.pre_price (today's last pre-market trade)
+    and compute chg vs prev_close_price. Otherwise: use snapshot.last_price.
+    Returns None when prev_close is missing or chosen price is unusable.
+    """
     try:
         snap = c.get_snapshot(sym)
-        last = float(snap.get("last_price") or 0)
         prev = float(snap.get("prev_close_price") or 0)
-        if last <= 0 or prev <= 0:
+        if prev <= 0:
             return None
-        return {"last": last, "prev": prev,
-                "chg_pct": round((last / prev - 1) * 100, 2)}
+        if _is_premarket_now():
+            pre = float(snap.get("pre_price") or 0)
+            if pre > 0:
+                return {"price": pre, "prev": prev,
+                        "chg_pct": round((pre / prev - 1) * 100, 2),
+                        "src": "pre"}
+        last = float(snap.get("last_price") or 0)
+        if last <= 0:
+            return None
+        return {"price": last, "prev": prev,
+                "chg_pct": round((last / prev - 1) * 100, 2),
+                "src": "last"}
     except Exception as e:
         log.debug("snapshot %s failed: %s", sym, e)
         return None
+
+
+def _snap_chg(c, sym: str) -> dict | None:
+    """Return a snapshot dict {last, prev, chg_pct} for `sym` or None.
+
+    `last` is the *user-visible* price — pre_price during pre-market window,
+    last_price otherwise. Key name kept as 'last' for legacy callers.
+    """
+    s = _live_snap(c, sym)
+    if s is None:
+        return None
+    return {"last": s["price"], "prev": s["prev"], "chg_pct": s["chg_pct"]}
 
 
 def _sector_snap(c, ticker: str) -> dict | None:
@@ -637,6 +682,11 @@ def _build_premarket_card(tech: dict, ai: dict,
     conf_e = CONF_EMOJI.get(ai.get("confidence", "中"), "✋")
     chg1   = tech.get("chg1") or 0.0
     arrow  = "📈" if chg1 >= 0 else "📉"
+    # Tag the price source so the user knows whether this is regular-session
+    # last or today's pre-market last. Critical at 08:30 ET where MooMoo's
+    # last_price is stale and we fall back to pre_price.
+    src    = tech.get("price_src", "last")
+    src_tag = " 🕓盘前" if src == "pre" else ""
     finbert_line = _finbert_line(sentiment)
     # Context block is optional — empty string when nothing was fetchable.
     context_section = f"\n{context_block}\n" if context_block else ""
@@ -644,7 +694,7 @@ def _build_premarket_card(tech: dict, ai: dict,
     return (
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"*{tech['ticker']}* {tech['company']} | "
-        f"${tech['price']} {arrow} {chg1:+.2f}%\n"
+        f"${tech['price']} {arrow} {chg1:+.2f}%{src_tag}\n"
         f"\n"
         f"{act_e} *{ai.get('action', '?')}*  {_score_bar(score)}\n"
         f"   {ai.get('reason', '')}\n"
@@ -751,23 +801,25 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
     # Use real-time snapshot for current price and daily change.
     # request_history_kline only returns completed bars, so close.iloc[-1] may be
     # 5–15 min stale during trading hours. Snapshot gives the live last price.
+    # _live_snap auto-swaps to pre_price during 04:00-09:30 ET — MooMoo's
+    # last_price field is stuck on yesterday's close in that window, which
+    # used to make the premarket card show yesterday's price + yesterday's chg.
     price = round(float(close.iloc[-1]), 2)  # fallback
     chg1  = 0.0
-    try:
-        snap  = c.get_snapshot(sym)
-        last  = float(snap.get("last_price") or 0)
-        prev  = float(snap.get("prev_close_price") or 0)
-        if last > 0:
-            price = round(last, 2)
-        if last > 0 and prev > 0:
-            chg1 = round((last / prev - 1) * 100, 2)
-    except Exception as snap_err:
-        log.debug("signal_reporter: snapshot fallback for %s: %s", sym, snap_err)
-        # chg1 fallback using daily kline
-        if df_d is not None and len(df_d) >= 2:
-            prev_close = float(df_d["close"].iloc[-1])
-            if prev_close > 0:
-                chg1 = round((price / prev_close - 1) * 100, 2)
+    price_src = "kline"
+    snap_info = _live_snap(c, sym)
+    if snap_info is not None:
+        price = round(snap_info["price"], 2)
+        chg1 = snap_info["chg_pct"]
+        price_src = snap_info["src"]
+        if price_src == "pre":
+            log.info("signal_reporter: %s using pre-market price $%.2f (%+.2f%%)",
+                     sym, price, chg1)
+    elif df_d is not None and len(df_d) >= 2:
+        # snapshot unavailable → fallback to daily kline for chg
+        prev_close = float(df_d["close"].iloc[-1])
+        if prev_close > 0:
+            chg1 = round((price / prev_close - 1) * 100, 2)
 
     chg5 = round((price / float(df_d["close"].iloc[-6]) - 1) * 100, 2) \
            if (df_d is not None and len(df_d) >= 6) else 0.0
@@ -791,6 +843,7 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
         "ticker":     sym,
         "company":    COMPANY_NAMES.get(sym, sym),
         "price":      price,
+        "price_src":  price_src,   # 'pre' | 'last' | 'kline' — surfaced in card header
         "chg1":       chg1,
         "chg5":       chg5,
         "rsi":        rsi_v,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -172,6 +173,10 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
             "stop_loss": new_stop,
             "take_profit": new_tp,
             "atr": signal.atr,
+            # Re-anchor scale-out to the new combined lot (stacks only happen in
+            # profit, so resetting the R unit off the new avg entry/stop is sane).
+            "qty_initial": new_total_qty,
+            "init_risk_per_share": max(new_avg_entry - new_stop, 0.0),
             "buy_order_id": buy_order_id,
             "stop_order_id": stop_order_id,
             "tp_order_id": tp_order_id,
@@ -206,6 +211,13 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
             "take_profit": signal.take_profit,
             "atr": signal.atr,
             "half_closed": False,
+            # Scale-out state (used only when USE_SCALE_OUT=true). qty_initial
+            # anchors the 1/3 tranche size to the ORIGINAL lot; init_risk_per_share
+            # is the R unit (entry − initial stop) for the +TP1_R / +TP2_R levels.
+            "qty_initial": qty,
+            "init_risk_per_share": max(float(signal.price) - float(signal.stop_loss), 0.0),
+            "tp1_done": False,
+            "tp2_done": False,
             "buy_order_id": buy_order_id,
             "stop_order_id": stop_order_id,
             "tp_order_id": tp_order_id,
@@ -328,114 +340,335 @@ def _check_bracket_fills(client: MoomooClient, symbol: str, trade: dict) -> dict
     return None
 
 
+def _last_price(client: MoomooClient, symbol: str) -> float | None:
+    """Fetch a *validated* last price, or None if the symbol looks halted/anomalous.
+
+    A halted, suspended, or limit-up/down stock can return last_price of 0, None,
+    NaN, negative, or a non-numeric string from the broker snapshot. Feeding any
+    of those into a SELL would place the order at ~$0 — a phantom total-loss fill —
+    or crash the manage loop. Returning None tells every caller to SKIP the symbol
+    this cycle and re-check next scan, instead of acting on a bad price.
+    """
+    try:
+        snap = client.get_snapshot(symbol)
+        last = float(snap["last_price"])
+    except Exception as e:
+        log.warning("snapshot unreadable for %s: %s — skipping this cycle", symbol, e)
+        return None
+    if not math.isfinite(last) or last <= 0:
+        log.warning("%s last_price=%r looks halted/anomalous — skipping this cycle",
+                    symbol, last)
+        return None
+    return last
+
+
+def _is_stalled(trade: dict, last_price: float, atr_ref: float) -> bool:
+    """A position is 'stalled' when after STALL_MIN_DAYS business days:
+      • Its high-water-mark is below entry + 0.5×ATR (never made meaningful progress)
+      • Its current price isn't deeply negative (just sideways, not yet SL'd)
+
+    Stall-out frees capital that would otherwise burn the rest of MAX_HOLD_DAYS
+    going nowhere. Set STALL_MIN_DAYS=3 — gives one weekend + a couple of
+    sessions for a thesis to play out before pulling the plug.
+    """
+    STALL_MIN_DAYS = 3
+    STALL_HW_THRESHOLD_R = 0.3   # high-water < entry + 0.3×ATR = "barely moved"
+    try:
+        opened = datetime.fromisoformat(trade["opened_at"])
+        age = _business_days_between(opened, datetime.utcnow())
+    except (KeyError, ValueError):
+        return False
+    if age < STALL_MIN_DAYS:
+        return False
+    entry = float(trade["entry_price"])
+    hw = float(trade.get("high_water") or entry)
+    progress_atr = (hw - entry) / atr_ref if atr_ref > 0 else 0
+    if progress_atr >= STALL_HW_THRESHOLD_R:
+        return False  # made enough progress; let MAX_HOLD or TP decide
+    return True
+
+
+def _force_close(client: MoomooClient, symbol: str, trade: dict,
+                 last: float, reason: str) -> tuple[float, dict]:
+    """Cancel any bracket legs and market-sell the position. Returns (pnl, action)."""
+    for key in ("stop_order_id", "tp_order_id"):
+        oid = trade.get(key)
+        if oid:
+            try:
+                client.cancel_order(oid)
+            except Exception as e:
+                log.warning("cancel %s %s failed: %s", symbol, key, e)
+    try:
+        client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+    except Exception as e:
+        log.warning("force-sell %s failed: %s", symbol, e)
+    pnl = _close_and_log(symbol, trade, trade["qty"], last, reason)
+    return pnl, {"type": reason.lower(), "symbol": symbol, "price": last,
+                 "qty": trade["qty"], "pnl": pnl}
+
+
+def _manage_one(client: MoomooClient, symbol: str, trade: dict,
+                trades: dict, actions: list[dict]) -> None:
+    """Manage ONE open position for a single scan cycle.
+
+    Mutates `trades` (pops on close) and `actions` (appends every action) in
+    place. Factored out of manage_open_trades so the caller can wrap each symbol
+    in try/except — that way one halted/anomalous name can never abort the
+    management of the others (each `continue` here is just a `return`)."""
+    has_bracket = bool(trade.get("stop_order_id") and trade.get("tp_order_id"))
+
+    # --- REAL bracket path: OCO check + stall-out + max-hold (broker owns SL/TP) ---
+    if has_bracket:
+        bracket_action = _check_bracket_fills(client, symbol, trade)
+        if bracket_action is not None:
+            actions.append(bracket_action)
+            trades.pop(symbol)
+            return
+        # Bracket still alive. The bot owns two housekeeping exits on top of it:
+        # stall-out (free idle capital) and the max-hold timeout.
+        try:
+            opened = datetime.fromisoformat(trade["opened_at"])
+            age_days = _business_days_between(opened, datetime.utcnow())
+        except (KeyError, ValueError):
+            age_days = 0
+
+        last = _last_price(client, symbol)
+        if last is None:
+            return   # halted — leave the bracket protecting it, retry next scan
+        # Sample the high-water mark so the stall heuristic is meaningful for
+        # bracket positions too (broker tracks fills, not our HW mark).
+        trade["high_water"] = max(float(trade.get("high_water") or trade["entry_price"]), last)
+
+        # Stall-out (2026-05-30): a bracket position that has gone nowhere for
+        # STALL_MIN_DAYS gets culled — cancel the bracket legs then force-close —
+        # so the slot/capital can chase a fresh signal instead of idling until
+        # the 7-day max-hold guillotine.
+        atr_ref = float(trade.get("atr") or 0) or max(
+            (float(trade["entry_price"]) - float(trade["stop_loss"])) / 3.5, 0.01
+        )
+        if _is_stalled(trade, last, atr_ref):
+            pnl, action = _force_close(client, symbol, trade, last, "STALL_OUT")
+            actions.append(action)
+            trades.pop(symbol)
+            log.info("Stall-out close (bracket): %s @ $%.2f (pnl=%.2f)", symbol, last, pnl)
+            return
+
+        if age_days >= _settings.max_hold_days:
+            # Pull bracket legs first, then market-sell remaining qty.
+            for oid in (trade["stop_order_id"], trade["tp_order_id"]):
+                if oid:
+                    client.cancel_order(oid)
+            client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+            pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
+            actions.append({"type": "max_hold_bracket", "symbol": symbol,
+                            "price": last, "qty": trade["qty"],
+                            "age_days": age_days, "pnl": pnl})
+            trades.pop(symbol)
+        return   # bracket path done — don't fall through to soft logic
+
+    # --- SIMULATE / REAL-fallback (no bracket): soft-track via snapshot polling ---
+    last = _last_price(client, symbol)
+    if last is None:
+        return   # halted/anomalous — don't soft-stop at $0; recheck next scan
+
+    # Update water-marks for MFE/MAE on eventual close.
+    trade["high_water"] = max(float(trade.get("high_water") or trade["entry_price"]), last)
+    trade["low_water"] = min(float(trade.get("low_water") or trade["entry_price"]), last)
+
+    # Soft stop-loss check (SIMULATE, or REAL when bracket attach failed).
+    if last <= trade["stop_loss"]:
+        client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+        pnl = _close_and_log(symbol, trade, trade["qty"], last, "SL")
+        actions.append({"type": "stop_hit", "symbol": symbol, "price": last,
+                        "qty": trade["qty"], "stop": trade["stop_loss"], "pnl": pnl})
+        trades.pop(symbol)
+        return
+
+    # Stall-out: if position has gone nowhere for 3+ business days, close.
+    # Frees capital for fresh signals instead of waiting the full MAX_HOLD.
+    atr_ref = float(trade.get("atr") or 0) or max(
+        (float(trade["entry_price"]) - float(trade["stop_loss"])) / 3.5, 0.01
+    )
+    if _is_stalled(trade, last, atr_ref):
+        pnl, action = _force_close(client, symbol, trade, last, "STALL_OUT")
+        actions.append(action)
+        trades.pop(symbol)
+        log.info("Stall-out close: %s @ $%.2f (pnl=%.2f)", symbol, last, pnl)
+        return
+
+    # Max-hold force close.
+    opened = datetime.fromisoformat(trade["opened_at"])
+    age_days = _business_days_between(opened, datetime.utcnow())
+    if age_days >= _settings.max_hold_days:
+        client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+        pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
+        actions.append({"type": "max_hold", "symbol": symbol, "price": last,
+                        "qty": trade["qty"], "age_days": age_days, "pnl": pnl})
+        trades.pop(symbol)
+        return
+
+    # --- partial profit-taking ---
+    if _settings.use_scale_out:
+        # 3-tranche scale-out (USE_SCALE_OUT). Mirrors backtest_v2 exactly so the
+        # SIMULATE PnL reproduces the cash-on backtest: bank 1/3 of the ORIGINAL
+        # lot at +TP1_R, another 1/3 at +TP2_R (R = entry − initial stop), then let
+        # the final ~1/3 RIDE the single take-profit / SL / max-hold. Deliberately
+        # NO trailing on the runner: the cash-frontier sweep showed trailing the
+        # runner in an uptrend HURTS (so3/6+trail ≈ $38/day vs so3/6 ≈ $55/day) —
+        # the runner does best riding to the wide ATR TP.
+        entry = float(trade["entry_price"])
+        risk = float(trade.get("init_risk_per_share") or 0.0)
+        if risk > 0:
+            qty_init = int(trade.get("qty_initial") or trade["qty"])
+            tranche = max(1, qty_init // 3)
+            # TP1 — first 1/3
+            if not trade.get("tp1_done") and last >= entry + _settings.tp1_r * risk \
+                    and tranche < trade["qty"]:
+                client.place_limit_order(symbol, tranche, last, TrdSide.SELL)
+                pnl = _close_and_log(symbol, trade, tranche, last, "TP1")
+                trade["qty"] -= tranche
+                trade["tp1_done"] = True
+                actions.append({"type": "scale_out", "tranche": 1, "symbol": symbol,
+                                "price": last, "qty": tranche, "pnl": pnl})
+            # TP2 — second 1/3 (may also fire this same tick if price is already
+            # through both levels, matching the backtest's per-bar sequential check)
+            if trade.get("tp1_done") and not trade.get("tp2_done") \
+                    and last >= entry + _settings.tp2_r * risk and tranche < trade["qty"]:
+                client.place_limit_order(symbol, tranche, last, TrdSide.SELL)
+                pnl = _close_and_log(symbol, trade, tranche, last, "TP2")
+                trade["qty"] -= tranche
+                trade["tp2_done"] = True
+                actions.append({"type": "scale_out", "tranche": 2, "symbol": symbol,
+                                "price": last, "qty": tranche, "pnl": pnl})
+        # runner exits WHOLE at the single take-profit (no trail) — same full-TP
+        # close the backtest books for the remaining lot.
+        if last >= trade["take_profit"] and trade["qty"] > 0:
+            client.place_limit_order(symbol, trade["qty"], last, TrdSide.SELL)
+            pnl = _close_and_log(symbol, trade, trade["qty"], last, "TP")
+            actions.append({"type": "tp_full", "symbol": symbol, "price": last,
+                            "qty": trade["qty"], "pnl": pnl})
+            trades.pop(symbol)
+            return
+        return   # scale-out path done — skip the legacy half-close + trail below
+
+    # Take-profit half close (legacy single-tranche default; USE_SCALE_OUT off).
+    if not trade["half_closed"] and last >= trade["take_profit"]:
+        half = trade["qty"] // 2
+        if half > 0:
+            client.place_limit_order(symbol, half, last, TrdSide.SELL)
+            pnl = _close_and_log(symbol, trade, half, last, "TP_HALF")
+            trade["qty"] -= half
+            trade["half_closed"] = True
+            actions.append({"type": "tp_half", "symbol": symbol, "price": last,
+                            "qty": half, "pnl": pnl})
+
+    # Trailing stop after first TP.
+    # Bug fix 2026-05-28: bound the new stop strictly BELOW current price
+    # by 0.5×ATR. Without this the EMA20 can sit right at (or above) `last`,
+    # which causes an immediate stop-out on the very next scan (we just
+    # raised the stop above price). The ATR buffer also avoids stopping out
+    # on routine intra-bar noise.
+    # 2026-05-29: also guard against NaN ema20/atr14 — happens when df has
+    # < 20 bars (new IPO, halt resumption, etc.). Skip silently instead of
+    # crashing the manage loop.
+    if trade["half_closed"]:
+        df = client.get_kline(symbol, bars=30)
+        import pandas_ta_classic as ta
+        ema20 = float(ta.ema(df["close"], length=20).iloc[-1])
+        atr14 = float(ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1])
+        if math.isnan(ema20) or math.isnan(atr14):
+            log.debug("trailing stop: %s has NaN ema/atr — skip this cycle", symbol)
+        else:
+            buffer = 0.5 * atr14 if atr14 > 0 else 0.0
+            ceiling = last - buffer    # never park the stop within 0.5 ATR of price
+            candidate = round(min(ema20, ceiling), 2)
+            new_stop = max(trade["stop_loss"], candidate)
+            if new_stop > trade["stop_loss"]:
+                trade["stop_loss"] = new_stop
+                actions.append({"type": "trail", "symbol": symbol, "new_stop": new_stop})
+
+
 def manage_open_trades(client: MoomooClient) -> list[dict]:
-    """Per-scan housekeeping: stale order cancel → OCO bracket check → soft fallback."""
+    """Per-scan housekeeping: stale order cancel → OCO bracket check → soft fallback.
+
+    2026-05-30 additions to keep capital flowing:
+      • Blacklist auto-close: any open position whose symbol is now on the
+        adaptive blacklist gets force-closed (don't let dead names linger).
+      • Stall-out: positions that go nowhere for STALL_MIN_DAYS are exited so
+        their capital can chase fresh signals.
+      • Over-capacity flush: when total holdings exceed MAX_POSITIONS, close
+        the worst-performing one — happens after a watchlist/.env tightening
+        that left old positions over-allocated.
+    """
     actions: list[dict] = []
     actions.extend(cancel_stale_orders(client))
 
+    # --- Auto-flush 0: positions whose symbol is now blacklisted ---
+    try:
+        from . import blacklist as _bl
+        blacklisted = set(_bl.get_blacklist().keys())
+    except Exception as e:
+        log.debug("blacklist load failed: %s", e)
+        blacklisted = set()
+
     trades = _load_open_trades()
-    for symbol, trade in list(trades.items()):
-        has_bracket = bool(trade.get("stop_order_id") and trade.get("tp_order_id"))
-
-        # --- REAL bracket path: OCO check + max-hold only (broker handles SL/TP) ---
-        if has_bracket:
-            bracket_action = _check_bracket_fills(client, symbol, trade)
-            if bracket_action is not None:
-                actions.append(bracket_action)
-                trades.pop(symbol)
-                continue
-            # Bracket alive — only thing the bot still owns is max-hold timeout.
+    for symbol in list(trades.keys()):
+        if symbol in blacklisted:
+            last = _last_price(client, symbol)
+            if last is None:
+                continue   # halted/anomalous — re-check next scan, don't sell at $0
             try:
-                opened = datetime.fromisoformat(trade["opened_at"])
-                age_days = _business_days_between(opened, datetime.utcnow())
-            except (KeyError, ValueError):
-                age_days = 0
-            if age_days >= _settings.max_hold_days:
-                # Pull bracket legs first, then market-sell remaining qty.
-                for oid in (trade["stop_order_id"], trade["tp_order_id"]):
-                    if oid:
-                        client.cancel_order(oid)
-                try:
-                    last = float(client.get_snapshot(symbol)["last_price"])
-                except Exception as e:
-                    log.warning("max-hold snapshot failed %s: %s", symbol, e)
-                    continue
-                client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
-                pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
-                actions.append({"type": "max_hold_bracket", "symbol": symbol,
-                                "price": last, "qty": trade["qty"],
-                                "age_days": age_days, "pnl": pnl})
+                pnl, action = _force_close(client, symbol, trades[symbol],
+                                           last, "BLACKLIST")
+                actions.append(action)
                 trades.pop(symbol)
-            continue   # bracket path done — don't fall through to soft logic
+                log.warning("Blacklist auto-close: %s @ $%.2f (pnl=%.2f)",
+                            symbol, last, pnl)
+            except Exception as e:
+                log.warning("blacklist auto-close %s failed: %s", symbol, e)
 
-        # --- SIMULATE / REAL-fallback (no bracket): soft-track via snapshot polling ---
+    # --- Auto-flush 1: over-capacity flush ---
+    # If we hold MORE than MAX_POSITIONS (e.g. user just tightened the cap),
+    # close the worst-performing one (most negative unrealized R) to free a slot.
+    if len(trades) > _settings.max_positions:
+        excess = len(trades) - _settings.max_positions
+        per_symbol_r: list[tuple[str, float]] = []
+        for symbol, trade in trades.items():
+            last = _last_price(client, symbol)
+            if last is None:
+                continue   # halted name can't be ranked/flushed this cycle
+            try:
+                entry = float(trade["entry_price"])
+                stop = float(trade["stop_loss"])
+                r_unit = entry - stop
+                r_now = (last - entry) / r_unit if r_unit > 0 else 0
+                per_symbol_r.append((symbol, r_now))
+            except Exception:
+                continue
+        # Close the `excess` worst names.
+        for symbol, r_now in sorted(per_symbol_r, key=lambda x: x[1])[:excess]:
+            last = _last_price(client, symbol)
+            if last is None:
+                continue
+            try:
+                pnl, action = _force_close(client, symbol, trades[symbol],
+                                           last, "OVER_CAP")
+                actions.append(action)
+                trades.pop(symbol)
+                log.warning("Over-cap flush: %s (R=%.2f) @ $%.2f (pnl=%.2f)",
+                            symbol, r_now, last, pnl)
+            except Exception as e:
+                log.warning("over-cap flush %s failed: %s", symbol, e)
+
+    for symbol, trade in list(trades.items()):
         try:
-            snap = client.get_snapshot(symbol)
-            last = float(snap["last_price"])
+            _manage_one(client, symbol, trade, trades, actions)
         except Exception as e:
-            log.warning("snapshot failed for %s: %s", symbol, e)
-            continue
-
-        # Update water-marks for MFE/MAE on eventual close.
-        trade["high_water"] = max(float(trade.get("high_water") or trade["entry_price"]), last)
-        trade["low_water"] = min(float(trade.get("low_water") or trade["entry_price"]), last)
-
-        # Soft stop-loss check (SIMULATE, or REAL when bracket attach failed).
-        if last <= trade["stop_loss"]:
-            client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
-            pnl = _close_and_log(symbol, trade, trade["qty"], last, "SL")
-            actions.append({"type": "stop_hit", "symbol": symbol, "price": last,
-                            "qty": trade["qty"], "stop": trade["stop_loss"], "pnl": pnl})
-            trades.pop(symbol)
-            continue
-
-        # Max-hold force close.
-        opened = datetime.fromisoformat(trade["opened_at"])
-        age_days = _business_days_between(opened, datetime.utcnow())
-        if age_days >= _settings.max_hold_days:
-            client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
-            pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
-            actions.append({"type": "max_hold", "symbol": symbol, "price": last,
-                            "qty": trade["qty"], "age_days": age_days, "pnl": pnl})
-            trades.pop(symbol)
-            continue
-
-        # Take-profit half close.
-        if not trade["half_closed"] and last >= trade["take_profit"]:
-            half = trade["qty"] // 2
-            if half > 0:
-                client.place_limit_order(symbol, half, last, TrdSide.SELL)
-                pnl = _close_and_log(symbol, trade, half, last, "TP_HALF")
-                trade["qty"] -= half
-                trade["half_closed"] = True
-                actions.append({"type": "tp_half", "symbol": symbol, "price": last,
-                                "qty": half, "pnl": pnl})
-
-        # Trailing stop after first TP.
-        # Bug fix 2026-05-28: bound the new stop strictly BELOW current price
-        # by 0.5×ATR. Without this the EMA20 can sit right at (or above) `last`,
-        # which causes an immediate stop-out on the very next scan (we just
-        # raised the stop above price). The ATR buffer also avoids stopping out
-        # on routine intra-bar noise.
-        # 2026-05-29: also guard against NaN ema20/atr14 — happens when df has
-        # < 20 bars (new IPO, halt resumption, etc.). Skip silently instead of
-        # crashing the manage loop.
-        if trade["half_closed"]:
-            import math
-            df = client.get_kline(symbol, bars=30)
-            import pandas_ta_classic as ta
-            ema20 = float(ta.ema(df["close"], length=20).iloc[-1])
-            atr14 = float(ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1])
-            if math.isnan(ema20) or math.isnan(atr14):
-                log.debug("trailing stop: %s has NaN ema/atr — skip this cycle", symbol)
-            else:
-                buffer = 0.5 * atr14 if atr14 > 0 else 0.0
-                ceiling = last - buffer    # never park the stop within 0.5 ATR of price
-                candidate = round(min(ema20, ceiling), 2)
-                new_stop = max(trade["stop_loss"], candidate)
-                if new_stop > trade["stop_loss"]:
-                    trade["stop_loss"] = new_stop
-                    actions.append({"type": "trail", "symbol": symbol, "new_stop": new_stop})
+            # Per-symbol isolation (2026-05-30): one halted/anomalous name must
+            # never abort management of the rest. Log + move on; it gets retried
+            # next scan, and any REAL bracket keeps protecting it meanwhile.
+            log.exception("manage %s failed (skipping this symbol this cycle): %s",
+                          symbol, e)
 
     _save_open_trades(trades)
     return actions
@@ -448,6 +681,14 @@ def manual_close(client: MoomooClient, symbol: str) -> dict:
         raise RuntimeError(f"no tracked position for {symbol}")
     trade = trades[symbol]
 
+    # Validate price BEFORE touching the brackets — if the symbol is halted we
+    # refuse the close and leave any broker stop/TP in place to keep protecting it.
+    last = _last_price(client, symbol)
+    if last is None:
+        raise RuntimeError(f"{symbol} price looks halted/anomalous — refusing to "
+                           f"market-sell at ~$0. Bracket legs left intact; "
+                           f"retry once the symbol resumes trading.")
+
     # Cancel any live bracket legs so we don't oversell.
     for key in ("stop_order_id", "tp_order_id"):
         oid = trade.get(key)
@@ -455,8 +696,6 @@ def manual_close(client: MoomooClient, symbol: str) -> dict:
             ok = client.cancel_order(oid)
             log.info("manual_close: cancel %s leg %s → %s", key, oid, ok)
 
-    snap = client.get_snapshot(symbol)
-    last = float(snap["last_price"])
     client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
     pnl = _close_and_log(symbol, trade, trade["qty"], last, "MANUAL")
     trades.pop(symbol)

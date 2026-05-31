@@ -57,9 +57,27 @@ class Trade:
     score: float = 0.0
     exit_date: str = ""
     exit_price: float = 0.0
-    exit_reason: str = ""   # SL | TP | MAX_HOLD | EOD
+    exit_reason: str = ""   # SL | TP | MAX_HOLD | EOD | TP1 | TP2 | TRAIL
     pnl: float = 0.0
     pnl_pct: float = 0.0
+    # ── Scale-out + breakeven tracking (2026-05-30) ──
+    # qty_initial preserves the original size so R-multiple math stays correct
+    # even after partial closes.
+    qty_initial: int = 0
+    tp1_done: bool = False     # +2R partial close happened
+    tp2_done: bool = False     # +4R partial close happened
+    breakeven_set: bool = False  # stop raised to entry after +1R
+    # ── Chandelier trailing-stop tracking (2026-05-30) ──
+    # atr_at_entry is frozen at fill so trailing + slippage math stays correct
+    # after the stop ratchets up (the old code back-derived ATR from the stop,
+    # which breaks the moment the stop moves). highest_high is the peak since
+    # entry that the Chandelier stop hangs off of.
+    atr_at_entry: float = 0.0
+    highest_high: float = 0.0
+    trail_active: bool = False   # True once price cleared trail_activate_r × R
+    # ── Pyramiding / stacking (2026-05-31) — mirrors live open_position ──
+    # Number of entries merged into this position (1 = original lot, no add-ons).
+    stacks: int = 1
 
 
 @dataclass
@@ -105,10 +123,46 @@ class BacktestConfig:
     apply_max_positions: bool = True
     # Diagnostics — counts get returned in metrics so we know what filtered
     track_skip_reasons: bool = True
+    # ── Scale-out + breakeven exit features (2026-05-30) ──
+    # All default to False to keep old backtests comparable. Flip on per-run
+    # to test if they lift PnL.
+    use_breakeven_stop: bool = False    # raise stop to entry once +1R hit
+    breakeven_trigger_r: float = 1.0    # R-multiple that triggers breakeven
+    use_scale_out: bool = False         # close 1/3 at +2R, 1/3 at +4R, trail
+    tp1_r: float = 2.0                  # first partial close at this R
+    tp2_r: float = 4.0                  # second partial close at this R
+    # ── Chandelier ATR trailing stop (2026-05-30) ──
+    # The MAX_HOLD guillotine was force-closing 30-40% of trades, capping the
+    # fat-tail winners this trend strategy lives on. A Chandelier exit trails
+    # the stop at (highest_high_since_entry − trail_atr_mult × ATR), ratcheting
+    # up only. It lets winners run while still protecting profit — the classic
+    # LeBeau trend-following exit. Pair with a longer max_hold_days so the trail
+    # (not the calendar) decides the exit.
+    use_trailing_stop: bool = False
+    trail_atr_mult: float = 3.0         # stop = peak − N × ATR(entry)
+    trail_activate_r: float = 1.0       # only start trailing past +N × R (room early)
+    # ── Regime-scaled sizing (2026-05-30) ──
+    # Concentrate capital when the trend edge is strongest. In a confirmed
+    # strong bull (SPY > 50MA > 200MA AND VIX < vix_calm), scale qty up; in a
+    # weak/neutral tape, stay at 1.0×. Risk is already vol-normalised by the
+    # ATR stop, so this is pure regime risk-on, not naive leverage.
+    use_regime_scaling: bool = False
+    regime_bull_mult: float = 1.35      # qty × this in confirmed strong bull
+    regime_vix_calm: float = 20.0       # VIX below this = calm enough to lever
     # SL cooldown — block re-entry on a name we just stopped out of.
     # Defaults match the live risk_manager.SL_COOLDOWN_HOURS so backtest ≈ live.
     # Set to 0 to disable (matches pre-fix behaviour).
     sl_cooldown_hours: int = 24
+    # ── Pyramiding / stacking (2026-05-31) ──
+    # Model the LIVE open_position add-on behaviour inside the cash engine: when a
+    # held name re-fires a qualifying buy AND it is already ≥ STACK_MIN_R_MULTIPLE
+    # in unrealised profit AND it has < MAX_STACKS_PER_SYMBOL stacks, merge an
+    # add-on (weighted-avg entry; stop/TP trail UP only). The stack gates
+    # (max_stacks_per_symbol, stack_min_r_multiple) are read from `settings` at
+    # run time — exactly like max_positions — so backtest ≈ live without extra
+    # plumbing. OFF by default → parity with the incumbent (which never stacks)
+    # is preserved exactly; only simulate_v2(use_pyramiding=True) adds add-ons.
+    use_pyramiding: bool = False
 
 
 # ---------- shared portfolio state (DD breaker) ----------
@@ -573,9 +627,82 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
         active = open_trades.get(sym)
         if active is not None:
             bars_held = i - active.entry_bar
-            atr_est = (active.entry_price - active.stop_loss) / max(cfg.sl_atr_mult, 1e-9)
+            # ATR frozen at entry — trailing/breakeven move the stop, so we can
+            # no longer back-derive ATR from (entry − stop) without corrupting
+            # both the slippage estimate and the R-unit. Fall back to the old
+            # derivation only for legacy trades that never stored atr_at_entry.
+            atr_at_entry = active.atr_at_entry if active.atr_at_entry > 0 else \
+                (active.entry_price - active.stop_loss) / max(cfg.sl_atr_mult, 1e-9)
+            atr_est = atr_at_entry
             exit_slip = (cfg.base_slip_bp + cfg.atr_slip_k
                          * (atr_est / max(active.entry_price, 1e-9) * 100)) / 10000.0
+
+            # R-unit = original entry risk. Must stay fixed even after the stop
+            # ratchets up, else breakeven/scale-out R-targets collapse toward 0.
+            r_unit = cfg.sl_atr_mult * atr_at_entry
+            if r_unit <= 0:
+                r_unit = 1e-9
+
+            # ── Breakeven stop: once price has touched entry + breakeven_trigger_r × r,
+            # raise the stop to entry (book a no-loss outcome on remaining qty).
+            if cfg.use_breakeven_stop and not active.breakeven_set:
+                trigger_price = active.entry_price + cfg.breakeven_trigger_r * r_unit
+                if hi >= trigger_price:
+                    active.stop_loss = max(active.stop_loss, active.entry_price)
+                    active.breakeven_set = True
+
+            # NB: the Chandelier trailing stop is updated AFTER the exit checks
+            # below — so the stop protecting THIS bar only reflects highs through
+            # the PRIOR bar (no intrabar look-ahead). See the post-exit block.
+
+            # ── Scale-out: partial closes at +tp1_r and +tp2_r ──
+            # tp1: close 1/3 at +2R; tp2: close another 1/3 at +4R; remaining
+            # 1/3 trails via a tightened breakeven (already set above).
+            if cfg.use_scale_out:
+                tp1_price = active.entry_price + cfg.tp1_r * r_unit
+                tp2_price = active.entry_price + cfg.tp2_r * r_unit
+                # tp1 — record the partial as its own closed Trade so metrics see it.
+                if not active.tp1_done and hi >= tp1_price:
+                    partial_qty = max(1, active.qty_initial // 3)
+                    if partial_qty < active.qty:
+                        partial = Trade(
+                            symbol=sym, entry_bar=active.entry_bar,
+                            entry_date=active.entry_date,
+                            entry_price=active.entry_price,
+                            stop_loss=active.stop_loss,
+                            take_profit=tp1_price,
+                            qty=partial_qty, score=active.score,
+                            qty_initial=partial_qty,
+                        )
+                        partial.exit_price = round(tp1_price, 2)
+                        partial.exit_date = bar_date
+                        partial.exit_reason = "TP1"
+                        _finalise(partial)
+                        closed_trades.append(partial)
+                        portfolio.record(partial.pnl)
+                        active.qty -= partial_qty
+                        active.tp1_done = True
+                # tp2 — close another 1/3.
+                if active.tp1_done and not active.tp2_done and hi >= tp2_price:
+                    partial_qty = max(1, active.qty_initial // 3)
+                    if partial_qty < active.qty:
+                        partial = Trade(
+                            symbol=sym, entry_bar=active.entry_bar,
+                            entry_date=active.entry_date,
+                            entry_price=active.entry_price,
+                            stop_loss=active.stop_loss,
+                            take_profit=tp2_price,
+                            qty=partial_qty, score=active.score,
+                            qty_initial=partial_qty,
+                        )
+                        partial.exit_price = round(tp2_price, 2)
+                        partial.exit_date = bar_date
+                        partial.exit_reason = "TP2"
+                        _finalise(partial)
+                        closed_trades.append(partial)
+                        portfolio.record(partial.pnl)
+                        active.qty -= partial_qty
+                        active.tp2_done = True
 
             if lo <= active.stop_loss:
                 open_price = float(bar["open"])
@@ -583,7 +710,15 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
                 worsened = exit_slip * cfg.sl_breakaway_mult
                 active.exit_price = round(trigger * (1 - worsened), 2)
                 active.exit_date = bar_date
-                active.exit_reason = "SL"
+                # Distinguish a profit-taking trailing/breakeven exit from a real
+                # SL so metrics aren't misleading. TRAIL = stop ratcheted above
+                # entry by the Chandelier trail; BREAKEVEN = parked at entry.
+                if active.trail_active and active.stop_loss > active.entry_price:
+                    active.exit_reason = "TRAIL"
+                elif active.breakeven_set and trigger >= active.entry_price:
+                    active.exit_reason = "BREAKEVEN"
+                else:
+                    active.exit_reason = "SL"
             elif hi >= active.take_profit:
                 active.exit_price = round(active.take_profit, 2)
                 active.exit_date = bar_date
@@ -595,6 +730,24 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
 
             if active.exit_reason:
                 _close(active, sym, ts)
+            else:
+                # ── Chandelier ATR trailing stop — updated only AFTER this bar's
+                # exit checks, so it never uses a high the same bar could have
+                # stopped out on. Hangs the stop off the highest high SINCE entry
+                # (incl. this bar) and ratchets up only; the new level protects
+                # the NEXT bar. Arms once price clears +trail_activate_r × R so
+                # the trade has room early. This is what lets fat-tail winners
+                # run past the MAX_HOLD guillotine.
+                if cfg.use_trailing_stop:
+                    if hi > active.highest_high:
+                        active.highest_high = hi
+                    if not active.trail_active and active.highest_high >= \
+                            active.entry_price + cfg.trail_activate_r * r_unit:
+                        active.trail_active = True
+                    if active.trail_active:
+                        trail_stop = active.highest_high - cfg.trail_atr_mult * atr_at_entry
+                        if trail_stop > active.stop_loss:
+                            active.stop_loss = round(trail_stop, 2)
             continue   # already has (or had) position on this bar — no new entry
 
         # --- (B) try to open a new position ---
@@ -639,11 +792,13 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
                     if not ok:
                         continue
 
-        if cfg.apply_regime_gate and spy_daily is not None and not spy_daily.empty:
+        regime = None
+        if (cfg.apply_regime_gate or cfg.use_regime_scaling) and \
+                spy_daily is not None and not spy_daily.empty:
             s_until = spy_daily.loc[spy_daily.index <= df.index[i]].tail(250)
             if len(s_until) >= 200:
                 regime = regime_mod.assess(s_until)
-                if regime.block_new_entries:
+                if cfg.apply_regime_gate and regime.block_new_entries:
                     continue
 
         if ml_pred is not None:
@@ -663,6 +818,17 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
                 continue   # halt active — refuse new entries this bar
             if portfolio.dd_pct >= cfg.dd_size_cut_pct:
                 qty_mult = 0.5
+
+        # --- regime-scaled sizing: lever up in a confirmed strong bull (SPY >
+        # 50MA > 200MA) when VIX is calm. Stacks on top of the DD cut, so a
+        # strong-bull-but-drawn-down state still de-risks first. ---
+        if cfg.use_regime_scaling and regime is not None and regime.bullish:
+            try:
+                vix_now = float(bar["vix"])
+            except (KeyError, TypeError, ValueError):
+                vix_now = 15.0
+            if vix_now < cfg.regime_vix_calm:
+                qty_mult *= cfg.regime_bull_mult
 
         # --- realistic limit-buy fill ---
         next_bar = df.iloc[i + 1]
@@ -698,7 +864,10 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
             stop_loss=stop_loss,
             take_profit=take_profit,
             qty=qty,
+            qty_initial=qty,
             score=sig.score,
+            atr_at_entry=sig.atr,
+            highest_high=round(entry_price, 2),
         )
 
     # ---------- close anything still open at the very end ----------

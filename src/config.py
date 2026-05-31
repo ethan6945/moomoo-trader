@@ -68,6 +68,19 @@ class Settings:
     sl_atr_mult: float = _float("SL_ATR_MULT", 2.0)
     max_gap_pct: float = _float("MAX_GAP_PCT", 3.0)   # overnight gap filter
 
+    # 3-tranche scale-out (2026-05-30 cash-frontier finding: banking partials and
+    # recycling the cash is the best NO-LEVERAGE lever for a real $5k account —
+    # it lifts cash-on $/day on both 180d & 360d while keeping MTM-DD < the halt).
+    # OFF by default so live behaviour is identical until explicitly switched on.
+    # When on, the soft manager closes 1/3 of the ORIGINAL qty at +TP1_R, another
+    # 1/3 at +TP2_R, and trails the final ~1/3. R = entry − initial_stop
+    # (= SL_ATR_MULT × ATR). NOTE: like the legacy TP_HALF, this runs on the
+    # soft-management path (SIMULATE, or REAL when the OCO bracket attach failed);
+    # in REAL with a live bracket the broker owns the single TP.
+    use_scale_out: bool = os.getenv("USE_SCALE_OUT", "false").lower() in ("1", "true", "yes")
+    tp1_r: float = _float("TP1_R", 3.0)
+    tp2_r: float = _float("TP2_R", 6.0)
+
     # Drawdown circuit breaker — discovered from the 142-day backtest where
     # Nov 2025 alone lost -$761 (17% of account) before the strategy recovered.
     # When account-level DD breaches these thresholds, we either halve qty or

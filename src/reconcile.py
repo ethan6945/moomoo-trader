@@ -30,89 +30,154 @@ RECONCILE_FILE = settings.root / "data" / "reconcile.json"
 NY = pytz.timezone("America/New_York")
 
 
-def reconcile(broker_positions: pd.DataFrame) -> dict:
-    """Compare our internal records to broker positions."""
+def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True) -> dict:
+    """Compare our internal records to broker positions.
+
+    2026-05-30 update: auto-fix the safe drifts instead of just logging.
+      • ORPHAN (broker has, we don't) → adopt with defensive stop/TP
+      • GHOST  (we track, broker doesn't) → drop our stale record
+      • MISMATCH (qty drift) → adopt broker's qty (broker is authoritative)
+    After auto-fix, the state is internally consistent again — no need to halt.
+    Halt is reserved for repeated-after-fix drift (broken state we can't recover).
+    """
     try:
         our_trades = json.loads(OPEN_TRADES_FILE.read_text()) if OPEN_TRADES_FILE.exists() else {}
     except json.JSONDecodeError:
         our_trades = {}
 
-    broker_holdings: dict[str, int] = {}
+    broker_holdings: dict[str, dict] = {}    # symbol → {qty, cost_price}
     if not broker_positions.empty:
         held = broker_positions[broker_positions["qty"].astype(float) > 0]
         for _, row in held.iterrows():
             sym = row["code"].split(".")[-1]
-            broker_holdings[sym] = int(float(row["qty"]))
+            broker_holdings[sym] = {
+                "qty": int(float(row["qty"])),
+                "cost_price": float(row.get("cost_price") or 0),
+            }
 
     our_syms = {s for s, t in our_trades.items() if t.get("qty", 0) > 0}
     broker_syms = set(broker_holdings.keys())
 
     orphans = [
-        {"symbol": s, "broker_qty": broker_holdings[s]}
+        {"symbol": s,
+         "broker_qty": broker_holdings[s]["qty"],
+         "broker_cost": broker_holdings[s]["cost_price"]}
         for s in sorted(broker_syms - our_syms)
     ]
     ghosts = [
-        {
-            "symbol": s,
-            "our_qty": our_trades[s].get("qty"),
-            "entry": our_trades[s].get("entry_price"),
-        }
+        {"symbol": s,
+         "our_qty": our_trades[s].get("qty"),
+         "entry": our_trades[s].get("entry_price")}
         for s in sorted(our_syms - broker_syms)
     ]
     mismatches = []
     for s in sorted(our_syms & broker_syms):
         our_qty = int(our_trades[s].get("qty", 0))
-        broker_qty = broker_holdings[s]
+        broker_qty = broker_holdings[s]["qty"]
         if our_qty != broker_qty:
             mismatches.append({
                 "symbol": s, "our_qty": our_qty, "broker_qty": broker_qty
             })
 
-    # Severity rules — when do we auto-halt?
-    #   • mismatch by ≥ 1 share is always severe (qty drift = unknown exposure)
-    #   • both orphan AND ghost simultaneously = our records are out of sync in both directions
-    #   • a single orphan or single ghost = warn but allow trading (low risk: just record drift)
-    severe = bool(mismatches) or (bool(orphans) and bool(ghosts))
-    # 2026-05-28: 2-strike halt rule — paper trading routinely shows transient
-    # mismatches when MooMoo's broker side hasn't caught up to a just-placed
-    # order. Halting on a single observation produced false stops in paper.
-    # Now we increment a streak counter; halt only fires after 2 consecutive
-    # severe reconciles. A clean reconcile resets the counter.
+    fixes_applied: list[dict] = []
+
+    if auto_fix:
+        now_iso = datetime.utcnow().isoformat()
+
+        # FIX ORPHAN: add to our tracking with defensive stop/TP defaults.
+        for o in orphans:
+            sym = o["symbol"]
+            cost = o["broker_cost"] or 0.0
+            if cost <= 0:
+                log.warning("Reconcile orphan %s has zero cost_price — skipping auto-add",
+                            sym)
+                continue
+            our_trades[sym] = {
+                "symbol": sym, "qty": o["broker_qty"],
+                "entry_price": cost,
+                "stop_loss": round(cost * 0.965, 2),     # -3.5%
+                "take_profit": round(cost * 1.07, 2),    # +7%
+                "atr": cost * 0.02,
+                "half_closed": False,
+                "buy_order_id": None, "stop_order_id": None, "tp_order_id": None,
+                "opened_at": now_iso,
+                "high_water": cost, "low_water": cost,
+                "ml_proba_entry": None,
+                "strategy": "reconcile_orphan_recovery",
+                "stacks": 1,
+            }
+            fixes_applied.append({"type": "ORPHAN_ADOPTED", "symbol": sym,
+                                  "qty": o["broker_qty"], "cost": cost})
+            log.warning("Reconcile auto-fix: adopted orphan %s qty=%d @ $%.2f",
+                        sym, o["broker_qty"], cost)
+
+        # FIX GHOST: drop stale records the broker doesn't actually hold.
+        for g in ghosts:
+            sym = g["symbol"]
+            our_trades.pop(sym, None)
+            fixes_applied.append({"type": "GHOST_DROPPED", "symbol": sym})
+            log.warning("Reconcile auto-fix: dropped ghost %s", sym)
+
+        # FIX MISMATCH: adopt broker's qty (broker side is authoritative).
+        for m in mismatches:
+            sym = m["symbol"]
+            if sym in our_trades:
+                our_trades[sym]["qty"] = m["broker_qty"]
+                fixes_applied.append({"type": "QTY_ADOPTED", "symbol": sym,
+                                      "old_qty": m["our_qty"], "new_qty": m["broker_qty"]})
+                log.warning("Reconcile auto-fix: %s qty %d → %d",
+                            sym, m["our_qty"], m["broker_qty"])
+
+        if fixes_applied:
+            try:
+                OPEN_TRADES_FILE.write_text(json.dumps(our_trades, indent=2, default=str))
+                # Also push through the SQLite mirror in executor.
+                from . import executor
+                executor._save_open_trades(our_trades)
+            except Exception as e:
+                log.error("reconcile auto-fix write failed: %s", e)
+
+        # Reset severe streak — drift just got fixed.
+        try:
+            db.update_state({"reconcile_severe_streak": 0})
+        except Exception:
+            pass
+
+    # Streak tracker (legacy 2-strike halt) — only counts UNFIXED severe state.
+    unfixed_severe = (not auto_fix) and (
+        bool(mismatches) or (bool(orphans) and bool(ghosts))
+    )
     severe_streak = int(db.get_state().get("reconcile_severe_streak", 0) or 0)
-    if severe:
+    if unfixed_severe:
         severe_streak += 1
     else:
         severe_streak = 0
     db.update_state({"reconcile_severe_streak": severe_streak})
-    halt_now = severe and severe_streak >= 2
+    halt_now = unfixed_severe and severe_streak >= 2
 
     result = {
         "ts": datetime.now(NY).isoformat(),
         "ok": not (orphans or ghosts or mismatches),
-        "severe": severe,
+        "severe": unfixed_severe,
         "orphans": orphans,
         "ghosts": ghosts,
         "mismatches": mismatches,
+        "fixes_applied": fixes_applied,
         "summary": (
             f"OK ({len(broker_syms)} positions)"
             if not (orphans or ghosts or mismatches)
-            else f"{len(orphans)} orphan, {len(ghosts)} ghost, {len(mismatches)} mismatch"
+            else f"{len(orphans)} orphan, {len(ghosts)} ghost, "
+                 f"{len(mismatches)} mismatch — {len(fixes_applied)} auto-fixed"
         ),
     }
 
-    # Auto-halt on severe drift — but only after 2 consecutive observations,
-    # so a one-off paper-trading hiccup doesn't shut down trading.
     if halt_now:
         try:
             db.atomic_state(lambda s: {"halted": True})
-            log.warning("Severe reconcile drift (streak=%d) → halted=True "
-                        "(resolve via GUI then click 'Halted' to reset)",
+            log.warning("Severe reconcile drift (streak=%d, no auto-fix) → halted=True",
                         severe_streak)
         except Exception as e:
             log.error("auto-halt on reconcile failed: %s", e)
-    elif severe:
-        log.warning("Reconcile severe (streak=%d) — watching but not halted yet",
-                    severe_streak)
 
     RECONCILE_FILE.parent.mkdir(parents=True, exist_ok=True)
     RECONCILE_FILE.write_text(json.dumps(result, indent=2))

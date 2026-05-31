@@ -32,12 +32,13 @@ WATCHLIST_FILE = settings.root / "config" / "watchlist.json"
 BACKUP_FILE = settings.root / "config" / "watchlist.json.bak"
 
 # Anchor tickers — always in the watchlist regardless of screen results.
-# 2026-05-28: dropped AMZN/META/SPY/QQQ/SMH after they showed up as net losers
-# (or barely-traded) in the 180-day sweep. Kept the high-vol single-name anchors
-# the strategy actually earns on. The weekly refresh otherwise re-adds them.
+# 2026-05-30: tightened to the top-10 winners only. The robustness sweep showed
+# top-10 had a Sortino edge (8.60 vs 7.85 full) and 3pp lower DD on 360 days.
+# The 9 previously-anchored names (TSLA/NVDA/MSFT/GOOGL/AAPL etc) all
+# under-traded or under-performed on per-symbol PnL.
 ANCHORS = [
-    "TSLA", "NVDA", "MSFT", "GOOGL", "AAPL",
-    "MU", "INTC", "AMD", "LRCX",
+    "SNDK", "MU", "INTC", "LRCX", "DDOG",
+    "AMD",  "WDC", "SWKS", "PANW", "MCHP",
 ]
 
 # Screen filters — env-overridable via WATCHLIST_* settings.
