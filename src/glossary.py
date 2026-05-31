@@ -93,15 +93,19 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
             "name": "ENTRY_SCORE_THRESHOLD",
             "summary": "分数 ≥ 这个才下单",
             "explain": (
-                "Optuna 跑过 4 次，发现在 60-68 范围都行，<60 直接亏钱。\n\n"
-                "现在用 60 (180 天最优):\n"
-                "  • 50-59 → 完全拒\n"
-                "  • 60-66 → marginal (减半仓位)\n"
-                "  • 67+   → full conviction\n\n"
-                "分数 80+ 在 180 天回测里胜率 79%，但样本太少。"
+                "Optuna 在 60-80 区间搜过 (step 2)，当前 .env 用 70。\n"
+                "入场用一个'门槛 − 10'的缓冲带 (threshold_floor=60):\n\n"
+                "  • < 60   → 完全拒 (连漏斗都不进)\n"
+                "  • 60-69  → marginal (进漏斗,但减半仓位 half-conviction)\n"
+                "  • 70+    → full conviction (满仓信心)\n\n"
+                "为什么要这条缓冲带:多数美股大盘股常年只打到 ~60 分,若硬卡 70\n"
+                "几乎永远 top_5=[] → 一笔都不开。所以 60-69 也放进来,但仓位减半,\n"
+                "和 ML '中性区'减半是同一个思路 — 试,但小试。\n\n"
+                "若叠加 ML 中性区 (proba 0.35-0.55 再 ×0.5) → 最小可到 1/4 仓。\n"
+                "分数 80+ 在回测里胜率最高,但样本太少。"
             ),
-            "where": ".env: ENTRY_SCORE_THRESHOLD",
-            "value": "60",
+            "where": ".env: ENTRY_SCORE_THRESHOLD;src/main.py: threshold_floor / marginal_setup",
+            "value": "70 (缓冲带下沿 60)",
         },
     },
 
@@ -119,9 +123,9 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "ATR 小 = 安静，止损可以紧"
             ),
             "where": "止损/止盈/仓位计算全靠它:\n"
-                     "  stop = entry - 3.25 × ATR\n"
-                     "  tp   = entry + 3.0  × ATR\n"
-                     "  qty  = $90 风险 / 止损距离",
+                     "  stop = entry - 3.5 × ATR  (SL_ATR_MULT)\n"
+                     "  tp   = entry + 8.0 × ATR  (TP_ATR_MULT)\n"
+                     "  qty  = $250 风险 / 止损距离",
         },
         "EMA — Exponential Moving Average": {
             "name": "Exponential Moving Average",
@@ -232,28 +236,30 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
             "name": "Per-Trade Risk Cap",
             "summary": "单笔最多亏账户的多少 %",
             "explain": (
-                "默认 2%，例如账户 $4500 单笔风险 = $90。\n"
-                "如果止损被打满最多亏 $90。\n\n"
-                "  qty = ($4500 × 2%) / 止损距离 = $90 / (entry - stop)\n\n"
+                "当前 5%，账户 $5000 → 单笔风险 = $250。\n"
+                "如果止损被打满最多亏 $250。\n\n"
+                "  qty = ($5000 × 5%) / 止损距离 = $250 / (entry - stop)\n\n"
                 "自适应仓位会基于近 30 笔 Sortino 自动调:\n"
-                "  Sortino > 5  → 风险 × 1.25 (= 2.5%)\n"
-                "  Sortino < 0  → 风险 × 0.5  (= 1.0%)"
+                "  Sortino > 5  → 风险 × 1.25 (= 6.25%)\n"
+                "  Sortino < 0  → 风险 × 0.5  (= 2.5%)"
             ),
-            "where": ".env: RISK_PER_TRADE",
-            "value": "0.02 (2%)",
+            "where": ".env: RISK_PER_TRADE (ACCOUNT_USD=$5000)",
+            "value": "0.05 (5%) → $250/笔",
         },
         "MAX_POSITIONS / MAX_POSITION_PCT": {
             "name": "Concurrent Position Caps",
             "summary": "同时最多几仓 + 每仓最大多少 %",
             "explain": (
-                "  MAX_POSITIONS=10        最多 10 仓\n"
-                "  MAX_POSITION_PCT=0.10   每仓不超过 10% 账户\n\n"
-                "10 × 10% = 100% — 满仓也不会超预算。\n\n"
-                "之前是 5 × 20% = 100%，改成 10 × 10% 更分散，"
-                "单只股暴跌时影响减半。"
+                "  MAX_POSITIONS=5         最多 5 仓\n"
+                "  MAX_POSITION_PCT=0.50   每仓名义市值上限 50% 账户 ($2500)\n\n"
+                "50% 是'封顶',不是目标 — 实际每仓大小由风险决定\n"
+                "(= $250 / 止损距离),MAX_POSITION_PCT 只防止单仓过大。\n\n"
+                "注意 5 × 50% = 250%:Oracle 不查现金,多仓的名义市值确实可能叠到\n"
+                ">100% (= 隐性杠杆,见'双引擎回测'章)。真实 $5000 现金账户在\n"
+                "enforce_cash 镜头下会被现金墙挡住,买不起就不买。"
             ),
             "where": ".env: MAX_POSITIONS, MAX_POSITION_PCT",
-            "value": "10 / 10%",
+            "value": "5 仓 / 每仓上限 50%",
         },
         "DD 断路器 (Drawdown Circuit Breaker)": {
             "name": "Account Drawdown Circuit Breaker",
@@ -261,13 +267,13 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
             "explain": (
                 "实时跟踪账户级 DD (= peak_equity - current_equity):\n\n"
                 "  DD ≥ 10% (DD_SIZE_CUT_PCT)  → 新仓位 × 0.5\n"
-                "  DD ≥ 15% (DD_HALT_PCT)      → 完全停开新仓\n\n"
+                "  DD ≥ 18% (DD_HALT_PCT)      → 完全停开新仓\n\n"
                 "现有仓位不受影响 (止损会自然触发)。\n"
                 "DD 回到 < 10% 后自动恢复全仓。\n\n"
                 "180 天回测显示这能把 11 月那种灾难月 -17% 压到 -8%。"
             ),
             "where": "src/risk_manager.py: _dd_size_multiplier",
-            "value": "10% / 15%",
+            "value": "减半 10% / 停盘 18%",
         },
         "3 连亏熔断": {
             "name": "3-Day Loss Streak Halt",
@@ -328,6 +334,115 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "现有仓位不受影响 — 这是入场过滤，不是强平规则。"
             ),
             "where": "src/earnings.py",
+        },
+    },
+
+    # ===================================================================
+    "🎚 出场与加仓 Exits & Scaling": {
+        "R — 风险单位 (R-Unit)": {
+            "name": "R-Unit (Initial Per-Share Risk)",
+            "summary": "一切出场/加仓的度量尺:1R = 入场价 − 初始止损",
+            "explain": (
+                "R = entry − initial_stop = SL_ATR_MULT × ATR(入场时)\n\n"
+                "几乎所有出场和加仓规则都用 R 描述距离,而不是用 %:\n"
+                "  • scale-out 在 +3R / +6R 分批止盈\n"
+                "  • 保本止损在 +1R 触发\n"
+                "  • 移动止损在 +1R 之后才启动\n"
+                "  • 金字塔加仓要求浮盈 ≥ +0.5R\n\n"
+                "好处:不管股价高低、波动大小,'1R' 永远等于'当初愿意亏的那一份',\n"
+                "规则在不同股票之间可比 (R-Multiple 同理)。"
+            ),
+            "where": "src/backtest_v2.py: r_unit = cfg.sl_atr_mult × atr0;实盘 executor 同公式",
+            "value": "1R = 3.5 × ATR (SL_ATR_MULT=3.5)",
+        },
+        "SL_ATR_MULT / TP_ATR_MULT": {
+            "name": "Stop / Take-Profit ATR Multipliers",
+            "summary": "止损、止盈各离入场多少个 ATR",
+            "explain": (
+                "  止损 stop = entry − SL_ATR_MULT × ATR\n"
+                "  止盈 tp   = entry + TP_ATR_MULT × ATR\n\n"
+                "当前 .env:\n"
+                "  SL_ATR_MULT = 3.5  → 止损约 3.5 个 ATR (宽止损,少被噪音洗下车)\n"
+                "  TP_ATR_MULT = 8.0  → 止盈约 8 个 ATR (很宽,博肥尾大行情)\n\n"
+                "宽 SL + 很宽 TP = 用'低胜率'换'大盈亏比'的趋势打法。\n"
+                "2026-05 sweep:更宽的 SL/TP 反而 +$5/天,因为减少了假止损。"
+            ),
+            "where": ".env: SL_ATR_MULT, TP_ATR_MULT;src/backtest_v2.py 出场解析",
+            "value": "SL 3.5 / TP 8.0 ATR",
+        },
+        "Scale-out — 分批止盈 (3 档)": {
+            "name": "Scale-Out (3-Tranche Partial Exit)",
+            "summary": "把仓位拆 3 份,边涨边分批落袋",
+            "explain": (
+                "入场时把仓位分成 3 份 (各 1/3):\n"
+                "  第 1 档  +TP1_R × R = +3R          卖 1/3 → 标 'TP1'\n"
+                "  第 2 档  +TP2_R × R = +6R          卖 1/3 → 标 'TP2'\n"
+                "  runner   +TP_ATR_MULT × ATR = +8 ATR  最后 1/3,固定止盈、不移动\n\n"
+                "用意:'落袋为安' 与 '让赢家跑' 的折中 — 先锁一部分利润,\n"
+                "再留一部分博更大行情,降低到手利润被回吐的风险。\n\n"
+                "注意当前参数:TP1(+10.5 ATR)/TP2(+21 ATR)其实高于 runner 的\n"
+                "止盈(+8 ATR),所以普通慢涨行情整仓会先在 +8 ATR 全平,两档只在\n"
+                "单根 K 线暴涨/跳空时才触发。回测:180d +$2/天、360d 持平、回撤不变\n"
+                "— 唯一一个'从不输基线'的无杠杆改动,所以才打开它。"
+            ),
+            "where": ".env: USE_SCALE_OUT, TP1_R, TP2_R;实盘 src/executor.py 软管理路径",
+            "value": "ON · TP1_R=3.0 / TP2_R=6.0",
+        },
+        "Pyramiding / Stacking — 金字塔加仓": {
+            "name": "Pyramiding (Add-On Stacking)",
+            "summary": "给已经在赚的持仓加仓 (实盘 open_position 的合并)",
+            "explain": (
+                "一只已持有的票若再次触发买入信号,且当前浮盈 ≥ +0.5R、\n"
+                "未超过每标的 5 层上限 → 把加仓单合并进原仓:\n"
+                "  • 成本价 = 原仓与加仓的加权平均\n"
+                "  • 止损/止盈 = 只升不降\n"
+                "  • 加仓不占 MAX_POSITIONS 名额 (是同一个持仓);但要扣现金\n\n"
+                "回测结论 (真实 $5k 现金账户):反而亏 —\n"
+                "  180d +55→+28/天,  360d +11→+6.5/天,  回撤更大\n"
+                "  '现金受限入场' 暴增 → 加仓把新机会需要的现金吃光了。\n"
+                "所以 use_pyramiding 默认 OFF,实盘没开 (只是建模出来供回测对比)。"
+            ),
+            "where": ".env: USE_PYRAMIDING (默认 false);src/backtest_v2.py: _stack_gate / "
+                     "_merge_addon;实盘 src/executor.py: open_position",
+            "value": "OFF · 上限 5 层/票 · 门槛 +0.5R",
+        },
+        "保本止损 (Breakeven Stop)": {
+            "name": "Breakeven Stop",
+            "summary": "浮盈到 +1R 就把止损提到入场价 (从此最坏平手)",
+            "explain": (
+                "价格触及 entry + breakeven_trigger_r × R (= +1R) 后,\n"
+                "把止损上提到入场价 — 之后最坏也是平手出场,标 'BREAKEVEN'。\n\n"
+                "回测引擎里有这个开关,但当前 .env 没开 (USE_BREAKEVEN_STOP 默认 false)。\n"
+                "可以在 sweep 里试;默认关是为了和实盘行为保持一致。"
+            ),
+            "where": "src/backtest_v2.py / backtest.py: use_breakeven_stop, breakeven_trigger_r",
+            "value": "OFF (触发 = +1R)",
+        },
+        "吊灯移动止损 (Chandelier Trail)": {
+            "name": "Chandelier Trailing Stop",
+            "summary": "止损跟着最高价上移:peak − N×ATR,只升不降",
+            "explain": (
+                "启动后:止损 = 持仓期间最高价 − trail_atr_mult × ATR,只升不降。\n"
+                "只有浮盈过 +trail_activate_r × R (= +1R) 才启动,早期给行情留空间。\n\n"
+                "  trail_atr_mult = 3.0  (跟踪 3 个 ATR)\n\n"
+                "当前 .env 没开 (USE_TRAILING_STOP 默认 false) — 这也是为什么 scale-out\n"
+                "的 runner 是'固定止盈不移动'。实盘打开 scale-out 后,正是用固定止盈\n"
+                "取代了移动止损,避免被正常回调噪音甩下车。"
+            ),
+            "where": "src/backtest_v2.py: trail_active, trail_atr_mult, trail_activate_r",
+            "value": "OFF (trail 3×ATR, 启动 +1R)",
+        },
+        "MAX_HOLD_DAYS — 最长持有": {
+            "name": "Max Hold (Time Stop)",
+            "summary": "持仓超过 N 个交易日还没了结就强平",
+            "explain": (
+                "持仓达到 MAX_HOLD_DAYS 个'交易日'(business days,跳过周末/假日)\n"
+                "还没碰到止损/止盈 → 按收盘市价强平,标 'MAX_HOLD'。\n\n"
+                "用意:这是短线 swing 策略,不让资金被一只走平的票长期占住名额。\n"
+                "executor 现在按 business days 计,和回测口径一致。"
+            ),
+            "where": ".env: MAX_HOLD_DAYS;src/backtest_v2.py 出场解析",
+            "value": "7 交易日",
         },
     },
 
@@ -655,6 +770,120 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "止损穿透时滑点 × 2 (sl_breakaway_mult)。"
             ),
             "where": "src/backtest.py: _slip_for",
+        },
+    },
+
+    # ===================================================================
+    "🔬 双引擎回测 Dual-Engine & 现金诚实度": {
+        "两个引擎 (Oracle vs V2)": {
+            "name": "Two Backtest Engines (Differential Testing)",
+            "summary": "两套独立写的回测引擎互相对账,防止单一实现里的隐藏 bug",
+            "explain": (
+                "回测结论要敢拿来调实盘参数,就不能只信一套代码。所以有两个引擎:\n\n"
+                "  • Oracle  simulate_time_stepped (src/backtest.py)\n"
+                "            — 冻结的'标准答案',GUI 跑的就是它\n"
+                "  • V2      simulate_v2 (src/backtest_v2.py)\n"
+                "            — 完全独立重写的第二实现\n\n"
+                "差分测试 (differential testing):让 V2 在'机制验证'模式下逐笔、\n"
+                "逐美元复现 Oracle。两套独立代码同时算错同一个数的概率极低,\n"
+                "所以一旦对得上,就对结果有信心。\n\n"
+                "scripts/engine_compare.py 是常驻对账脚本:净值差 / 笔数差只要不为 0\n"
+                "就 exit 1 报警。当前:净差 $0.00、笔数差 0 (完全一致)。"
+            ),
+            "where": "src/backtest.py (oracle) vs src/backtest_v2.py (v2);scripts/engine_compare.py",
+            "value": "PARITY OK · Δ净值 $0.00 · Δ笔数 0",
+        },
+        "parity_mode — 机制验证": {
+            "name": "parity_mode (Mechanism Validation Lens)",
+            "summary": "V2 的'对账模式':关现金墙、关加仓,只验证机制和 Oracle 一致",
+            "explain": (
+                "同一份 simulate_v2 代码,两个镜头看回测。parity_mode=True 是第一个:\n\n"
+                "  • 不检查现金 (和 Oracle 一样按静态 $5000 算仓位)\n"
+                "  • 关闭金字塔加仓\n"
+                "  • 目标:逐笔、逐美元复现 Oracle\n\n"
+                "用意:把'机制对不对'和'策略赚不赚'两件事拆开验证。先证明 V2 的\n"
+                "出场/排序/风控机制和冻结的 Oracle 完全一样 (机制验证),再打开现金\n"
+                "约束去看真实账户表现 (策略验证)。机制这层不过,策略数字就没意义。"
+            ),
+            "where": "src/backtest_v2.py: simulate_v2(parity_mode=True)",
+            "value": "对账时 ON;真实账户评估时 OFF",
+        },
+        "enforce_cash — 策略验证 / 真实现金账户": {
+            "name": "enforce_cash (Real $5k Cash-Balance Lens)",
+            "summary": "V2 的'真实现金模式':真的扣现金、买不起就不买",
+            "explain": (
+                "simulate_v2 的第二个镜头 enforce_cash=True,模拟真实的 $5000 现金账户:\n\n"
+                "  • 每次开仓 / 加仓真的从现金余额里扣钱\n"
+                "  • 现金不够 → 这个信号买不起,直接丢弃 (现金墙)\n"
+                "  • 跟踪逐 bar 的浮动盈亏 (MTM-DD)\n\n"
+                "为什么需要它:Oracle 按静态 $5000 算每仓,从不查'账上还剩多少现金',\n"
+                "于是会同时持有远超 $5000 的名义市值 (= 隐性杠杆)。真实 SIMULATE\n"
+                "账户只有 $5000 现金,买不起就是买不起。这个镜头把那层免费杠杆\n"
+                "拿掉,给出'真账户能复制'的诚实读数。"
+            ),
+            "where": "src/backtest_v2.py: simulate_v2(enforce_cash=True)",
+            "value": "真实账户评估时 ON",
+        },
+        "MTM-DD — 浮动回撤 (Mark-to-Market Drawdown)": {
+            "name": "Mark-to-Market Drawdown",
+            "summary": "把未平仓也按每根 K 线收盘价计价后的回撤 (比已实现回撤诚实)",
+            "explain": (
+                "普通'已实现回撤'只在平仓那一刻才把亏损计入权益曲线 — 持仓浮亏被\n"
+                "藏起来,回撤看着很漂亮。MTM-DD (mark-to-market) 不一样:\n\n"
+                "  • 每根 bar 都把所有未平仓按当根收盘价重新计价\n"
+                "  • 浮盈浮亏实时进权益曲线\n"
+                "  • 回撤 = 这条'含浮动'曲线的峰谷差\n\n"
+                "意义:这才是你账户屏幕上真实看到的数字,也是你真正要承受的痛。\n"
+                "报告里凡是带 MTM 的回撤都比已实现回撤更大 / 更诚实。"
+            ),
+            "where": "src/backtest_v2.py: _RealizedDD / 逐 bar 计价",
+            "value": "报告里标 MTM-DD",
+        },
+        "隐性杠杆 / 峰值毛敞口 (pkGr%)": {
+            "name": "Implicit Leverage / Peak Gross Exposure",
+            "summary": "Oracle 按静态 $5000 算每仓、从不查现金,于是悄悄上了杠杆",
+            "explain": (
+                "Oracle 每笔都按固定 $5000 × 风险% 算仓位,但从不检查'账上现金\n"
+                "够不够'。于是它能同时持有好几个满仓位,名义市值远超 $5000 —\n"
+                "等于免费用了杠杆,自己却不知道。\n\n"
+                "峰值毛敞口 pkGr% = 同时持仓的名义市值峰值 / $5000:\n"
+                "  • 100% = 刚好满仓,无杠杆\n"
+                "  • 实测见过 252% – 534% → 相当于 2.5×–5× 杠杆\n\n"
+                "真实 SIMULATE 现金账户没有这层杠杆,所以 Oracle 的漂亮收益有一部分\n"
+                "是'账户其实复制不出来'的。enforce_cash 镜头就是用来戳破这一点。"
+            ),
+            "where": "src/backtest_v2.py: 峰值毛敞口统计 (pkGr%)",
+            "value": "实测峰值 252% – 534% (≈2.5×–5×)",
+        },
+        "现金受限入场 (cashLim)": {
+            "name": "Cash-Limited Entries",
+            "summary": "因为现金不够而被丢弃的合格信号数 — '饿肚子'指标",
+            "explain": (
+                "在 enforce_cash 模式下,一个信号通过了全部 8 道漏斗、本该开仓,\n"
+                "却因为账上现金不足而买不起 → 记一次'现金受限入场' (cashLim)。\n\n"
+                "它是一个'饥饿'信号:数字越大,说明现金越常被占满、错过的好机会越多。\n\n"
+                "典型用法:评估金字塔加仓时就是看它 —\n"
+                "  加仓把现金吃光 → cashLim 暴增 (180d ×3.6 / 360d ×1.8)\n"
+                "  → 新名字的机会被饿死 → 这正是加仓在 $5k 账户上反而亏钱的原因。"
+            ),
+            "where": "src/backtest_v2.py: enforce_cash 路径的 cash-limited 计数",
+            "value": "报告里标 cashLim (越低越好)",
+        },
+        "诚实读数 ($/day @ MTM-DD)": {
+            "name": "The Honest Read",
+            "summary": "用真实现金 + 浮动回撤口径看策略,而不是被隐性杠杆美化的版本",
+            "explain": (
+                "把上面几件事合起来,就是评判一个'无杠杆改动'到底好不好的统一口径:\n\n"
+                "  1. enforce_cash  — 真扣现金、买不起就不买 (去掉隐性杠杆)\n"
+                "  2. MTM-DD        — 含浮动盈亏的诚实回撤\n"
+                "  3. cashLim       — 有没有把现金占满、饿死新机会\n"
+                "  4. $/day         — 每日净收益 (跨不同回测长度可比)\n\n"
+                "一个改动只有在这个诚实口径下'不输基线'才会被打开。\n"
+                "  • scale-out 过了 → 实盘打开 (USE_SCALE_OUT=true)\n"
+                "  • pyramiding 没过 ($/day 掉、回撤升、cashLim 暴增) → 保持 OFF"
+            ),
+            "where": "scripts/engine_compare.py / pyramiding_compare.py 的对比口径",
+            "value": "决策口径:真实现金 + MTM-DD + $/day",
         },
     },
 
