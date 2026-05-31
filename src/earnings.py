@@ -82,6 +82,60 @@ def get_next_earnings(symbol: str, force_refresh: bool = False) -> str | None:
     return next_date
 
 
+# ── Historical earnings calendar (for backtest gating) ───────────────────────
+# The live gate above only needs the NEXT earnings date. A backtest needs the
+# PAST dates that fell inside its window, so it can replay the same "block within
+# N days before earnings" rule bar-by-bar. yfinance.get_earnings_dates returns
+# both past and near-future reports; we cache them separately (longer TTL is fine
+# — past earnings dates never change).
+HIST_CACHE_FILE = settings.root / "data" / "earnings_hist.json"
+HIST_CACHE_TTL_DAYS = 7
+
+
+def get_earnings_history(symbol: str, limit: int = 24,
+                        force_refresh: bool = False) -> list[str]:
+    """Return ISO dates of past + near-future earnings for `symbol`.
+
+    Cached HIST_CACHE_TTL_DAYS in data/earnings_hist.json. Returns [] on any
+    failure (ETF / yfinance error) so the caller simply never blocks it — same
+    graceful degradation as the live gate.
+    """
+    cache: dict = {}
+    if HIST_CACHE_FILE.exists():
+        try:
+            cache = json.loads(HIST_CACHE_FILE.read_text())
+        except json.JSONDecodeError:
+            cache = {}
+    key = symbol.upper()
+    entry = cache.get(key, {})
+    if not force_refresh and entry:
+        try:
+            age = (date.today() - date.fromisoformat(entry.get("fetched_at", ""))).days
+            if age <= HIST_CACHE_TTL_DAYS:
+                return entry.get("dates", [])
+        except ValueError:
+            pass
+
+    dates: list[str] = []
+    try:
+        import yfinance as yf
+        df = yf.Ticker(symbol).get_earnings_dates(limit=limit)
+        if df is not None and len(df):
+            dates = sorted({d.date().isoformat() for d in df.index})
+    except Exception as e:
+        log.warning("earnings history fetch failed for %s: %s", symbol, e)
+
+    cache[key] = {"dates": dates, "fetched_at": date.today().isoformat()}
+    HIST_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HIST_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+    return dates
+
+
+def load_earnings_calendar(symbols: list[str]) -> dict[str, list[str]]:
+    """{SYMBOL: [ISO earnings dates]} for backtest gating. Best-effort per name."""
+    return {s.upper(): get_earnings_history(s) for s in symbols}
+
+
 def earnings_block(symbol: str) -> tuple[bool, str]:
     """Return (blocked, reason). Blocked if earnings within EARNINGS_AVOID_DAYS."""
     next_date = get_next_earnings(symbol)

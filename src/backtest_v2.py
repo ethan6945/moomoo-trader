@@ -207,6 +207,11 @@ def simulate_v2(
     # Pyramiding only ever runs in the strategy lens, never in parity_mode
     # (the incumbent has no stacking, so adding it would break the diff-test).
     use_pyramiding = bool(cfg.use_pyramiding) and not parity_mode
+    # Live-fidelity knobs — ALL force-disabled in parity_mode so the A-vs-B
+    # diff-test stays byte-exact. They only ever bite in the strategy lens.
+    _vix_sizing = bool(cfg.apply_vix_sizing) and not parity_mode
+    _earn_gate = bool(cfg.apply_earnings_gate) and not parity_mode
+    _real_comm = bool(cfg.use_realistic_commission) and not parity_mode
 
     if cfg.apply_mr_strategy:
         from . import strategy_momentum, strategy_mr
@@ -224,8 +229,32 @@ def simulate_v2(
     per_ticker = cache["per_ticker"]
     warm_up = _warm_up(cfg)
     max_hold = _max_hold_bars(cfg)
-    commission = cfg.commission_per_trade
     lookback = warm_up + 20
+
+    # Commission model. When _real_comm is off this returns the flat per-trade
+    # value byte-for-byte (so parity is preserved); when on it charges the
+    # moomoo per-ORDER schedule on each side: pct × notional + platform fee, plus
+    # sell-side regulatory bps. (Run the realistic lens without scale-out so each
+    # trade is one buy + one sell — partials would re-charge the buy fee.)
+    flat_commission = cfg.commission_per_trade
+
+    def _commission_for(qty: int, entry: float, exit_: float) -> float:
+        if not _real_comm:
+            return flat_commission
+        buy_amt, sell_amt = qty * entry, qty * exit_
+        buy = cfg.commission_pct_per_order * buy_amt + cfg.platform_fee_per_order
+        sell = (cfg.commission_pct_per_order * sell_amt + cfg.platform_fee_per_order
+                + cfg.sell_regulatory_bps / 10000.0 * sell_amt)
+        return round(buy + sell, 2)
+
+    # Historical earnings calendar (only when the gate is on). Best-effort; any
+    # symbol that fails to fetch just never gets earnings-blocked (like live).
+    earn_cal: dict[str, list] = {}
+    if _earn_gate:
+        from . import earnings as _earn
+        from datetime import date as _date
+        raw = _earn.load_earnings_calendar(list(per_ticker.keys()))
+        earn_cal = {s: [_date.fromisoformat(d) for d in ds] for s, ds in raw.items()}
 
     # ---------- chronological event stream (independent build) ----------
     events: list[tuple] = []
@@ -251,6 +280,7 @@ def simulate_v2(
     max_dd_mtm = 0.0
     peak_gross = 0.0          # peak Σ|position notional| in $
     n_skipped_cash = 0        # buys blocked/clipped to zero by the cash wall
+    n_earnings_blocked = 0    # new entries blocked by the earnings gate
 
     def slip_frac(price: float, atr: float) -> float:
         if price <= 0:
@@ -265,9 +295,10 @@ def simulate_v2(
         t.exit_price = round(exit_price, 2)
         t.exit_date = exit_date
         t.exit_reason = reason
-        t.pnl = round((t.exit_price - t.entry_price) * t.qty - commission, 2)
+        comm = _commission_for(t.qty, t.entry_price, t.exit_price)
+        t.pnl = round((t.exit_price - t.entry_price) * t.qty - comm, 2)
         t.pnl_pct = round((t.exit_price - t.entry_price) / t.entry_price * 100, 2)
-        cash += t.qty * t.exit_price - commission
+        cash += t.qty * t.exit_price - comm
         rdd.record(t.pnl)
         closed.append(t)
         if reason == "SL":
@@ -285,7 +316,7 @@ def simulate_v2(
         of truth for the strategy/sizing/fill logic — which is exactly why the
         new-entry path still matches the incumbent to the dollar after the
         refactor (proven by engine_compare's parity assertion)."""
-        nonlocal n_skipped_cash
+        nonlocal n_skipped_cash, n_earnings_blocked
         window = df.iloc[max(0, i + 1 - lookback): i + 1]
         try:
             sig = evaluate(sym, window)
@@ -330,6 +361,18 @@ def simulate_v2(
             except Exception:
                 pass
 
+        # Earnings gate (live earnings.earnings_block): block a NEW entry when an
+        # earnings report falls within `earnings_avoid_days` ahead of this bar.
+        # Replays the live forward-only rule bar-by-bar off the historical
+        # calendar. ETFs / fetch failures carry an empty list and so never block
+        # (same graceful degradation as live). Flag-gated + parity-suppressed.
+        if _earn_gate:
+            bar_d = df.index[i].date()
+            for e in earn_cal.get(sym.upper(), ()):
+                if 0 <= (e - bar_d).days <= cfg.earnings_avoid_days:
+                    n_earnings_blocked += 1
+                    return None
+
         # DD breaker (realized — same signal the incumbent gates on)
         qty_mult = 1.0
         if cfg.apply_dd_breaker:
@@ -346,6 +389,20 @@ def simulate_v2(
                 vix_now = 15.0
             if vix_now < cfg.regime_vix_calm:
                 qty_mult *= cfg.regime_bull_mult
+
+        # VIX risk-off sizing (live risk_manager.calc_position_size): halve the
+        # share count when VIX>25, quarter it when VIX>35. Neither engine modeled
+        # this, so backtests over-sized through fear regimes. Flag-gated +
+        # parity-suppressed; falls back to a calm VIX=15 if the column is missing.
+        if _vix_sizing:
+            try:
+                vix_rf = float(bar["vix"])
+            except (KeyError, TypeError, ValueError):
+                vix_rf = 15.0
+            if vix_rf > 35:
+                qty_mult *= 0.25
+            elif vix_rf > 25:
+                qty_mult *= 0.5
 
         # ---- fill model (independent copy) ----
         next_bar = df.iloc[i + 1]
@@ -374,7 +431,7 @@ def simulate_v2(
 
         # ---- THE cash wall (the honest constraint) ----
         if enforce_cash:
-            affordable = int((cash - commission) / max(entry_price, 1e-9))
+            affordable = int((cash - flat_commission) / max(entry_price, 1e-9))
             if affordable < qty:
                 if affordable <= 0:
                     n_skipped_cash += 1
@@ -559,7 +616,8 @@ def simulate_v2(
         open_pos.pop(sym, None)
 
     metrics = _metrics_v2(closed, cfg, start_capital, cash,
-                          max_dd_mtm, peak_gross, n_skipped_cash)
+                          max_dd_mtm, peak_gross, n_skipped_cash,
+                          n_earnings_blocked)
     log.info("[v2] done — %d trades, realized-DD=%.2f%%, MTM-DD=%.2f%%, "
              "final equity=$%.2f, ending cash=$%.2f",
              len(closed), rdd.dd_pct, max_dd_mtm, rdd.equity, cash)
@@ -588,7 +646,8 @@ def simulate_v2(
 #  needs are produced; Sharpe/Sortino/MonteCarlo are out of scope here.
 # ──────────────────────────────────────────────────────────────────────────
 def _metrics_v2(trades, cfg, start_capital, ending_cash,
-                max_dd_mtm, peak_gross, n_skipped_cash) -> dict:
+                max_dd_mtm, peak_gross, n_skipped_cash,
+                n_earnings_blocked=0) -> dict:
     if not trades:
         return {"total_trades": 0, "note": "no trades generated",
                 "net_pnl_usd": 0.0, "max_drawdown_pct": 0.0,
@@ -631,5 +690,6 @@ def _metrics_v2(trades, cfg, start_capital, ending_cash,
         "peak_gross_exposure_usd": round(peak_gross, 2),
         "peak_gross_exposure_pct": round(peak_gross / max(start_capital, 1e-9) * 100, 1),
         "n_cash_limited_entries": n_skipped_cash,
+        "n_earnings_blocked": n_earnings_blocked,
         "exit_reasons": reasons,
     }

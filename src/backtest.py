@@ -149,6 +149,18 @@ class BacktestConfig:
     use_regime_scaling: bool = False
     regime_bull_mult: float = 1.35      # qty × this in confirmed strong bull
     regime_vix_calm: float = 20.0       # VIX below this = calm enough to lever
+    # ── Live-fidelity knobs (2026-05-31) — close the backtest↔live gap ──
+    # All default OFF so parity_mode + engine_compare stay byte-exact (the frozen
+    # oracle never reads these; simulate_v2 force-disables them in parity_mode).
+    # Turn them ON only in the realistic enforce_cash lens for a closest-to-live
+    # read. None of them can perturb the A-vs-B diff-test.
+    apply_vix_sizing: bool = False        # VIX>25 → ½ size, VIX>35 → ¼ (live risk_manager)
+    apply_earnings_gate: bool = False     # block new entries within N days before earnings
+    earnings_avoid_days: int = 2          # live EARNINGS_AVOID_DAYS
+    use_realistic_commission: bool = False  # moomoo per-order fees instead of flat $1
+    commission_pct_per_order: float = 0.0003  # moomoo MY US: 0.03% × notional / order / side
+    platform_fee_per_order: float = 0.99      # moomoo MY US: $0.99 / order / side
+    sell_regulatory_bps: float = 0.5          # SEC+TAF+settlement ≈ bps of sell notional (sell only)
     # SL cooldown — block re-entry on a name we just stopped out of.
     # Defaults match the live risk_manager.SL_COOLDOWN_HOURS so backtest ≈ live.
     # Set to 0 to disable (matches pre-fix behaviour).
