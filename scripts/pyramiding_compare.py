@@ -1,7 +1,7 @@
 """pyramiding_compare — does LIVE-style stacking help a real $5k CASH account,
 or does it just concentrate the book and starve new names of cash?
 
-This is the strategy question behind the engine upgrade. simulate_v2 now models
+This is the strategy question behind the engine upgrade. simulate_v3 now models
 the live open_position add-on: a held name that RE-FIRES a qualifying buy while
 already ≥ STACK_MIN_R_MULTIPLE in unrealised profit (and with room under
 MAX_STACKS_PER_SYMBOL) gets an add-on merged in (weighted-avg entry; stop/TP
@@ -29,7 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
@@ -63,7 +63,7 @@ def stack_stats(trades):
 
 def row(label, days, tickers, cache, *, pyramiding):
     cfg = replace(base(days, tickers), use_pyramiding=pyramiding)
-    res = simulate_v2(cfg, cache, enforce_cash=True)
+    res = simulate_v3(cfg, cache, enforce_cash=True)
     m = res["metrics"]
     n_stacked, max_stk = stack_stats(res["trades"])
     return {"label": label, "trd": m.get("total_trades", 0),

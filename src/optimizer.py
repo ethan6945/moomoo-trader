@@ -33,7 +33,8 @@ from typing import Optional
 
 import optuna
 
-from .backtest import BacktestConfig, prefetch_data, simulate_with_cache
+from .backtest import (BacktestConfig, prefetch_data, simulate_with_cache,  # noqa: F401
+                       _run_live_engine)
 from .config import settings  # noqa: F401 (re-exported)
 
 # Suppress Optuna's experimental warnings — TPE is fine.
@@ -62,7 +63,15 @@ def _evaluate_params(
     from .metrics import compute_full_metrics
 
     cfg = replace(base_cfg, **params)
-    result = simulate_with_cache(cfg, cache)
+    # Phase 2c (2026-06-01): optimise on the HONEST cash-walled engine, not the
+    # leveraged oracle. _run_live_engine applies the real $5k cash wall + VIX
+    # sizing + earnings gate + MY commissions (enforce_cash=True), so the param
+    # optimum Optuna finds is the one that actually deploys on the account. The
+    # incumbent tp=6.0/sl=3.25 was tuned on simulate_with_cache, which can hold
+    # unlimited positions — a different, more aggressive optimum than a cash
+    # account wants. rich_metrics off: we only need the trade list for the
+    # per-fold Sortino below (skips the Monte-Carlo cost on every trial).
+    result = _run_live_engine(cfg, cache, rich_metrics=False)
     trades = result.get("trades", [])
     if not trades:
         return {"sortino_mean": -10.0, "n_trades": 0, "fold_sortinos": [],
@@ -84,7 +93,10 @@ def _evaluate_params(
             continue
         m = compute_full_metrics(fold, cfg.account_usd, max(cfg.days // n_folds, 30),
                                  n_sims=0)
-        fold_sortinos.append(m.get("sortino_ratio", 0.0))
+        # 2026-06-03: clamp the fold Sortino so a single thin/no-loss fold (which
+        # the metrics layer reports as the "downside-unmeasurable" sentinel) can't
+        # dominate the mean and let the optimizer overfit to a lucky window.
+        fold_sortinos.append(max(-10.0, min(m.get("sortino_ratio", 0.0), 8.0)))
 
     if not fold_sortinos:
         return {"sortino_mean": -10.0, "n_trades": n, "fold_sortinos": [],
@@ -106,7 +118,12 @@ def _make_objective(base_cfg: BacktestConfig, n_folds: int, min_trades: int, cac
         # Old bounds (tp 1-3 / sl 1.5-3.5) couldn't reach the actual optimum
         # of tp=6.0 / sl=3.25 — Optuna was searching the wrong neighbourhood.
         params = {
-            "threshold":       trial.suggest_int("threshold", 55, 72, step=1),
+            # 2026-06-01 (Phase 2c honest retune): widened the upper bound 72→80.
+            # The honest $5k cash wall makes SELECTIVITY more valuable than under
+            # the leveraged oracle — fewer, higher-conviction entries leave cash
+            # for the best signals instead of starving slots 3-5. Let Optuna reach
+            # a higher threshold if the cash-constrained optimum lives there.
+            "threshold":       trial.suggest_int("threshold", 55, 80, step=1),
             "tp_atr_mult":     trial.suggest_float("tp_atr_mult", 3.5, 8.0, step=0.5),
             "sl_atr_mult":     trial.suggest_float("sl_atr_mult", 2.5, 4.0, step=0.25),
             "max_gap_pct":     trial.suggest_float("max_gap_pct", 2.0, 5.0, step=0.5),
@@ -146,16 +163,23 @@ def run_study(
     tickers: Optional[list[str]] = None,
     timeframe: Optional[str] = None,
     fast_mode: bool = True,
+    apply_ml_gate: Optional[bool] = None,
+    apply_mr_strategy: Optional[bool] = None,
 ) -> dict:
     """Run the Optuna study.
 
     `fast_mode=True` disables the ML and mean-revert gates during the search.
-    Both add a lot of per-bar CPU but their thresholds are NOT optimised, so
-    they act as constant filters — leaving them on while exploring threshold
-    / ATR multiples just slows the search down without changing the ranking
-    of parameter combos. Re-enable them by re-running the backtest with the
-    chosen params + the live config.
+    ML is a pure veto, so leaving it off only widens the trade set without
+    changing the threshold/ATR ranking much. BUT the mean-revert + momentum
+    strategies are NOT pure filters — they ADD signals at different score
+    levels, so toggling them shifts the score distribution and therefore the
+    threshold optimum. To tune the engine production actually runs, pass the
+    two flags EXPLICITLY (they override the fast_mode-derived defaults):
+    production = `apply_ml_gate=True, apply_mr_strategy=False`. Leaving them
+    None preserves the legacy fast_mode behaviour (both = not fast_mode).
     """
+    ml_on = (not fast_mode) if apply_ml_gate is None else apply_ml_gate
+    mr_on = (not fast_mode) if apply_mr_strategy is None else apply_mr_strategy
     base_cfg = BacktestConfig(
         days=days,
         timeframe=timeframe or settings.timeframe,
@@ -165,9 +189,11 @@ def run_study(
         risk_per_trade=settings.risk_per_trade,
         max_position_pct=settings.max_position_pct,
         max_hold_days=settings.max_hold_days,
-        apply_ml_gate=not fast_mode,
-        apply_mr_strategy=not fast_mode,
+        apply_ml_gate=ml_on,
+        apply_mr_strategy=mr_on,
     )
+    log.info("[optuna] search engine fidelity: apply_ml_gate=%s apply_mr_strategy=%s "
+             "(production = True/False)", ml_on, mr_on)
 
     # Pre-fetch all kline data ONCE. Every trial after this is pure CPU
     # (no OpenD calls), making 25 trials take ~30s instead of ~2 hours.

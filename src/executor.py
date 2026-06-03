@@ -27,6 +27,12 @@ from .indicators import Signal
 from .moomoo_client import MoomooClient
 
 ORDER_TIMEOUT_MIN = 5    # cancel unfilled BUY orders after this many minutes
+# Protective exits (soft stop-loss, force-close, max-hold, stall-out) are
+# marketable limits — priced BELOW last so they fill even through a fast
+# gap-down. The old 0.5% (last×0.995) was too tight: in a gap the price blows
+# straight through it and the position is left unprotected. 3% gives fill
+# headroom while bounding worst-case slippage. (Bug fix 2026-06-03.)
+PROTECTIVE_EXIT_SLIP = 0.03
 
 
 def _business_days_between(start: datetime, end: datetime) -> int:
@@ -148,10 +154,11 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
         new_tp = max(float(existing.get("take_profit", 0)), signal.take_profit)
         stacks = int(existing.get("stacks", 1)) + 1
 
-        # On REAL, replace the OCO bracket so it covers the new combined qty.
+        # On REAL, replace the OCO bracket so it covers the new combined qty
+        # (only when broker brackets are in use — soft-exit mode skips this).
         stop_order_id = existing.get("stop_order_id")
         tp_order_id = existing.get("tp_order_id")
-        if settings.moomoo_trade_env == "REAL":
+        if settings.moomoo_trade_env == "REAL" and not settings.real_use_soft_exits:
             for oid in (stop_order_id, tp_order_id):
                 if oid:
                     try:
@@ -192,7 +199,10 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
                  new_total_qty, new_avg_entry, new_stop, new_tp)
     else:
         stop_order_id, tp_order_id = None, None
-        if settings.moomoo_trade_env == "REAL":
+        # REAL with a broker OCO bracket ONLY when soft-exits are off. When
+        # REAL_USE_SOFT_EXITS=true, REAL is managed exactly like SIMULATE
+        # (soft scale-out/trailing/stop) so live matches the honest backtest.
+        if settings.moomoo_trade_env == "REAL" and not settings.real_use_soft_exits:
             stop_order_id, tp_order_id = place_bracket(
                 client, signal.symbol, qty, signal.stop_loss, signal.take_profit
             )
@@ -200,8 +210,9 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
                 log.warning("Bracket incomplete for %s (stop=%s tp=%s) — soft tracking active as fallback",
                             signal.symbol, stop_order_id, tp_order_id)
         else:
-            log.info("SIMULATE: soft stop @ $%.2f & TP @ $%.2f tracked locally",
-                     signal.stop_loss, signal.take_profit)
+            mode = "REAL soft-exits" if settings.moomoo_trade_env == "REAL" else "SIMULATE"
+            log.info("%s: soft stop @ $%.2f & TP @ $%.2f tracked locally (scale-out enabled)",
+                     mode, signal.stop_loss, signal.take_profit)
 
         trade = {
             "symbol": signal.symbol,
@@ -239,7 +250,7 @@ def _close_and_log(symbol: str, trade: dict, qty: int, exit_price: float, reason
     """Record a close to risk_manager (state) + portfolio (R-multiple, MFE/MAE).
     Returns the realised pnl."""
     pnl = (exit_price - trade["entry_price"]) * qty
-    risk_manager.record_trade_close(pnl, account_usd=settings.account_usd)
+    risk_manager.record_trade_close(pnl, account_usd=risk_manager.budget_usd())
 
     entry = float(trade["entry_price"]) or 1e-9
     hw = float(trade.get("high_water") or trade["entry_price"])
@@ -316,8 +327,11 @@ def _check_bracket_fills(client: MoomooClient, symbol: str, trade: dict) -> dict
     if not (stop_id and tp_id):
         return None
 
-    stop_filled = client.is_order_filled(stop_id)
-    tp_filled = client.is_order_filled(tp_id)
+    # include_partial=True: a partially-filled leg counts as fired so we still
+    # cancel the opposite leg (avoids both legs filling → oversell). reconcile()
+    # re-syncs any residual qty on the next scan. (Bug fix 2026-06-03.)
+    stop_filled = client.is_order_filled(stop_id, include_partial=True)
+    tp_filled = client.is_order_filled(tp_id, include_partial=True)
 
     if stop_filled:
         if client.cancel_order(tp_id):
@@ -399,7 +413,7 @@ def _force_close(client: MoomooClient, symbol: str, trade: dict,
             except Exception as e:
                 log.warning("cancel %s %s failed: %s", symbol, key, e)
     try:
-        client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+        client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
     except Exception as e:
         log.warning("force-sell %s failed: %s", symbol, e)
     pnl = _close_and_log(symbol, trade, trade["qty"], last, reason)
@@ -458,7 +472,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
             for oid in (trade["stop_order_id"], trade["tp_order_id"]):
                 if oid:
                     client.cancel_order(oid)
-            client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+            client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
             pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
             actions.append({"type": "max_hold_bracket", "symbol": symbol,
                             "price": last, "qty": trade["qty"],
@@ -477,7 +491,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
 
     # Soft stop-loss check (SIMULATE, or REAL when bracket attach failed).
     if last <= trade["stop_loss"]:
-        client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+        client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
         pnl = _close_and_log(symbol, trade, trade["qty"], last, "SL")
         actions.append({"type": "stop_hit", "symbol": symbol, "price": last,
                         "qty": trade["qty"], "stop": trade["stop_loss"], "pnl": pnl})
@@ -500,7 +514,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
     opened = datetime.fromisoformat(trade["opened_at"])
     age_days = _business_days_between(opened, datetime.utcnow())
     if age_days >= _settings.max_hold_days:
-        client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+        client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
         pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
         actions.append({"type": "max_hold", "symbol": symbol, "price": last,
                         "qty": trade["qty"], "age_days": age_days, "pnl": pnl})
@@ -509,7 +523,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
 
     # --- partial profit-taking ---
     if _settings.use_scale_out:
-        # 3-tranche scale-out (USE_SCALE_OUT). Mirrors backtest_v2 exactly so the
+        # 3-tranche scale-out (USE_SCALE_OUT). Mirrors backtest_v3 exactly so the
         # SIMULATE PnL reproduces the cash-on backtest: bank 1/3 of the ORIGINAL
         # lot at +TP1_R, another 1/3 at +TP2_R (R = entry − initial stop), then let
         # the final ~1/3 RIDE the single take-profit / SL / max-hold. Deliberately
@@ -624,6 +638,13 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
                 trades.pop(symbol)
                 log.warning("Blacklist auto-close: %s @ $%.2f (pnl=%.2f)",
                             symbol, last, pnl)
+                # Feedback 铁律: force-closing a real position must be visible.
+                try:
+                    from . import notifier
+                    notifier.send(f"⛔ 黑名单平仓: {symbol} @ ${last:.2f} "
+                                  f"(已实现 ${pnl:+.0f}) — 该票已进黑名单")
+                except Exception:
+                    pass
             except Exception as e:
                 log.warning("blacklist auto-close %s failed: %s", symbol, e)
 
@@ -696,7 +717,7 @@ def manual_close(client: MoomooClient, symbol: str) -> dict:
             ok = client.cancel_order(oid)
             log.info("manual_close: cancel %s leg %s → %s", key, oid, ok)
 
-    client.place_limit_order(symbol, trade["qty"], last * 0.995, TrdSide.SELL)
+    client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
     pnl = _close_and_log(symbol, trade, trade["qty"], last, "MANUAL")
     trades.pop(symbol)
     _save_open_trades(trades)

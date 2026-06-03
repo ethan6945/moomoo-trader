@@ -88,6 +88,46 @@ def _drawdown_risk_multiplier() -> float:
 HALT_AUTO_RELEASE_DAYS = 7
 
 
+# ---- Dynamic capital ────────────────────────────────────────────────────────
+# 2026-06-03: sizing/risk/DD no longer anchor to the static .env ACCOUNT_USD.
+# They derive from the owner's allocated BUDGET (runtime db-state key
+# 'budget_usd' — GUI-editable, takes effect next scan, NO restart), capped by
+# the live account equity (so a large SIMULATE balance can't oversize, and a
+# drawn-down REAL account auto-sizes down). Falls back to .env ACCOUNT_USD when
+# the budget is unset. The backtest engine is untouched — it sizes off
+# cfg.account_usd via its own _position_size, so honest-engine numbers are
+# unchanged.
+_live_equity_cache: dict = {"value": None}
+
+
+def set_live_equity(value) -> None:
+    """main.py calls this once per scan with cash + open-position market value."""
+    try:
+        v = float(value)
+        _live_equity_cache["value"] = v if v > 0 else None
+    except (TypeError, ValueError):
+        _live_equity_cache["value"] = None
+
+
+def budget_usd() -> float:
+    """Owner's allocated capital. Runtime db-state 'budget_usd', else .env."""
+    try:
+        v = float(_load_state().get("budget_usd") or 0.0)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    return settings.account_usd
+
+
+def sizing_capital() -> float:
+    """Capital used for position sizing + the hard budget cap: the allocated
+    budget, never exceeding live account equity (when known)."""
+    b = budget_usd()
+    le = _live_equity_cache["value"]
+    return min(b, le) if le else b
+
+
 def current_drawdown_pct() -> float:
     """Account-level drawdown as a percent, computed from peak_equity in state.
 
@@ -99,7 +139,7 @@ def current_drawdown_pct() -> float:
     if peak <= 0:
         return 0.0
     realized = float(state.get("realized_pnl_total") or 0.0)
-    equity = settings.account_usd + realized
+    equity = budget_usd() + realized
     if equity >= peak:
         return 0.0
     return (peak - equity) / peak * 100
@@ -129,7 +169,7 @@ def _check_halt_auto_release(state: dict) -> tuple[float, bool]:
             # streak) still scale qty down — the DD halt is a hard stop, not
             # a soft brake.
             realized = float(state.get("realized_pnl_total") or 0.0)
-            new_peak = max(settings.account_usd + realized, 1.0)
+            new_peak = max(budget_usd() + realized, 1.0)
             def _apply(_s):
                 return {"peak_equity": new_peak, "halt_started_at": None}
             db.atomic_state(_apply)
@@ -139,6 +179,15 @@ def _check_halt_auto_release(state: dict) -> tuple[float, bool]:
                 state.get("peak_equity", 0),
                 new_peak,
             )
+            # Feedback 铁律: this resumes trading after a halt — notify the owner.
+            try:
+                from . import notifier
+                notifier.send(
+                    f"🔄 DD 熔断自动解除（已暂停 {HALT_AUTO_RELEASE_DAYS} 天）— "
+                    f"峰值重置为 ${new_peak:.0f}，恢复开新仓。"
+                )
+            except Exception:
+                pass
             return 0.0, True
     except (ValueError, TypeError) as e:
         log.debug("halt timer parse error: %s", e)
@@ -180,14 +229,17 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     except Exception as e:
         log.debug("adaptive_sizing skipped: %s", e)
         adaptive_mult = 1.0
-    risk_dollars = (settings.account_usd * settings.risk_per_trade
+    cap = sizing_capital()
+    # risk_per_trade is runtime-overridable (half-Kelly proposal, owner-approved).
+    from . import runtime_config
+    risk_dollars = (cap * runtime_config.risk_per_trade()
                     * dd_mult * dd_size_mult * adaptive_mult * conviction)
 
     stop_distance = signal.price - signal.stop_loss
     if stop_distance <= 0:
         return 0
     qty_by_risk = int(risk_dollars / stop_distance)
-    qty_by_cap = int(settings.account_usd * settings.max_position_pct / signal.price)
+    qty_by_cap = int(cap * settings.max_position_pct / signal.price)
     base = max(0, min(qty_by_risk, qty_by_cap))
     if base <= 0:
         return 0
@@ -365,8 +417,9 @@ def can_open_new(
     if not held.empty:
         invested = float((held["qty"].astype(float) * held["cost_price"].astype(float)).sum())
     committed = invested + pending_value
-    if committed + required_cash > settings.account_usd:
-        return False, (f"budget cap ${settings.account_usd:.0f} would be exceeded "
+    cap = sizing_capital()
+    if committed + required_cash > cap:
+        return False, (f"budget cap ${cap:.0f} would be exceeded "
                        f"(committed ${committed:.0f} + new ${required_cash:.0f})")
 
     drawdown = (state["starting_cash"] - current_cash) / state["starting_cash"] \
@@ -393,7 +446,7 @@ def record_trade_close(realized_pnl: float, account_usd: float | None = None) ->
         new_total = current.get("realized_pnl_total", 0.0) + realized_pnl
         # account_usd is needed to compute equity baseline. Fall back to
         # settings if caller didn't pass it.
-        base = account_usd if account_usd is not None else settings.account_usd
+        base = account_usd if account_usd is not None else budget_usd()
         current_equity = base + new_total
         peak = max(current.get("peak_equity", 0.0) or 0.0,
                    base,        # never report a peak below starting capital

@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
@@ -66,7 +66,7 @@ def base(days, tickers):
 
 def row(label, overrides, days, tickers, cache):
     cfg = replace(base(days, tickers), **overrides)
-    res = simulate_v2(cfg, cache, enforce_cash=True)
+    res = simulate_v3(cfg, cache, enforce_cash=True)
     m = res["metrics"]
     reasons: dict[str, int] = {}
     for t in res["trades"]:

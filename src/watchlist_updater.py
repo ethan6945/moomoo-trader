@@ -46,8 +46,13 @@ MIN_AVG_VOLUME = 5_000_000   # 5M shares/day average
 MIN_PRICE = 15.0             # avoid sub-$15 stocks (ATR too small in $)
 MIN_ATR_PCT = 1.5            # daily ATR must be >= 1.5% of price
 LOOKBACK_DAYS = 30           # how much history to pull for the screen
-TARGET_SIZE = 30             # final watchlist size
-TOP_FROM_SCREEN = TARGET_SIZE - len(ANCHORS)
+# Phase 2c: PINNED to the 10 anchors. Backtests on the honest cash engine showed
+# expanding to 15/25 names only diluted signal quality (the $5k cash wall locks at
+# ~2 positions). Capping TARGET_SIZE at the anchor count makes TOP_FROM_SCREEN = 0,
+# so a refresh re-writes the same 10 anchors instead of padding with screen tail.
+# To re-enable auto-expansion, bump TARGET_SIZE back to 30.
+TARGET_SIZE = len(ANCHORS)   # final watchlist size — pinned to anchors only
+TOP_FROM_SCREEN = max(0, TARGET_SIZE - len(ANCHORS))
 
 # Recent-performance filters — added after the 142-day backtest revealed that
 # 12 of 30 watchlist symbols had negative cumulative PnL (~$-750). The common

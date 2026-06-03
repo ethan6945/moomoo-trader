@@ -60,16 +60,15 @@ class Signal:
 
     @property
     def stop_loss(self) -> float:
-        # Read multiplier from settings so .env / Optuna results take effect
-        # without touching code. Import inline to avoid circular imports at
-        # module load time.
-        from .config import settings
-        return round(self.price - settings.sl_atr_mult * self.atr, 2)
+        # Runtime override (owner-approved optimizer) beats .env, no restart;
+        # falls back to the .env setting. Inline import avoids circular load.
+        from . import runtime_config
+        return round(self.price - runtime_config.sl_atr_mult() * self.atr, 2)
 
     @property
     def take_profit(self) -> float:
-        from .config import settings
-        return round(self.price + settings.tp_atr_mult * self.atr, 2)
+        from . import runtime_config
+        return round(self.price + runtime_config.tp_atr_mult() * self.atr, 2)
 
 
 # ---------- factor scorers ----------
@@ -201,6 +200,56 @@ def check_gap(df_daily: pd.DataFrame, max_gap_pct: float = 3.0) -> tuple[bool, s
     return True, f"gap {gap_pct:+.2f}% OK"
 
 
+def relative_strength(stock_daily: pd.DataFrame, bench_daily: pd.DataFrame,
+                      lookback: int = 20) -> tuple[float, str]:
+    """Relative strength = stock's N-day return minus benchmark's N-day return.
+
+    Phase 3-A new-alpha factor. Positive RS ⇒ the name is outperforming the
+    index over the window (classic momentum/RS edge). Both returns are computed
+    from DAILY closes so the value is identical in live and backtest regardless
+    of the intraday timeframe the rest of the funnel runs on.
+
+    Returns (rs_pct, note) in percentage points. Degrades gracefully: if either
+    series lacks `lookback + 1` bars we return (0.0, …) so the caller's
+    `rs >= rs_min` gate passes (never block on missing data — same policy as the
+    MTF / earnings gates).
+    """
+    def _ret(df: pd.DataFrame) -> float | None:
+        if df is None or len(df) < lookback + 1:
+            return None
+        c = df["close"]
+        past = float(c.iloc[-1 - lookback])
+        if past <= 0:
+            return None
+        return (float(c.iloc[-1]) / past - 1) * 100
+
+    s_ret = _ret(stock_daily)
+    b_ret = _ret(bench_daily)
+    if s_ret is None or b_ret is None:
+        return 0.0, "RS n/a — insufficient daily bars (pass)"
+    rs = s_ret - b_ret
+    return rs, f"RS {rs:+.1f}pp ({lookback}d: stock {s_ret:+.1f}% vs bench {b_ret:+.1f}%)"
+
+
+def sector_regime_bullish(etf_daily: pd.DataFrame, fast: int = 20,
+                          slow: int = 50) -> tuple[bool, str]:
+    """Fast sector-regime gate (Phase 3-B): EMA(fast) > EMA(slow) on a sector ETF.
+
+    For a semiconductor-heavy book, SOXX flips its short-vs-medium EMA cross far
+    sooner than SPY crosses its 200-day SMA, so this catches sector rolls the
+    slow market-regime gate misses. Returns (ok, note); insufficient bars ⇒
+    (True, …) so it never blocks on missing data.
+    """
+    if etf_daily is None or len(etf_daily) < slow + 5:
+        return True, f"sector-regime n/a — <{slow + 5} bars (pass)"
+    close = etf_daily["close"]
+    ef = float(ta.ema(close, length=fast).iloc[-1])
+    es = float(ta.ema(close, length=slow).iloc[-1])
+    if ef > es:
+        return True, f"EMA{fast}({ef:.2f}) > EMA{slow}({es:.2f}) — sector up"
+    return False, f"EMA{fast}({ef:.2f}) <= EMA{slow}({es:.2f}) — sector down, pause"
+
+
 def daily_trend_bullish(df_daily: pd.DataFrame) -> tuple[bool, str]:
     """Check daily-chart trend for MTF confirmation (called when TIMEFRAME=HOUR_1).
 
@@ -218,47 +267,6 @@ def daily_trend_bullish(df_daily: pd.DataFrame) -> tuple[bool, str]:
         note = "above" if price > e20 else "below"
         return True, f"DAILY EMA20({e20:.2f}) > EMA50({e50:.2f}), price {note} EMA20"
     return False, f"DAILY EMA20({e20:.2f}) < EMA50({e50:.2f}) — daily downtrend"
-
-
-def min30_trend_bullish(df_30m: pd.DataFrame) -> tuple[bool, str]:
-    """30-min direction filter for the MIN_10 intraday strategy.
-
-    Three conditions must all pass:
-      1. EMA9 > EMA21 (short-term trend up)
-      2. ADX >= 18 (enough trend strength — avoids choppy opens)
-      3. Price above rolling VWAP(20) (institutional side confirmed)
-
-    Returns (ok, reason). Called once per ticker per scan; if False the
-    10-min entry scoring is skipped entirely.
-    """
-    if len(df_30m) < 25:
-        return True, "30m: not enough bars — skipping MTF gate"
-
-    ema9 = ta.ema(df_30m["close"], length=9)
-    ema21 = ta.ema(df_30m["close"], length=21)
-    e9, e21 = float(ema9.iloc[-1]), float(ema21.iloc[-1])
-    price = float(df_30m["close"].iloc[-1])
-
-    adx_df = ta.adx(df_30m["high"], df_30m["low"], df_30m["close"], length=14)
-    adx = float(adx_df.iloc[-1, 0]) if adx_df is not None and not adx_df.empty else 0.0
-
-    vwap20 = _rolling_vwap(df_30m, length=20)
-    vwap_val = float(vwap20.iloc[-1]) if not pd.isna(vwap20.iloc[-1]) else price
-
-    ema_ok = e9 > e21
-    adx_ok = adx >= 18
-    vwap_ok = price >= vwap_val
-
-    if ema_ok and adx_ok and vwap_ok:
-        return True, f"30m OK: EMA9({e9:.2f})>EMA21({e21:.2f}), ADX={adx:.0f}, +VWAP"
-    reasons = []
-    if not ema_ok:
-        reasons.append(f"EMA9({e9:.2f})<EMA21({e21:.2f})")
-    if not adx_ok:
-        reasons.append(f"ADX={adx:.0f}<18 (chop)")
-    if not vwap_ok:
-        reasons.append(f"price({price:.2f})<VWAP({vwap_val:.2f})")
-    return False, "30m FAIL: " + ", ".join(reasons)
 
 
 # ---------- entrypoint ----------

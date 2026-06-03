@@ -168,7 +168,7 @@ cp .env.example .env
 
 ```bash
 # 方法 A：GUI（推荐）
-python gui.py
+python gui_qt.py
 
 # 方法 B：命令行单次扫描
 python -m src.main scan
@@ -438,8 +438,7 @@ moomoo-trader/
 │   └── optimizer/              # Optuna 结果
 ├── logs/                       # 运行日志（gitignored）
 │
-├── gui.py                      # Tkinter 控制台
-├── start-gui.command           # Mac 双击启动
+├── gui_qt.py                   # PyQt6 控制台
 ├── start-scheduler.command     # 命令行启动
 ├── requirements.txt
 ├── .env.example                # 配置模板

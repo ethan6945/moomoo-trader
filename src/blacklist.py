@@ -132,6 +132,20 @@ def get_blacklist() -> dict[str, BlacklistEntry]:
     return _load()
 
 
+def add(symbol: str, reason: str = "") -> str:
+    """Add a symbol to the blacklist (owner-approved path via approvals.py).
+    Idempotent — re-adding refreshes the reason + review timer."""
+    entries = _load()
+    sym = symbol.upper()
+    entries[sym] = BlacklistEntry(
+        symbol=sym, added_at=_now_iso(), last_review_at=_now_iso(),
+        reason=reason or "owner-approved",
+    )
+    _save(entries)
+    log.info("blacklist add: %s (%s)", sym, reason)
+    return f"{sym} added to blacklist"
+
+
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
@@ -246,23 +260,3 @@ def evaluate_all(notifier_send=None) -> dict:
     return summary
 
 
-def force_review(symbol: str) -> str:
-    """Manual override — force an immediate review of `symbol`. GUI uses this."""
-    entries = _load()
-    sym = symbol.upper()
-    if sym not in entries:
-        return f"{sym} not in blacklist"
-    entries[sym].last_review_at = "1970-01-01T00:00:00Z"  # force overdue
-    _save(entries)
-    return f"{sym} marked for immediate review"
-
-
-def manual_remove(symbol: str) -> str:
-    """Manual override — remove a symbol from the blacklist immediately."""
-    entries = _load()
-    sym = symbol.upper()
-    if sym not in entries:
-        return f"{sym} not in blacklist"
-    entries.pop(sym)
-    _save(entries)
-    return f"{sym} removed from blacklist"

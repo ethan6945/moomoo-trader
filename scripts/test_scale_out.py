@@ -8,7 +8,7 @@ Exercised through the REAL executor soft-management path with a fake broker:
   S2. at TP1 (<TP2) → bank 1/3 of the ORIGINAL lot, tp1_done set, qty -= 1/3.
   S3. through TP2 in one tick → bank 1/3 (TP1) then 1/3 (TP2) the same tick.
   S4. runner: once price reaches the single TP the remaining lot closes WHOLE
-      (reason TP) and the position is removed — matching backtest_v2.
+      (reason TP) and the position is removed — matching backtest_v3.
   S5. NO trailing under scale-out: get_kline (used only by the legacy trail) is
       never called on the scale-out path.
 

@@ -1,4 +1,4 @@
-"""Unit tests for the pyramiding / stacking mechanics in backtest_v2 (2026-05-31).
+"""Unit tests for the pyramiding / stacking mechanics in backtest_v3 (2026-05-31).
 
 These pin the PURE helpers that model the live `open_position` add-on, so a
 future edit can't silently change how a winner gets stacked:
@@ -17,7 +17,7 @@ future edit can't silently change how a winner gets stacked:
 
 The incumbent `simulate_time_stepped` is intentionally NOT touched here — it is
 the frozen oracle, and scripts/engine_compare.py is the standing diff-test that
-fails if it ever drifts. Pyramiding lives only in simulate_v2's strategy lens
+fails if it ever drifts. Pyramiding lives only in simulate_v3's strategy lens
 (use_pyramiding, off in parity_mode), so it can't perturb that parity check.
 
 Standalone (no pytest):  .venv/bin/python3 scripts/test_pyramiding.py
@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.backtest import Trade
-from src.backtest_v2 import _stack_gate, _merge_addon
+from src.backtest_v3 import _stack_gate, _merge_addon
 from src.config import settings
 
 _results: list[bool] = []

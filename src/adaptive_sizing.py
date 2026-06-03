@@ -68,14 +68,20 @@ def _daily_equity_returns(trades: list[dict]) -> list[float]:
             continue
         daily[d] += float(t.get("pnl", 0.0))
 
+    # Normalise PnL into a fractional daily return against the owner's current
+    # allocated budget (dynamic — was a hardcoded $4500). Lazy import avoids a
+    # circular dependency with risk_manager (which imports this module).
+    try:
+        from .risk_manager import budget_usd
+        base_capital = budget_usd() or 4500.0
+    except Exception:
+        base_capital = 4500.0
+
     equity = 1.0
     rets: list[float] = []
     last_equity = equity
     for d in sorted(daily.keys()):
-        # Translate PnL into a return on the running equity. We use a fixed
-        # nominal base so a +$50 day on a $4500 account always reads as the
-        # same fractional bump, independent of compounding.
-        ret = daily[d] / 4500.0   # approximate against typical account size
+        ret = daily[d] / base_capital
         equity *= (1 + ret)
         rets.append(ret)
         last_equity = equity

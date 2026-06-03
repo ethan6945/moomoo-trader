@@ -259,8 +259,15 @@ class MoomooClient:
             log.warning("get_order_status(%s) failed: %s", order_id, e)
             return ""
 
-    def is_order_filled(self, order_id: str) -> bool:
-        return self.get_order_status(order_id) == "FILLED_ALL"
+    def is_order_filled(self, order_id: str, include_partial: bool = False) -> bool:
+        """True if the order is fully filled. With include_partial=True, a
+        PARTIAL fill also counts as 'fired' — used by the OCO check so a
+        partially-filled bracket leg still cancels the opposite leg (preventing
+        double exposure); reconcile() then re-syncs any residual qty."""
+        st = self.get_order_status(order_id)
+        if include_partial:
+            return st in ("FILLED_ALL", "FILLED_PART")
+        return st == "FILLED_ALL"
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel a pending order. Returns True on success."""

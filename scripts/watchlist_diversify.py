@@ -7,11 +7,11 @@ if the semi cycle rolls over, all five draw down together. cash_frontier proved
 the .env is already near the cash-account optimum on $/day; this asks the OTHER
 question: can we keep most of the $/day while cutting single-sector tail risk?
 
-Each candidate is scored through simulate_v2(enforce_cash=True) on BOTH windows
+Each candidate is scored through simulate_v3(enforce_cash=True) on BOTH windows
 (real $5k cash, mark-to-market DD). We also break PnL down by sector and report
 the SEMIS SHARE of gross activity — the concentration we're trying to reduce.
 
-NOTE: simulate_v2 trades every ticker in the prefetched cache, so each candidate
+NOTE: simulate_v3 trades every ticker in the prefetched cache, so each candidate
 gets its OWN prefetch (network-heavy → candidates kept to a handful).
 
 Run:  .venv/bin/python3 scripts/watchlist_diversify.py
@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 from src.sector import get_sector
 
@@ -82,7 +82,7 @@ def run(days, name, tickers):
     cfg = base(days, tickers)
     cache = prefetch_data(cfg)
     got = sorted(cache["per_ticker"].keys())
-    res = simulate_v2(cfg, cache, enforce_cash=True)
+    res = simulate_v3(cfg, cache, enforce_cash=True)
     m = res["metrics"]
     by_sec, semis_share = sector_breakdown(res["trades"])
     return {"name": name, "tickers": got, "n_tickers": len(got),

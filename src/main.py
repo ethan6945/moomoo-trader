@@ -17,17 +17,16 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from moomoo import KLType
 
 from . import (
-    adaptive_sizing, ai_validator, audit, blacklist, clock, cron_state, db,
-    executor, history, indicators, kill_switch, notifier, portfolio,
-    regime as regime_mod, risk_manager, strategy_momentum, strategy_mr,
-    watchlist_updater,
+    adaptive_sizing, ai_validator, approvals, audit, blacklist, clock,
+    cron_state, db, executor, history, indicators, kill_switch, notifier,
+    portfolio, regime as regime_mod, risk_manager, runtime_config, self_improve,
+    self_review, strategy_momentum, strategy_mr, watchlist_updater,
 )
 from .config import settings
 from .earnings import earnings_block
 from .ml import predict as ml_predict
 from .moomoo_client import client
 from .reconcile import log_reconcile, reconcile
-from .sector import check_sector_exposure
 
 SPREAD_MAX_PCT = 0.5   # refuse entry if bid-ask spread > 0.5% of mid
 # Frames where the last K-line is still forming when we fetch — drop it
@@ -146,8 +145,8 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "cash": cash,
             "positions_count": len(real_held),
             "invested": invested,
-            "budget": settings.account_usd,
-            "budget_used_pct": round(invested / settings.account_usd * 100, 1) if settings.account_usd else 0,
+            "budget": risk_manager.budget_usd(),
+            "budget_used_pct": round(invested / risk_manager.budget_usd() * 100, 1) if risk_manager.budget_usd() else 0,
             "unrealized_pnl": unrealized,
             "realized_pnl_total": realized_total,
             "total_pnl": unrealized + realized_total,
@@ -162,7 +161,7 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "regime": regime.label,
             "regime_note": regime.note,
             "open_risk": round(portfolio.current_open_risk(), 2),
-            "heat_cap": round(settings.account_usd * portfolio.PORTFOLIO_HEAT_PCT, 2),
+            "heat_cap": round(risk_manager.budget_usd() * portfolio.PORTFOLIO_HEAT_PCT, 2),
             "trade_stats": portfolio.trade_stats(50),
             "skip_gates": audit.gate_summary(200),
             "last_scan_utc": clock.utc_now_corrected().isoformat(),
@@ -174,6 +173,8 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "clock": clock.status(),
             "per_position": per_pos,
             "realized_pnl_today": float(state.get("realized_pnl_today", 0.0)),
+            "budget_usd": risk_manager.budget_usd(),
+            "pending_approvals": approvals.list_pending(),
         }
         (settings.root / "data" / "account.json").write_text(
             json.dumps(snap, indent=2, default=str)
@@ -181,7 +182,7 @@ def _refresh_account_snapshot(c, vix: float | None = None,
         if full:
             history.append({
                 "invested": round(invested, 2),
-                "budget": settings.account_usd,
+                "budget": risk_manager.budget_usd(),
                 "unrealized_pnl": round(unrealized, 2),
                 "realized_pnl_total": round(realized_total, 2),
                 "total_pnl": round(unrealized + realized_total, 2),
@@ -231,6 +232,32 @@ def scan_once() -> None:
         except Exception as e:
             log.exception("account fetch failed: %s", e)
             return
+
+        # Dynamic capital: feed live equity (cash + open-position market value)
+        # to the risk manager so sizing/budget/DD derive from real account state,
+        # capped by the owner's allocated budget. No restart when budget changes.
+        try:
+            pos_mv = 0.0
+            if positions is not None and not positions.empty:
+                if "market_val" in positions.columns:
+                    pos_mv = float(positions["market_val"].astype(float).sum())
+                elif "qty" in positions.columns:
+                    px = (positions["nominal_price"] if "nominal_price" in positions.columns
+                          else positions.get("cost_price", 0))
+                    pos_mv = float((positions["qty"].astype(float) * px.astype(float)).sum())
+            risk_manager.set_live_equity(cash + pos_mv)
+        except Exception as e:
+            log.debug("set_live_equity failed (sizing falls back to budget): %s", e)
+
+        # Apply any owner-APPROVED suggestions (analyze→notify→approve→execute).
+        # Nothing here runs until the owner approved it in the GUI / via CLI —
+        # the feedback 铁律 choke point. Confirm what was applied.
+        try:
+            applied = approvals.apply_approved()
+            for a in applied:
+                notifier.send(f"✅ 已执行你批准的建议: {a.get('action', a.get('detail',''))}")
+        except Exception as e:
+            log.debug("apply_approved skipped: %s", e)
 
         # 2b. Reconcile broker vs internal records — catch drift before trading.
         try:
@@ -308,8 +335,8 @@ def scan_once() -> None:
                 "cash": cash,
                 "positions_count": len(real_held),
                 "invested": invested,
-                "budget": settings.account_usd,
-                "budget_used_pct": round(invested / settings.account_usd * 100, 1) if settings.account_usd else 0,
+                "budget": risk_manager.budget_usd(),
+                "budget_used_pct": round(invested / risk_manager.budget_usd() * 100, 1) if risk_manager.budget_usd() else 0,
                 "unrealized_pnl": unrealized,
                 "realized_pnl_total": realized_total,
                 "total_pnl": unrealized + realized_total,
@@ -324,7 +351,7 @@ def scan_once() -> None:
                 "regime": regime.label,
                 "regime_note": regime.note,
                 "open_risk": round(portfolio.current_open_risk(), 2),
-                "heat_cap": round(settings.account_usd * portfolio.PORTFOLIO_HEAT_PCT, 2),
+                "heat_cap": round(risk_manager.budget_usd() * portfolio.PORTFOLIO_HEAT_PCT, 2),
                 "trade_stats": portfolio.trade_stats(50),
                 "skip_gates": audit.gate_summary(200),
                 "last_scan_utc": clock.utc_now_corrected().isoformat(),
@@ -342,7 +369,7 @@ def scan_once() -> None:
             )
             history.append({
                 "invested": round(invested, 2),
-                "budget": settings.account_usd,
+                "budget": risk_manager.budget_usd(),
                 "unrealized_pnl": round(unrealized, 2),
                 "realized_pnl_total": round(realized_total, 2),
                 "total_pnl": round(unrealized + realized_total, 2),
@@ -367,7 +394,14 @@ def scan_once() -> None:
         # Without this buffer the bot scores ~60 for most US large-caps and
         # NEVER hits 70+, so top_5 = [] every scan → zero trades. This zone
         # is the same idea as the ML "neutral" band — try it, but small.
-        threshold_floor = settings.entry_threshold - 10
+        # Runtime-overridable (owner-approved optimizer); falls back to .env.
+        entry_thr = runtime_config.entry_threshold()
+        # 2026-06-03 live↔backtest parity: HARD threshold (no marginal sub-70
+        # band). The honest backtest uses a hard threshold and still generates
+        # ~105 trades/180d on trend+momentum, and the gate-ablation proved sub-70
+        # setups destroy returns (thr 65 = −$11/day). The old −10 marginal band
+        # was a trend-only-era workaround; momentum scoring clears 70 fine now.
+        threshold_floor = entry_thr
         # Refresh the blacklist before this scan's symbol loop. Cheap (file read).
         _bl_active = blacklist.get_blacklist()
         for sym in tickers:
@@ -459,12 +493,12 @@ def scan_once() -> None:
 
             # Stacking add-ons require the rule score to clear full threshold —
             # don't pyramid on a marginal setup, even if base setup was strong.
-            if is_stack_candidate and sig.score < settings.entry_threshold:
+            if is_stack_candidate and sig.score < entry_thr:
                 continue
 
             # "Marginal" = rule score in [threshold-10, threshold). These setups
             # still enter the funnel but get sized down via conviction.
-            marginal_setup = sig.score < settings.entry_threshold
+            marginal_setup = sig.score < entry_thr
             setup_conviction = 0.5 if marginal_setup else 1.0
 
             def _skip(gate: str, reason: str, _sig=sig) -> None:
@@ -500,14 +534,11 @@ def scan_once() -> None:
                     _skip("gap", gap_reason)
                     continue
 
-            # --- Sector / earnings / spread (cheap context veto) ---
-            sector_ok, sector_reason = check_sector_exposure(
-                sig.symbol, positions, pending_symbols
-            )
-            if not sector_ok:
-                _skip("sector", sector_reason)
-                continue
-
+            # --- Earnings / spread (cheap context veto) ---
+            # 2026-06-03: sector-exposure gate removed — structurally non-binding
+            # (MAX_PER_SECTOR=5 >= MAX_POSITIONS=5, so a sector can never exceed
+            # the total-position cap). check_sector_exposure() is kept in sector.py
+            # but no longer called here. SECTOR_MAP/get_sector still used elsewhere.
             ern_blocked, ern_reason = earnings_block(sig.symbol)
             if ern_blocked:
                 _skip("earnings", ern_reason)
@@ -551,9 +582,15 @@ def scan_once() -> None:
             log.info("%s rule=%.1f%s ai=%s conviction=%.2f (%s)",
                      sig.symbol, sig.score, ml_tag,
                      "pass" if ai_pass else "veto", conviction, ai_reason)
+            # 2026-06-03 live↔backtest parity: the backtest has no AI layer, so AI
+            # is ADVISORY by default (logged, shown in the card) and does NOT block
+            # — live trades then match the backtest the $/day figure is built on.
+            # Set AI_VETO_BLOCKING=true to restore hard blocking.
             if not ai_pass:
-                _skip("ai_veto", ai_reason)
-                continue
+                if settings.ai_veto_blocking:
+                    _skip("ai_veto", ai_reason)
+                    continue
+                ai_reason = f"[advisory veto, not blocking] {ai_reason}"
 
             # --- Risk / heat / sizing (all factor in conviction) ---
             ok, reason = risk_manager.can_open_new(
@@ -566,10 +603,10 @@ def scan_once() -> None:
 
             qty = risk_manager.calc_position_size(sig, vix=vix, conviction=conviction)
 
-            heat_ok, heat_reason = portfolio.heat_check(sig, qty)
-            if not heat_ok:
-                _skip("heat", heat_reason)
-                continue
+            # 2026-06-03: portfolio.heat_check gate removed — structurally
+            # non-binding (heat cap = 20% of account while per-trade risk is also
+            # a % of account, so both scale together and it never fires).
+            # portfolio.heat_check() is kept as the heat primitive but not called.
 
             try:
                 executor.open_position(c, sig, qty, ml_proba=ml_proba)
@@ -826,6 +863,33 @@ def _weekly_watchlist_refresh_job() -> None:
         notifier.send(f"⚠ Watchlist refresh failed: {e}")
 
 
+def _weekly_self_review_job() -> None:
+    """Sunday 23:00 ET — review the past week's REAL fills and emit suggestions
+    (analyze→notify→approve). Never changes live behavior on its own."""
+    log.info("weekly self-review: starting")
+    try:
+        report = self_review.run_and_notify(days=7)
+        log.info("weekly self-review done: %d trades, $%.2f/day, %d suggestions",
+                 report.get("n_trades", 0), report.get("per_day", 0.0),
+                 len(report.get("suggestions", [])))
+        # Evidence-based self-improvement proposals (half-Kelly risk + universe
+        # review) → approval queue. Suggest-only; owner approves.
+        try:
+            si = self_improve.run_all()
+            log.info("self-improve: kelly_proposed=%s universe_drops=%s",
+                     si.get("kelly_proposed"), si.get("universe_dropped_proposed"))
+        except Exception as e:
+            log.warning("self-improve proposals failed: %s", e)
+        approvals.purge_resolved()   # keep the approval queue bounded
+        cron_state.record_run("self_review")
+    except Exception as e:
+        log.exception("weekly self-review failed: %s", e)
+        try:
+            notifier.send(f"⚠ Weekly self-review failed: {e}")
+        except Exception:
+            pass
+
+
 def _run_catchup_on_startup() -> None:
     """Detect and run any scheduled jobs that were missed while the laptop was off.
 
@@ -847,15 +911,14 @@ def _run_catchup_on_startup() -> None:
         ("daily_blacklist",
          cron_state.expected_last_fire_daily(23, 0, weekdays_only=True),
          _daily_blacklist_review_job, "Daily blacklist review"),
-        ("watchlist_refresh",
-         cron_state.expected_last_fire_weekly(6, 22, 0),   # Sunday 22:00
-         _weekly_watchlist_refresh_job, "Weekly watchlist refresh"),
+        # watchlist_refresh + ml_retrain catch-up removed 2026-06-03 (see run_loop):
+        # both were silent-execution violations; now manual GUI actions only.
         ("weekly_backtest",
          cron_state.expected_last_fire_weekly(6, 22, 30),  # Sunday 22:30
          _weekly_backtest_validation_job, "Weekly backtest"),
-        ("ml_retrain",
-         cron_state.expected_last_fire_monthly(1, 2, 0),
-         _monthly_retrain_job, "Monthly ML retrain"),
+        ("self_review",
+         cron_state.expected_last_fire_weekly(6, 23, 0),   # Sunday 23:00
+         _weekly_self_review_job, "Weekly self-review"),
         ("monthly_optuna",
          cron_state.expected_last_fire_monthly(1, 3, 0),
          _monthly_optuna_job, "Monthly Optuna optimization"),
@@ -921,21 +984,27 @@ def run_loop() -> None:
         misfire_grace_time=60,
         max_instances=1,
     )
-    # Monthly ML retrain: 1st of each month at 02:00 ET (after data settles).
-    sched.add_job(_monthly_retrain_job, "cron", day=1, hour=2, minute=0,
-                  coalesce=True, misfire_grace_time=3600, max_instances=1)
-
-    # Weekly watchlist refresh: Sunday 22:00 ET — picks up board rotation
-    # before the new trading week starts.
-    sched.add_job(_weekly_watchlist_refresh_job, "cron",
-                  day_of_week="sun", hour=22, minute=0,
-                  coalesce=True, misfire_grace_time=3600, max_instances=1)
+    # 2026-06-03 DISABLED (feedback 铁律 — no silent execution):
+    #   • Monthly ML retrain silently OVERWROTE data/ml/model.joblib with no
+    #     quality/approval gate (and ran even with ML_ENABLED=false).
+    #   • Weekly watchlist refresh silently REWROTE config/watchlist.json,
+    #     able to swap out the pinned universe behind the owner's back.
+    # Both functions are kept and remain available as MANUAL, owner-initiated
+    # GUI actions (which is acceptable — the owner triggers them knowingly).
+    #   sched.add_job(_monthly_retrain_job, "cron", day=1, hour=2, minute=0, ...)
+    #   sched.add_job(_weekly_watchlist_refresh_job, "cron", day_of_week="sun", ...)
 
     # Weekly backtest validation: Sunday 22:30 ET — health-check the strategy
     # on a rolling 90-day window. Runs AFTER watchlist refresh so we evaluate
     # on the fresh ticker set.
     sched.add_job(_weekly_backtest_validation_job, "cron",
                   day_of_week="sun", hour=22, minute=30,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
+
+    # Weekly SELF-REVIEW of REAL fills: Sunday 23:00 ET. Reviews what the bot
+    # actually did (not a backtest), emits suggestions for owner approval.
+    sched.add_job(_weekly_self_review_job, "cron",
+                  day_of_week="sun", hour=23, minute=0,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
     # Monthly Optuna re-optimization: 1st of each month at 03:00 ET. Runs
@@ -952,9 +1021,9 @@ def run_loop() -> None:
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
     log.info(
-        "scheduler started — scan=%dm, ML retrain=1st@02:00, "
-        "watchlist refresh=Sun 22:00, weekly backtest=Sun 22:30, "
-        "monthly Optuna=1st@03:00, daily blacklist=23:00 ET",
+        "scheduler started — scan=%dm, weekly backtest=Sun 22:30, "
+        "monthly Optuna=1st@03:00, daily blacklist=23:00 ET "
+        "(ML retrain + watchlist refresh disabled — manual GUI only)",
         settings.scan_interval_min,
     )
     from .i18n import t
@@ -971,8 +1040,25 @@ def main() -> None:
         scan_once()
     elif cmd == "run":
         run_loop()
+    elif cmd == "review":
+        # On-demand weekly self-review (also the Sunday cron). analyze→notify.
+        _weekly_self_review_job()
+    elif cmd == "approvals":
+        # List pending owner-approval suggestions.
+        pend = approvals.list_pending()
+        if not pend:
+            print("No pending approvals.")
+        for a in pend:
+            print(f"[{a['id']}] {a['kind']}: {a.get('detail','')}\n"
+                  f"        → {a.get('action','')}")
+    elif cmd in ("approve", "reject") and len(sys.argv) >= 3:
+        ok = approvals.resolve(sys.argv[2], approved=(cmd == "approve"))
+        print(f"{cmd} {sys.argv[2]}: {'done — applies next scan' if ok else 'not found / already resolved'}"
+              if cmd == "approve" else
+              f"{cmd} {sys.argv[2]}: {'rejected' if ok else 'not found / already resolved'}")
     else:
         print(f"unknown command: {cmd}")
+        print("commands: scan | run | review | approvals | approve <id> | reject <id>")
         sys.exit(2)
 
 

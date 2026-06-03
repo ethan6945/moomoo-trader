@@ -1,9 +1,9 @@
 """engine_compare — the STANDING DIFFERENTIAL REGRESSION TEST for the unified
-engine. Runs the incumbent (frozen oracle) SIDE-BY-SIDE with backtest_v2 on
+engine. Runs the incumbent (frozen oracle) SIDE-BY-SIDE with backtest_v3 on
 identical data + config, prints where they agree / diverge, and HARD-FAILS
 (exit 1) if the mechanism-validation lens stops reproducing the oracle.
 
-The "two engines in one" idea: simulate_v2 has two lenses of the SAME code —
+The "two engines in one" idea: simulate_v3 has two lenses of the SAME code —
   • parity_mode=True  → mechanism validation. Sizes like the incumbent, no cash
                         wall, no pyramiding. MUST match the oracle to the dollar.
   • enforce_cash=True → strategy validation. Real $5k cash balance + MTM-DD (+
@@ -11,16 +11,16 @@ The "two engines in one" idea: simulate_v2 has two lenses of the SAME code —
 
 Three rows per (window × config):
   A · Active        = simulate_time_stepped  (the incumbent oracle; the GUI engine)
-  B · V2 parity     = simulate_v2(parity_mode=True) — independent mechanics that
+  B · V3 parity     = simulate_v3(parity_mode=True) — independent mechanics that
                       MUST reproduce A to the dollar AND to the trade. If it does,
                       neither engine hides a fill/exit/accounting bug. This is the
                       assertion that gates the whole file (PARITY PASS/FAIL).
-  C · V2 cash-on    = simulate_v2(enforce_cash=True) — adds a REAL cash balance:
+  C · V3 cash-on    = simulate_v3(enforce_cash=True) — adds a REAL cash balance:
                       a position can only be opened with cash on hand. The gap
                       C-vs-B is the implicit-leverage premium the incumbent bakes
                       in (it can hold ~2.5× notional on the $5k seed, cost-free).
 
-Also shows mark-to-market DD (V2 only) — the honest peak-to-trough including
+Also shows mark-to-market DD (V3 only) — the honest peak-to-trough including
 open losers, which the realized-PnL DD of the incumbent understates.
 
 Run:  .venv/bin/python3 scripts/engine_compare.py   (exit 0 = parity holds)
@@ -33,7 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data, simulate_with_cache
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
@@ -123,12 +123,12 @@ for days in [180, 360]:
     for cfg_name, ov in CONFIGS:
         cfg = replace(base(days), **ov)
         a = simulate_with_cache(cfg, cache)["metrics"]
-        b = simulate_v2(cfg, cache, parity_mode=True)["metrics"]   # mechanism lens
-        c = simulate_v2(cfg, cache, enforce_cash=True)["metrics"]  # strategy lens
+        b = simulate_v3(cfg, cache, parity_mode=True)["metrics"]   # mechanism lens
+        c = simulate_v3(cfg, cache, enforce_cash=True)["metrics"]  # strategy lens
         rows = [
             _row("A · Active",     a, days, is_active=True),
-            _row("B · V2 parity",  b, days, is_active=False),
-            _row("C · V2 cash-on", c, days, is_active=False),
+            _row("B · V3 parity",  b, days, is_active=False),
+            _row("C · V3 cash-on", c, days, is_active=False),
         ]
         show(rows, days, cfg_name)
 
@@ -139,7 +139,7 @@ for days in [180, 360]:
         net_gap = abs(b.get("net_pnl_usd", 0) - a.get("net_pnl_usd", 0))
         trd_gap = abs(b.get("total_trades", 0) - a.get("total_trades", 0))
         ok = net_gap <= 0.01 and trd_gap == 0
-        print(f"  PARITY {'PASS ✓' if ok else 'FAIL ✗'}: v2(parity_mode) vs incumbent"
+        print(f"  PARITY {'PASS ✓' if ok else 'FAIL ✗'}: v3(parity_mode) vs incumbent"
               f"  → net Δ ${net_gap:.2f}, trades Δ {trd_gap}")
         if not ok:
             _parity_failures.append((days, cfg_name, net_gap, trd_gap))
@@ -150,9 +150,9 @@ if _parity_failures:
     for d, n, ng, tg in _parity_failures:
         print(f"     {d}d · {n}: net Δ ${ng:.2f}, trades Δ {tg}")
     print("   The unified engine no longer reproduces the oracle. Investigate "
-          "fills/exits/accounting before trusting any v2 strategy number.")
+          "fills/exits/accounting before trusting any v3 strategy number.")
     sys.exit(1)
-print("✅ PARITY OK — v2(parity_mode) reproduces the incumbent to the dollar AND "
+print("✅ PARITY OK — v3(parity_mode) reproduces the incumbent to the dollar AND "
       "to the trade on every config × window.")
 print("   Mechanism validated: the cash-on / pyramiding numbers sit on a trustworthy engine.")
 print("\nDONE")

@@ -1,5 +1,5 @@
 {
-  "_comment": "2026-05-30 robustness-sweep update — top-10 only. 360-day backtest showed top-10 had Sortino 8.6 (vs 19's 7.85) AND lower DD 14.41% (vs 17.57%). Risk-adjusted edge per ticker, less noise from marginal names. The 9 dropped tickers (HPE, HPQ, FTNT, DELL, TSLA, NVDA, AAPL, GOOGL, MSFT) all underperformed in the sweep's per-symbol breakdown. watchlist_updater.py will refresh this on Sunday — verify ANCHORS list in updater is still top-10 aligned.",
+  "_comment": "Phase 2c: PINNED to the 10 winners. Expanding to 15/25 tested worse on the honest cash engine. watchlist_updater is capped at TARGET_SIZE=len(ANCHORS) so a refresh keeps these 10 only.",
   "tickers": [
     "SNDK",
     "MU",
@@ -13,15 +13,15 @@
     "MCHP"
   ],
   "notes": {
-    "SNDK": "180d: 80% WR, +$1350 — best name",
-    "MU": "180d: 70% WR, +$757",
-    "INTC": "180d: 67% WR, +$1338",
-    "LRCX": "180d: 73% WR, +$713",
-    "DDOG": "180d: 71% WR, +$110 — low freq but clean",
-    "AMD": "180d: 70% WR, +$94",
-    "WDC": "180d: 91% WR, +$1541 — highest WR",
-    "SWKS": "180d: 78% WR, +$62 — low freq",
-    "PANW": "180d: 65% WR, +$59",
-    "MCHP": "180d: 63% WR, +$43"
+    "SNDK": "anchor",
+    "MU": "anchor",
+    "INTC": "anchor",
+    "LRCX": "anchor",
+    "DDOG": "anchor",
+    "AMD": "anchor",
+    "WDC": "anchor",
+    "SWKS": "anchor",
+    "PANW": "anchor",
+    "MCHP": "anchor"
   }
 }

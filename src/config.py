@@ -31,6 +31,12 @@ class Settings:
 
     tavily_key: str = os.getenv("TAVILY_API_KEY", "")
 
+    # DeepSeek — autonomous optimizer (OpenAI-compatible API). Owner adds the
+    # key to .env later; blank = optimizer stays in rules-only suggest mode.
+    deepseek_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -96,6 +102,21 @@ class Settings:
     # current bull-skewed watchlist (cost ~$4/day vs trend+momentum only).
     # Disable by default. Set MR_ENABLED=true to re-enable for sideways regimes.
     mr_enabled: bool = os.getenv("MR_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    # Fidelity fix (2026-06-03): when REAL, use the SAME soft-managed exits as
+    # SIMULATE (scale-out + trailing + soft stop) instead of a broker OCO
+    # bracket. This closes the backtest↔live gap (the honest engine models
+    # scale-out, which the REAL bracket path didn't do). Tradeoff: no broker-side
+    # hard stop if the process dies (same as SIMULATE today). Default OFF —
+    # verify on a small REAL position before enabling.
+    real_use_soft_exits: bool = os.getenv("REAL_USE_SOFT_EXITS", "false").lower() in ("1", "true", "yes")
+
+    # Live↔backtest parity (2026-06-03): the honest backtest does NOT model the
+    # Gemini AI veto, so leaving it BLOCKING makes live take different trades than
+    # the backtest that the $/day figure is based on. Default False = AI runs as
+    # advisory (logged + shown in the buy card) but never blocks an entry, so the
+    # set of trades matches the backtest. Set true to let AI veto block again.
+    ai_veto_blocking: bool = os.getenv("AI_VETO_BLOCKING", "false").lower() in ("1", "true", "yes")
 
     root: Path = ROOT
 

@@ -15,7 +15,7 @@ The live .env is ALREADY heavily tuned (tp=8.0, sl=3.5, hold=7, rpt=0.05,
 mpp=0.50), so the honest expectation is small/no headroom — this run is diligence
 to confirm we're near the cash-account optimum, not a promise of a big win.
 
-Every row is scored through simulate_v2(enforce_cash=True): a real $5k cash
+Every row is scored through simulate_v3(enforce_cash=True): a real $5k cash
 balance + mark-to-market DD, so $/day is what a live cash account would live.
 A variant only WINS if it beats baseline $/day on BOTH windows with MTM-DD under
 the 18% halt on BOTH.
@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
@@ -89,7 +89,7 @@ VARIANTS = [
 
 
 def run(cfg, name, cache):
-    m = simulate_v2(cfg, cache, enforce_cash=True)["metrics"]
+    m = simulate_v3(cfg, cache, enforce_cash=True)["metrics"]
     return {"name": name, "trd": m.get("total_trades", 0),
             "wr": m.get("win_rate_pct", 0), "pf": m.get("profit_factor", 0),
             "net": m.get("net_pnl_usd", 0), "daily": m.get("daily_pnl_usd", 0),

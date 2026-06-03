@@ -1,4 +1,4 @@
-"""backtest_v2 — an independent, conservative re-implementation of the portfolio
+"""backtest_v3 — an independent, conservative re-implementation of the portfolio
 backtest, built SIDE-BY-SIDE with `simulate_time_stepped` for cross-validation.
 
 WHY A SECOND ENGINE
@@ -30,23 +30,23 @@ TWO HONESTY UPGRADES the incumbent lacks — each catches a specific inflation:
      every position off the *static* $5,000 seed and never checks whether the
      cash to buy the shares exists — so with max_position_pct=0.50 and the
      5-slot cap it can hold up to 5 × $2,500 = $12,500 of stock on a $5,000
-     account (~2.5× implicit, cost-free leverage). V2 debits/credits a real
+     account (~2.5× implicit, cost-free leverage). V3 debits/credits a real
      cash balance and (when enforce_cash) refuses/clips buys it can't fund.
      The B-vs-C gap in engine_compare = the implicit-leverage premium baked
      into the headline.
   2. MARK-TO-MARKET DRAWDOWN. The incumbent measures DD off *realized* PnL
      only, so an open losing position is invisible to the DD curve until it
-     closes — understating max-DD. V2 marks every open position to each bar's
+     closes — understating max-DD. V3 marks every open position to each bar's
      close, so `max_dd_mtm_pct` is the honest peak-to-trough an account
      actually lives through.
 
-GATING PARITY. So that V2(cash off) lines up with the incumbent trade-for-trade,
+GATING PARITY. So that V3(cash off) lines up with the incumbent trade-for-trade,
 the *entry gates* (threshold, MTF, gap, regime, ML, SL-cooldown, max-positions,
 and the realized-DD halt/size-cut) are replicated exactly. Only the cash
 constraint and the MTM-DD reporting are new. That makes the comparison clean:
   A  = simulate_time_stepped(cfg, cache)            # incumbent
-  B  = simulate_v2(cfg, cache, enforce_cash=False)  # independent mechanics → ≈ A
-  C  = simulate_v2(cfg, cache, enforce_cash=True)   # honest, deleveraged result
+  B  = simulate_v3(cfg, cache, enforce_cash=False)  # independent mechanics → ≈ A
+  C  = simulate_v3(cfg, cache, enforce_cash=True)   # honest, deleveraged result
 
 Run it via `scripts/engine_compare.py`.
 """
@@ -74,7 +74,7 @@ log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Independent realized-DD breaker (mirrors PortfolioState's halt logic, but
-#  re-implemented here so V2 shares no accounting code with the incumbent).
+#  re-implemented here so V3 shares no accounting code with the incumbent).
 # ──────────────────────────────────────────────────────────────────────────
 class _RealizedDD:
     """Tracks realized-PnL equity, its high-water peak, and a halt timer with
@@ -168,17 +168,18 @@ def _merge_addon(pos, s_entry, s_stop, s_tp, s_qty, s_atr) -> float:
 # ──────────────────────────────────────────────────────────────────────────
 #  The engine
 # ──────────────────────────────────────────────────────────────────────────
-def simulate_v2(
+def simulate_v3(
     cfg: BacktestConfig,
     cache: dict,
     *,
     enforce_cash: bool = True,
     parity_mode: bool = False,
+    rich_metrics: bool = False,
     progress_cb=None,
 ) -> dict:
     """Independent portfolio backtest. Same return shape as
     `simulate_time_stepped` (config / metrics / trades / errors / generated_at)
-    plus extra V2-only fields under metrics: max_dd_mtm_pct, final_equity_mtm,
+    plus extra V3-only fields under metrics: max_dd_mtm_pct, final_equity_mtm,
     ending_cash, peak_gross_exposure_usd, peak_gross_exposure_pct, n_skipped_cash.
 
     enforce_cash:
@@ -189,13 +190,14 @@ def simulate_v2(
 
     parity_mode:
       The named "mechanism-validation" configuration. Forces enforce_cash=False
-      AND pyramiding off, so simulate_v2 reproduces the incumbent engine
+      AND pyramiding off, so simulate_v3 reproduces the incumbent engine
       trade-for-trade and dollar-for-dollar (verified by scripts/engine_compare).
       Use this for the differential regression test; use enforce_cash=True
       (parity_mode off) for the honest strategy result. The two modes are the
       "two engines in one": same code, mechanism-check vs strategy-check.
     """
-    from .indicators import check_gap, daily_trend_bullish, evaluate
+    from .indicators import (check_gap, daily_trend_bullish, evaluate,
+                             relative_strength, sector_regime_bullish)
     from . import regime as regime_mod
     from .config import settings as _settings
 
@@ -212,8 +214,19 @@ def simulate_v2(
     _vix_sizing = bool(cfg.apply_vix_sizing) and not parity_mode
     _earn_gate = bool(cfg.apply_earnings_gate) and not parity_mode
     _real_comm = bool(cfg.use_realistic_commission) and not parity_mode
+    # Phase 3 entry gates — parity-suppressed like the other live-fidelity knobs
+    # so the A-vs-B diff-test stays byte-exact; they only bite in the strategy lens.
+    _rs_gate = bool(cfg.apply_rs_gate) and not parity_mode
+    _sector_regime = bool(cfg.apply_sector_regime_gate) and not parity_mode
+    _ml_conviction = bool(cfg.apply_ml_conviction_sizing) and not parity_mode
+    # Fidelity fix 2026-06-03: live (main.py) ALWAYS scores trend + momentum_break
+    # and takes the max; the honest engine previously only ran momentum when
+    # apply_mr_strategy was on, so the production run (MR off) was trend-only and
+    # did NOT represent the live bot. Decoupled: momentum has its own flag, set
+    # True by _run_live_engine, parity-suppressed so the diff-test stays exact.
+    _momentum = bool(cfg.apply_momentum_strategy) and not parity_mode
 
-    if cfg.apply_mr_strategy:
+    if cfg.apply_mr_strategy or _momentum:
         from . import strategy_momentum, strategy_mr
 
     ml_pred = None
@@ -226,6 +239,7 @@ def simulate_v2(
             ml_pred = None
 
     spy_daily = cache["spy_daily"]
+    soxx_daily = cache.get("soxx_daily")
     per_ticker = cache["per_ticker"]
     warm_up = _warm_up(cfg)
     max_hold = _max_hold_bars(cfg)
@@ -263,7 +277,7 @@ def simulate_v2(
         for i in range(warm_up, len(df) - 1):
             events.append((df.index[i], sym, i))
     events.sort(key=lambda x: x[0])
-    log.info("[v2] event stream: %d bars across %d tickers (enforce_cash=%s)",
+    log.info("[v3] event stream: %d bars across %d tickers (enforce_cash=%s)",
              len(events), len(per_ticker), enforce_cash)
 
     # ---------- account state ----------
@@ -281,6 +295,9 @@ def simulate_v2(
     peak_gross = 0.0          # peak Σ|position notional| in $
     n_skipped_cash = 0        # buys blocked/clipped to zero by the cash wall
     n_earnings_blocked = 0    # new entries blocked by the earnings gate
+    n_rs_blocked = 0          # new entries blocked by the Phase 3-A RS gate
+    n_sector_blocked = 0      # new entries blocked by the Phase 3-B sector-regime gate
+    n_ml_halved = 0           # entries half-sized by ML conviction (Phase 4-2)
 
     def slip_frac(price: float, atr: float) -> float:
         if price <= 0:
@@ -316,14 +333,19 @@ def simulate_v2(
         of truth for the strategy/sizing/fill logic — which is exactly why the
         new-entry path still matches the incumbent to the dollar after the
         refactor (proven by engine_compare's parity assertion)."""
-        nonlocal n_skipped_cash, n_earnings_blocked
+        nonlocal n_skipped_cash, n_earnings_blocked, n_rs_blocked, n_sector_blocked, n_ml_halved
         window = df.iloc[max(0, i + 1 - lookback): i + 1]
         try:
             sig = evaluate(sym, window)
+            # Mirror the live funnel: trend + momentum_break always (when the
+            # momentum flag is on); mean-revert only when separately enabled.
+            cands = [sig]
+            if _momentum:
+                cands.append(strategy_momentum.evaluate(sym, window))
             if cfg.apply_mr_strategy:
-                sig_mr = strategy_mr.evaluate(sym, window)
-                sig_mom = strategy_momentum.evaluate(sym, window)
-                sig = max([sig, sig_mr, sig_mom], key=lambda s: s.score)
+                cands.append(strategy_mr.evaluate(sym, window))
+            if len(cands) > 1:
+                sig = max(cands, key=lambda s: s.score)
         except Exception:
             return None
         if sig.score < cfg.threshold or sig.atr <= 0:
@@ -352,14 +374,36 @@ def simulate_v2(
                 if cfg.apply_regime_gate and regime.block_new_entries:
                     return None
 
-        # ML veto
+        # Phase 3-A: relative-strength gate — only let in names beating SPY over
+        # the lookback. Uses DAILY closes for both (parity with live). Missing
+        # bars ⇒ rs=0.0 which passes when rs_min_pct<=0 (graceful, like live).
+        if _rs_gate and spy_daily is not None and not spy_daily.empty \
+                and daily_df is not None and not daily_df.empty:
+            st = daily_df.loc[daily_df.index <= df.index[i]].tail(cfg.rs_lookback_days + 5)
+            sp = spy_daily.loc[spy_daily.index <= df.index[i]].tail(cfg.rs_lookback_days + 5)
+            rs, _ = relative_strength(st, sp, cfg.rs_lookback_days)
+            if rs < cfg.rs_min_pct:
+                n_rs_blocked += 1
+                return None
+
+        # Phase 3-B: fast sector-regime gate — pause new entries when SOXX EMA
+        # fast <= slow (semiconductor roll, caught sooner than SPY-200MA).
+        if _sector_regime and soxx_daily is not None and not soxx_daily.empty:
+            sx = soxx_daily.loc[soxx_daily.index <= df.index[i]].tail(cfg.sector_regime_slow + 10)
+            ok, _ = sector_regime_bullish(sx, cfg.sector_regime_fast, cfg.sector_regime_slow)
+            if not ok:
+                n_sector_blocked += 1
+                return None
+
+        # ML veto (+ optional conviction sizing, mirroring live main.py)
+        ml_proba = None
         if ml_pred is not None:
             try:
-                proba = ml_pred.predict_proba(window, symbol=sym)
-                if proba is not None and proba < ml_pred.ML_VETO_THRESHOLD:
+                ml_proba = ml_pred.predict_proba(window, symbol=sym)
+                if ml_proba is not None and ml_proba < ml_pred.ML_VETO_THRESHOLD:
                     return None
             except Exception:
-                pass
+                ml_proba = None
 
         # Earnings gate (live earnings.earnings_block): block a NEW entry when an
         # earnings report falls within `earnings_avoid_days` ahead of this bar.
@@ -380,6 +424,14 @@ def simulate_v2(
                 return None
             if rdd.dd_pct >= cfg.dd_size_cut_pct:
                 qty_mult = 0.5
+
+        # ML conviction sizing (mirrors live main.py:534): a passing-but-low-conviction
+        # proba (>= veto, < ML_BOOST_THRESHOLD) halves the position. Flag-gated +
+        # parity-suppressed. This is the live behaviour the veto-only ablation missed.
+        if _ml_conviction and ml_proba is not None \
+                and ml_proba < ml_pred.ML_BOOST_THRESHOLD:
+            qty_mult *= 0.5
+            n_ml_halved += 1
 
         # regime-scaled sizing
         if cfg.use_regime_scaling and regime is not None and regime.bullish:
@@ -615,10 +667,23 @@ def simulate_v2(
                    str(df.index[-1].date()), df.index[-1])
         open_pos.pop(sym, None)
 
-    metrics = _metrics_v2(closed, cfg, start_capital, cash,
+    metrics = _metrics_v3(closed, cfg, start_capital, cash,
                           max_dd_mtm, peak_gross, n_skipped_cash,
-                          n_earnings_blocked)
-    log.info("[v2] done — %d trades, realized-DD=%.2f%%, MTM-DD=%.2f%%, "
+                          n_earnings_blocked, n_rs_blocked, n_sector_blocked,
+                          n_ml_halved)
+    # rich_metrics: the production path (run_backtest → GUI panel + weekly Telegram
+    # self-check) needs the full report shape the oracle emits — Sharpe/Sortino/
+    # Calmar/MonteCarlo/by_symbol/monthly_pnl/avg_win_pct/max_drawdown_usd. We reuse
+    # the oracle's compute_metrics over our OWN closed trades, then let V3's honest
+    # keys win the merge (net_pnl, max_dd_mtm_pct, n_cash_limited_entries, …). The
+    # diff-test scripts never pass rich_metrics, so _metrics_v3 stays the lean,
+    # independent source that engine_compare validates byte-for-byte.
+    if rich_metrics and closed:
+        from .backtest import compute_metrics
+        rich = compute_metrics(closed, cfg)
+        rich.update(metrics)          # V3's authoritative keys override the oracle's
+        metrics = rich
+    log.info("[v3] done — %d trades, realized-DD=%.2f%%, MTM-DD=%.2f%%, "
              "final equity=$%.2f, ending cash=$%.2f",
              len(closed), rdd.dd_pct, max_dd_mtm, rdd.equity, cash)
     return {
@@ -626,7 +691,7 @@ def simulate_v2(
             "days": cfg.days, "timeframe": cfg.timeframe,
             "threshold": cfg.threshold, "tickers": list(per_ticker.keys()),
             "account_usd": cfg.account_usd,
-            "simulator": f"v2_cash{'_on' if enforce_cash else '_off'}"
+            "simulator": f"v3_cash{'_on' if enforce_cash else '_off'}"
                          f"{'_parity' if parity_mode else ''}"
                          f"{'_pyr' if use_pyramiding else ''}",
             "enforce_cash": enforce_cash,
@@ -645,9 +710,10 @@ def simulate_v2(
 #  one engine can't silently mask a divergence. Only the fields the side-by-side
 #  needs are produced; Sharpe/Sortino/MonteCarlo are out of scope here.
 # ──────────────────────────────────────────────────────────────────────────
-def _metrics_v2(trades, cfg, start_capital, ending_cash,
+def _metrics_v3(trades, cfg, start_capital, ending_cash,
                 max_dd_mtm, peak_gross, n_skipped_cash,
-                n_earnings_blocked=0) -> dict:
+                n_earnings_blocked=0, n_rs_blocked=0, n_sector_blocked=0,
+                n_ml_halved=0) -> dict:
     if not trades:
         return {"total_trades": 0, "note": "no trades generated",
                 "net_pnl_usd": 0.0, "max_drawdown_pct": 0.0,
@@ -691,5 +757,8 @@ def _metrics_v2(trades, cfg, start_capital, ending_cash,
         "peak_gross_exposure_pct": round(peak_gross / max(start_capital, 1e-9) * 100, 1),
         "n_cash_limited_entries": n_skipped_cash,
         "n_earnings_blocked": n_earnings_blocked,
+        "n_rs_blocked": n_rs_blocked,
+        "n_sector_regime_blocked": n_sector_blocked,
+        "n_ml_conviction_halved": n_ml_halved,
         "exit_reasons": reasons,
     }

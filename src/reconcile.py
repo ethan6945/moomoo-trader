@@ -92,12 +92,18 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True) -> dict:
                 log.warning("Reconcile orphan %s has zero cost_price — skipping auto-add",
                             sym)
                 continue
+            # ATR-derived stop/TP using the bot's LIVE exit multipliers (was a
+            # hardcoded -3.5%/+7%). atr_proxy = 2% of price (typical for these
+            # names); stop/TP then match how the bot actually exits, so an
+            # adopted orphan is managed consistently with a bot-opened position.
+            from . import runtime_config
+            atr_proxy = cost * 0.02
             our_trades[sym] = {
                 "symbol": sym, "qty": o["broker_qty"],
                 "entry_price": cost,
-                "stop_loss": round(cost * 0.965, 2),     # -3.5%
-                "take_profit": round(cost * 1.07, 2),    # +7%
-                "atr": cost * 0.02,
+                "stop_loss": round(cost - runtime_config.sl_atr_mult() * atr_proxy, 2),
+                "take_profit": round(cost + runtime_config.tp_atr_mult() * atr_proxy, 2),
+                "atr": atr_proxy,
                 "half_closed": False,
                 "buy_order_id": None, "stop_order_id": None, "tp_order_id": None,
                 "opened_at": now_iso,

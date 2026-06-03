@@ -352,7 +352,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "好处:不管股价高低、波动大小,'1R' 永远等于'当初愿意亏的那一份',\n"
                 "规则在不同股票之间可比 (R-Multiple 同理)。"
             ),
-            "where": "src/backtest_v2.py: r_unit = cfg.sl_atr_mult × atr0;实盘 executor 同公式",
+            "where": "src/backtest_v3.py: r_unit = cfg.sl_atr_mult × atr0;实盘 executor 同公式",
             "value": "1R = 3.5 × ATR (SL_ATR_MULT=3.5)",
         },
         "SL_ATR_MULT / TP_ATR_MULT": {
@@ -367,7 +367,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "宽 SL + 很宽 TP = 用'低胜率'换'大盈亏比'的趋势打法。\n"
                 "2026-05 sweep:更宽的 SL/TP 反而 +$5/天,因为减少了假止损。"
             ),
-            "where": ".env: SL_ATR_MULT, TP_ATR_MULT;src/backtest_v2.py 出场解析",
+            "where": ".env: SL_ATR_MULT, TP_ATR_MULT;src/backtest_v3.py 出场解析",
             "value": "SL 3.5 / TP 8.0 ATR",
         },
         "Scale-out — 分批止盈 (3 档)": {
@@ -402,7 +402,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "  '现金受限入场' 暴增 → 加仓把新机会需要的现金吃光了。\n"
                 "所以 use_pyramiding 默认 OFF,实盘没开 (只是建模出来供回测对比)。"
             ),
-            "where": ".env: USE_PYRAMIDING (默认 false);src/backtest_v2.py: _stack_gate / "
+            "where": ".env: USE_PYRAMIDING (默认 false);src/backtest_v3.py: _stack_gate / "
                      "_merge_addon;实盘 src/executor.py: open_position",
             "value": "OFF · 上限 5 层/票 · 门槛 +0.5R",
         },
@@ -415,7 +415,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "回测引擎里有这个开关,但当前 .env 没开 (USE_BREAKEVEN_STOP 默认 false)。\n"
                 "可以在 sweep 里试;默认关是为了和实盘行为保持一致。"
             ),
-            "where": "src/backtest_v2.py / backtest.py: use_breakeven_stop, breakeven_trigger_r",
+            "where": "src/backtest_v3.py / backtest.py: use_breakeven_stop, breakeven_trigger_r",
             "value": "OFF (触发 = +1R)",
         },
         "吊灯移动止损 (Chandelier Trail)": {
@@ -429,7 +429,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "的 runner 是'固定止盈不移动'。实盘打开 scale-out 后,正是用固定止盈\n"
                 "取代了移动止损,避免被正常回调噪音甩下车。"
             ),
-            "where": "src/backtest_v2.py: trail_active, trail_atr_mult, trail_activate_r",
+            "where": "src/backtest_v3.py: trail_active, trail_atr_mult, trail_activate_r",
             "value": "OFF (trail 3×ATR, 启动 +1R)",
         },
         "MAX_HOLD_DAYS — 最长持有": {
@@ -441,7 +441,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "用意:这是短线 swing 策略,不让资金被一只走平的票长期占住名额。\n"
                 "executor 现在按 business days 计,和回测口径一致。"
             ),
-            "where": ".env: MAX_HOLD_DAYS;src/backtest_v2.py 出场解析",
+            "where": ".env: MAX_HOLD_DAYS;src/backtest_v3.py 出场解析",
             "value": "7 交易日",
         },
     },
@@ -775,44 +775,44 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
 
     # ===================================================================
     "🔬 双引擎回测 Dual-Engine & 现金诚实度": {
-        "两个引擎 (Oracle vs V2)": {
+        "两个引擎 (Oracle vs V3)": {
             "name": "Two Backtest Engines (Differential Testing)",
             "summary": "两套独立写的回测引擎互相对账,防止单一实现里的隐藏 bug",
             "explain": (
                 "回测结论要敢拿来调实盘参数,就不能只信一套代码。所以有两个引擎:\n\n"
                 "  • Oracle  simulate_time_stepped (src/backtest.py)\n"
                 "            — 冻结的'标准答案',GUI 跑的就是它\n"
-                "  • V2      simulate_v2 (src/backtest_v2.py)\n"
+                "  • V3      simulate_v3 (src/backtest_v3.py)\n"
                 "            — 完全独立重写的第二实现\n\n"
-                "差分测试 (differential testing):让 V2 在'机制验证'模式下逐笔、\n"
+                "差分测试 (differential testing):让 V3 在'机制验证'模式下逐笔、\n"
                 "逐美元复现 Oracle。两套独立代码同时算错同一个数的概率极低,\n"
                 "所以一旦对得上,就对结果有信心。\n\n"
                 "scripts/engine_compare.py 是常驻对账脚本:净值差 / 笔数差只要不为 0\n"
                 "就 exit 1 报警。当前:净差 $0.00、笔数差 0 (完全一致)。"
             ),
-            "where": "src/backtest.py (oracle) vs src/backtest_v2.py (v2);scripts/engine_compare.py",
+            "where": "src/backtest.py (oracle) vs src/backtest_v3.py (v3);scripts/engine_compare.py",
             "value": "PARITY OK · Δ净值 $0.00 · Δ笔数 0",
         },
         "parity_mode — 机制验证": {
             "name": "parity_mode (Mechanism Validation Lens)",
-            "summary": "V2 的'对账模式':关现金墙、关加仓,只验证机制和 Oracle 一致",
+            "summary": "V3 的'对账模式':关现金墙、关加仓,只验证机制和 Oracle 一致",
             "explain": (
-                "同一份 simulate_v2 代码,两个镜头看回测。parity_mode=True 是第一个:\n\n"
+                "同一份 simulate_v3 代码,两个镜头看回测。parity_mode=True 是第一个:\n\n"
                 "  • 不检查现金 (和 Oracle 一样按静态 $5000 算仓位)\n"
                 "  • 关闭金字塔加仓\n"
                 "  • 目标:逐笔、逐美元复现 Oracle\n\n"
-                "用意:把'机制对不对'和'策略赚不赚'两件事拆开验证。先证明 V2 的\n"
+                "用意:把'机制对不对'和'策略赚不赚'两件事拆开验证。先证明 V3 的\n"
                 "出场/排序/风控机制和冻结的 Oracle 完全一样 (机制验证),再打开现金\n"
                 "约束去看真实账户表现 (策略验证)。机制这层不过,策略数字就没意义。"
             ),
-            "where": "src/backtest_v2.py: simulate_v2(parity_mode=True)",
+            "where": "src/backtest_v3.py: simulate_v3(parity_mode=True)",
             "value": "对账时 ON;真实账户评估时 OFF",
         },
         "enforce_cash — 策略验证 / 真实现金账户": {
             "name": "enforce_cash (Real $5k Cash-Balance Lens)",
-            "summary": "V2 的'真实现金模式':真的扣现金、买不起就不买",
+            "summary": "V3 的'真实现金模式':真的扣现金、买不起就不买",
             "explain": (
-                "simulate_v2 的第二个镜头 enforce_cash=True,模拟真实的 $5000 现金账户:\n\n"
+                "simulate_v3 的第二个镜头 enforce_cash=True,模拟真实的 $5000 现金账户:\n\n"
                 "  • 每次开仓 / 加仓真的从现金余额里扣钱\n"
                 "  • 现金不够 → 这个信号买不起,直接丢弃 (现金墙)\n"
                 "  • 跟踪逐 bar 的浮动盈亏 (MTM-DD)\n\n"
@@ -821,7 +821,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "账户只有 $5000 现金,买不起就是买不起。这个镜头把那层免费杠杆\n"
                 "拿掉,给出'真账户能复制'的诚实读数。"
             ),
-            "where": "src/backtest_v2.py: simulate_v2(enforce_cash=True)",
+            "where": "src/backtest_v3.py: simulate_v3(enforce_cash=True)",
             "value": "真实账户评估时 ON",
         },
         "MTM-DD — 浮动回撤 (Mark-to-Market Drawdown)": {
@@ -836,7 +836,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "意义:这才是你账户屏幕上真实看到的数字,也是你真正要承受的痛。\n"
                 "报告里凡是带 MTM 的回撤都比已实现回撤更大 / 更诚实。"
             ),
-            "where": "src/backtest_v2.py: _RealizedDD / 逐 bar 计价",
+            "where": "src/backtest_v3.py: _RealizedDD / 逐 bar 计价",
             "value": "报告里标 MTM-DD",
         },
         "隐性杠杆 / 峰值毛敞口 (pkGr%)": {
@@ -852,7 +852,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "真实 SIMULATE 现金账户没有这层杠杆,所以 Oracle 的漂亮收益有一部分\n"
                 "是'账户其实复制不出来'的。enforce_cash 镜头就是用来戳破这一点。"
             ),
-            "where": "src/backtest_v2.py: 峰值毛敞口统计 (pkGr%)",
+            "where": "src/backtest_v3.py: 峰值毛敞口统计 (pkGr%)",
             "value": "实测峰值 252% – 534% (≈2.5×–5×)",
         },
         "现金受限入场 (cashLim)": {
@@ -866,7 +866,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "  加仓把现金吃光 → cashLim 暴增 (180d ×3.6 / 360d ×1.8)\n"
                 "  → 新名字的机会被饿死 → 这正是加仓在 $5k 账户上反而亏钱的原因。"
             ),
-            "where": "src/backtest_v2.py: enforce_cash 路径的 cash-limited 计数",
+            "where": "src/backtest_v3.py: enforce_cash 路径的 cash-limited 计数",
             "value": "报告里标 cashLim (越低越好)",
         },
         "诚实读数 ($/day @ MTM-DD)": {
@@ -1037,16 +1037,6 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
         },
     },
 }
-
-
-def all_categories() -> list[str]:
-    """List of top-level section names in display order."""
-    return list(GLOSSARY.keys())
-
-
-def all_entries(category: str) -> list[str]:
-    """List of term names under a category, in display order."""
-    return list(GLOSSARY.get(category, {}).keys())
 
 
 def get_entry(category: str, term: str) -> dict | None:

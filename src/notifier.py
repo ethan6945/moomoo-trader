@@ -39,38 +39,6 @@ def send(text: str) -> None:
                 log.warning("telegram send failed: %s", e)
 
 
-def send_html(text: str) -> None:
-    """Send with HTML parse mode — used by signal_reporter for rich card formatting.
-
-    Splits messages longer than 3800 chars to stay under Telegram's 4096-char limit.
-    Uses json= (not data=) so HTML entities survive encoding correctly.
-    """
-    if not settings.telegram_token or not settings.telegram_chat_id:
-        log.info("[telegram disabled] %s", text[:80])
-        return
-    url     = f"https://api.telegram.org/bot{settings.telegram_token}/sendMessage"
-    chunks  = [text[i:i + 3800] for i in range(0, len(text), 3800)] or [""]
-    for chunk in chunks:
-        if not chunk:
-            continue
-        payload = {
-            "chat_id":                  settings.telegram_chat_id,
-            "text":                     chunk,
-            "parse_mode":               "HTML",
-            "disable_web_page_preview": True,
-        }
-        for attempt in range(3):
-            try:
-                requests.post(url, json=payload, timeout=15)
-                break
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(3)
-                else:
-                    log.warning("telegram send_html failed: %s", e)
-        time.sleep(0.6)   # stay below Telegram's ~1 msg/sec rate limit
-
-
 def signal_msg(signal, ai_reason: str, qty: int) -> str:
     return t(
         "tg_buy",

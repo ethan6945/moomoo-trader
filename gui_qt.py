@@ -734,6 +734,7 @@ class App(QMainWindow):
         self._nav(lay, f"🗺  {_t('btn_sectors')}",  self.open_sectors)
         self._nav(lay, f"🤖 {_t('btn_ml')}",        self.open_ml)
         self._nav(lay, "📡 Signal Reporter",          self.open_signal_reporter)
+        self._nav(lay, "✅ Approvals",                 self.open_approvals)
 
         lay.addStretch(1)
         lay.addSpacing(8)
@@ -980,6 +981,9 @@ class App(QMainWindow):
     def open_signal_reporter(self):
         SignalReporterDialog(self).show()
 
+    def open_approvals(self):
+        ApprovalsDialog(self).show()
+
     def open_api_keys(self):
         ApiKeysDialog(self).show()
 
@@ -987,30 +991,25 @@ class App(QMainWindow):
         HelpDialog(self).show()
 
     def _edit_budget(self):
-        from src.config import settings as _s
-        current = float(_s.account_usd)
+        # 2026-06-03 dynamic capital: the budget is now a RUNTIME value in db
+        # state ('budget_usd'). Changing it takes effect on the NEXT scan with
+        # NO restart. Sizing also auto-caps to live account equity, so this is
+        # the owner's allocated ceiling, not a hardcoded constant.
+        from src import db, risk_manager
+        current = float(risk_manager.budget_usd())
         val, ok = QInputDialog.getDouble(
-            self, "Edit Budget",
-            f"New ACCOUNT_USD (currently ${current:,.2f}):",
+            self, "Set Trading Budget",
+            f"Allocated trading budget (currently ${current:,.2f}).\n"
+            f"Takes effect next scan — no restart. Sizing auto-caps to live equity.",
             current, 0, 9_999_999, 2,
         )
         if not ok or val <= 0 or abs(val - current) < 1:
             return
-        env_path = ROOT / ".env"
-        if not env_path.exists():
-            self._toast("⚠ .env not found")
-            return
-        lines = env_path.read_text().splitlines()
-        found = False
-        for i, line in enumerate(lines):
-            if line.lstrip().startswith(("ACCOUNT_USD=", "#ACCOUNT_USD=")):
-                lines[i] = f"ACCOUNT_USD={val:.0f}"
-                found = True
-                break
-        if not found:
-            lines.append(f"ACCOUNT_USD={val:.0f}")
-        env_path.write_text("\n".join(lines) + "\n")
-        self._toast(f"💰 Budget updated to ${val:,.0f}")
+        try:
+            db.update_state({"budget_usd": val})
+            self._toast(f"💰 Budget set to ${val:,.0f} (live — no restart)")
+        except Exception as e:
+            self._toast(f"⚠ Budget update failed: {e}")
 
     def _reset_halt(self):
         state = read_json(STATE_FILE)
@@ -1723,6 +1722,98 @@ class AuditDialog(QDialog):
             row = self.gtree.rowCount(); self.gtree.insertRow(row)
             for col, v in enumerate([g, str(c), f"{c/total*100:.0f}%"]):
                 self.gtree.setItem(row, col, QTableWidgetItem(v))
+
+
+# ── Approvals Dialog ───────────────────────────────────────────────────────
+# The owner-facing half of the feedback 铁律: automated analysis (weekly
+# self-review + DeepSeek optimizer) enqueues SUGGESTIONS here; nothing touches
+# live behavior until the owner Approves. Approved items are applied by the
+# scheduler on its next scan (runtime override / blacklist add — no restart).
+class ApprovalsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Approvals — 待批准建议")
+        self.resize(940, 560)
+        self._items: list = []
+        self._build()
+        self._refresh()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        top = QWidget(); tl = QHBoxLayout(top); tl.setContentsMargins(0, 0, 0, 0)
+        btn = QPushButton("🔄 Refresh"); btn.clicked.connect(self._refresh); tl.addWidget(btn)
+        tl.addStretch(1)
+        self.lbl = QLabel("—")
+        self.lbl.setStyleSheet(f"color: {T['text_strong']}; font-family: Menlo; font-weight: bold;")
+        tl.addWidget(self.lbl)
+        lay.addWidget(top)
+
+        cols = ["When", "Kind", "Suggestion", "Status"]
+        widths = [140, 130, 470, 90]
+        self.tbl = QTableWidget(0, len(cols)); self.tbl.setHorizontalHeaderLabels(cols)
+        for i, w in enumerate(widths): self.tbl.setColumnWidth(i, w)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.verticalHeader().setVisible(False)
+        lay.addWidget(self.tbl)
+
+        actions = QWidget(); al = QHBoxLayout(actions); al.setContentsMargins(0, 0, 0, 0)
+        self.btn_app = QPushButton("✅ Approve selected")
+        self.btn_app.clicked.connect(lambda: self._resolve(True))
+        self.btn_rej = QPushButton("✖ Reject selected")
+        self.btn_rej.clicked.connect(lambda: self._resolve(False))
+        al.addWidget(self.btn_app); al.addWidget(self.btn_rej); al.addStretch(1)
+        note = QLabel("批准后由调度器下次扫描执行（运行时生效，免重启）。")
+        note.setStyleSheet(f"color: {T['muted']};")
+        al.addWidget(note)
+        lay.addWidget(actions)
+
+    def _refresh(self):
+        try:
+            from src import approvals
+            items = approvals.list_all()
+        except Exception as e:
+            items = []
+            self.lbl.setText(f"load failed: {e}")
+        # pending first, then most-recent
+        items = sorted(items, key=lambda a: (a.get("status") != "pending",
+                                             a.get("created_at", "")), reverse=False)
+        self._items = items
+        self.tbl.setRowCount(0)
+        npend = 0
+        for a in items:
+            r = self.tbl.rowCount(); self.tbl.insertRow(r)
+            st = a.get("status", "pending")
+            if st == "pending":
+                npend += 1
+            vals = [a.get("created_at", "")[:19].replace("T", " "),
+                    a.get("kind", ""), a.get("detail", "")[:110], st]
+            color = QColor(T["text_strong"] if st == "pending"
+                           else T["success"] if st in ("approved",) else T["muted"])
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                if c == 3:
+                    item.setForeground(color)
+                self.tbl.setItem(r, c, item)
+        self.lbl.setText(f"{npend} pending  |  {len(items)} total")
+
+    def _resolve(self, approved: bool):
+        from src import approvals
+        rows = sorted({i.row() for i in self.tbl.selectedItems()})
+        done = 0
+        for r in rows:
+            if 0 <= r < len(self._items):
+                a = self._items[r]
+                if a.get("status") == "pending" and approvals.resolve(a.get("id", ""), approved):
+                    done += 1
+        self._refresh()
+        try:
+            self.parent()._toast(
+                f"{'✅ approved' if approved else '✖ rejected'} {done} "
+                f"{'(applies next scan)' if approved else ''}")
+        except Exception:
+            pass
 
 
 # ── Watchlist Dialog ───────────────────────────────────────────────────────

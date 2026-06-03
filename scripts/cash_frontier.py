@@ -1,13 +1,13 @@
 """cash_frontier — what is the BEST $/day a real $5,000 *cash* account can do?
 
 engine_compare.py proved the $100/day combo was implicit leverage (it needs
-~5× margin; strip it with simulate_v2(enforce_cash=True) and $105/day → $43/day,
+~5× margin; strip it with simulate_v3(enforce_cash=True) and $105/day → $43/day,
 worse than baseline). So this sweep drops sizing-leverage entirely and asks the
 honest question: among exit-management tweaks that DON'T borrow money
 (scale-out, breakeven, trailing, threshold), which lifts the cash-on $/day on
 BOTH windows while keeping mark-to-market DD under the 18% halt?
 
-Everything is scored through the NEW engine (backtest_v2, enforce_cash=True) so
+Everything is scored through the NEW engine (backtest_v3, enforce_cash=True) so
 the numbers are what a cash account would actually live. A couple of mild
 regime-leverage rows are included ONLY as a contrast — to show even 1.25-1.5×
 doesn't help once you can't fund it.
@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
@@ -75,7 +75,7 @@ VARIANTS = [
 
 
 def run(cfg, name, cache):
-    m = simulate_v2(cfg, cache, enforce_cash=True)["metrics"]
+    m = simulate_v3(cfg, cache, enforce_cash=True)["metrics"]
     return {"name": name, "trd": m.get("total_trades", 0),
             "wr": m.get("win_rate_pct", 0), "pf": m.get("profit_factor", 0),
             "net": m.get("net_pnl_usd", 0), "daily": m.get("daily_pnl_usd", 0),

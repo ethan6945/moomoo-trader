@@ -1,7 +1,7 @@
 """final_compare — the capstone before/after for the no-leverage upgrade.
 
 Shows, side by side on BOTH windows, what a real $5k CASH account would live
-(simulate_v2 enforce_cash=True) against the incumbent's optimistic number
+(simulate_v3 enforce_cash=True) against the incumbent's optimistic number
 (simulate_time_stepped = what the GUI reports), for the recommended changes:
 
   baseline          — live .env exactly as it is today (10 semis, single TP_HALF)
@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from src.backtest import BacktestConfig, prefetch_data, simulate_with_cache
-from src.backtest_v2 import simulate_v2
+from src.backtest_v3 import simulate_v3
 from src.config import settings
 
 logging.basicConfig(level=logging.ERROR, format="%(message)s")
@@ -67,7 +67,7 @@ def row(label, days, tickers, ov, cache, *, active=False):
                 "wr": m.get("win_rate_pct", 0), "pf": m.get("profit_factor", 0),
                 "net": net, "daily": net / days, "ddm": None,
                 "feq": settings.account_usd + net}
-    m = simulate_v2(cfg, cache, enforce_cash=True)["metrics"]
+    m = simulate_v3(cfg, cache, enforce_cash=True)["metrics"]
     return {"label": label, "trd": m.get("total_trades", 0),
             "wr": m.get("win_rate_pct", 0), "pf": m.get("profit_factor", 0),
             "net": m.get("net_pnl_usd", 0), "daily": m.get("daily_pnl_usd", 0),
