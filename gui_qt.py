@@ -1737,6 +1737,18 @@ class ApprovalsDialog(QDialog):
         self._items: list = []
         self._build()
         self._refresh()
+        # Auto-refresh so actions taken in Telegram (shared db queue) show up
+        # here live, without clicking Refresh.
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(4000)
+
+    def closeEvent(self, e):
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+        super().closeEvent(e)
 
     def _build(self):
         lay = QVBoxLayout(self)

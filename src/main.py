@@ -20,7 +20,7 @@ from . import (
     adaptive_sizing, ai_validator, approvals, audit, blacklist, clock,
     cron_state, db, executor, history, indicators, kill_switch, notifier,
     portfolio, regime as regime_mod, risk_manager, runtime_config, self_improve,
-    self_review, strategy_momentum, strategy_mr, watchlist_updater,
+    self_review, strategy_momentum, strategy_mr, tg_approvals, watchlist_updater,
 )
 from .config import settings
 from .earnings import earnings_block
@@ -1012,6 +1012,19 @@ def run_loop() -> None:
     # Telegrams suggested params; user reviews before editing .env.
     sched.add_job(_monthly_optuna_job, "cron", day=1, hour=3, minute=0,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # Telegram approval sync: every 60s, any time of day. Posts pending
+    # suggestion cards with Approve/Reject buttons, processes your taps into the
+    # shared approval queue, and applies anything you approved (same queue the
+    # GUI reads, so both stay in sync). Cheap HTTP; no-op if Telegram unset.
+    def _tg_sync():
+        try:
+            tg_approvals.sync()
+            approvals.apply_approved()   # apply off-hours approvals promptly
+        except Exception as e:
+            log.debug("tg approval sync failed: %s", e)
+    sched.add_job(_tg_sync, "interval", seconds=60,
+                  coalesce=True, misfire_grace_time=30, max_instances=1)
 
     # Daily blacklist review: 23:00 ET every weekday. Reads recent closed
     # trades, adds chronic losers, removes recovered names, extends watch on

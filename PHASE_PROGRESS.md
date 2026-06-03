@@ -73,6 +73,26 @@
 
 **审计路线图 next/later 全部完成（#5-#11）。结论：能提收益的真实杠杆只有 gap-cap 松绑（已落地 $57.6/day）；其余 ML/因子权重/regime放大 在本 mega-cap 宇宙都无 edge（诚实验证，不强加）。self-improvement 框架（half-Kelly/宇宙复盘/DeepSeek 优化器）已就位，随真实成交累积 + 你填 DeepSeek key 后自动产建议（审批制）。**
 
+## 🛠 2026-06-03 第五批：Telegram 审批 + 换宇宙实测
+
+**Telegram 审批 bot（✅）**：`src/tg_approvals.py` —— 待批建议推卡片(带 ✅批准/✖拒绝 按钮)，轮询点击→写共享 db 审批队列→下次扫描执行。GUI 审批栏 4 秒自动刷新→与 Telegram 同步。调度器每 60s sync(任何时段)。**已实测发卡+点击+应答+改卡片全通**(loading 是因旧调度器没轮询；重启加载新代码即自动)。GUI `ApprovalsDialog` 加 QTimer 自动刷新。⚠ 激活需重启调度器。
+
+**换宇宙实测（✅ 决定性负面结论）**：`scripts/universe_compare.py` —— 完全相同策略/参数，只换股票池：
+| 宇宙 | 180d $/day | 360d $/day | 回撤 | 胜率 | PF |
+|---|---|---|---|---|---|
+| MEGA(现10只) | **+57.59** | **+26.68** | 11-12% | 64-73% | 3.0-4.3 |
+| 中小盘高波动篮子 | **−8.59** | **−4.97** | **41-48%** | 23-36% | 0.5-0.7 |
+- **同策略丢中小盘=灾难**。策略与宇宙绑定，edge 不迁移：现策略是为大盘半导体平滑趋势 + 宽 TP/SL 调的，野票被来回打脸。
+- 偏差自认：测试篮子是静态的、含 RIVN/LCID/MARA/RIOT 等窗口内暴跌名，只做多动量在跌票上必亏（选池没筛趋势）。中小盘要能用需 (a)RS/动量筛只取上升流动票 +(b)重调策略 = 真项目,非快赢。
+
+## 🏁 本会话最终结论（2026-06-03）
+
+**$57.6/day(180d 回测)≈ 这套「大盘半导体 + trend/momentum」配置的天花板。** 本会话穷举验证、全部负面：ML 死、因子权重学习无效、RS/SOXX 闸亏、regime 放大亏、裸换中小盘大亏。**硬调策略/模型/宇宙都到顶。**
+
+**唯一确定性放大收益的路 = 加本金**（$5k 现金墙锁 ~2 仓是硬约束；本金 ×2 ≈ $/day ×2）。其余（中小盘+专用策略、期权流/另类数据）是高投入不确定的研究项目。
+
+**系统现状**：交易全自动 + 全程 feedback(GUI/Telegram 审批) + self-improvement 框架就位 + DeepSeek 接口待 key。逻辑 live↔回测已对齐。**待用户 commit**（第五批：`tg_approvals.py`、`main.py`、`gui_qt.py`、`scripts/universe_compare.py` 未提交）。
+
 新模块：`self_improve.py`、`runtime_config.risk_per_trade`。新脚本：`factor_weight_refit.py`、`ml_relabel_test.py`、`regime_scaling_test`(inline)。
 
 ---
