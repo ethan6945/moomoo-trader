@@ -94,9 +94,7 @@ class Settings:
     dd_size_cut_pct: float = _float("DD_SIZE_CUT_PCT", 10.0)   # half qty
     dd_halt_pct: float = _float("DD_HALT_PCT", 15.0)           # no new entries
 
-    # ML alpha engine (Phase 4)
-    ml_enabled: bool = os.getenv("ML_ENABLED", "true").lower() in ("1", "true", "yes")
-    ml_blend_weight: float = _float("ML_BLEND_WEIGHT", 0.30)   # 0=ignore ML, 1=ML-only
+    # (ML alpha engine removed 2026-06-03 — proven inert, AUC ~0.5.)
 
     # 2026-05-29 combo-sweep finding: mean-revert strategy was net-negative in
     # current bull-skewed watchlist (cost ~$4/day vs trend+momentum only).

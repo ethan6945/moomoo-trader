@@ -112,12 +112,6 @@ def record_close(
             f.write(json.dumps(row) + "\n")
     except Exception as e:
         log.warning("legacy trade log write failed: %s", e)
-    # Recompute ML calibration (cheap — full scan of closed_trades).
-    try:
-        from .ml.calibration import compute as _calib_compute
-        _calib_compute()
-    except Exception as e:
-        log.debug("calibration recompute skipped: %s", e)
     return row
 
 

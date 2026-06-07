@@ -229,14 +229,7 @@ def simulate_v3(
     if cfg.apply_mr_strategy or _momentum:
         from . import strategy_momentum, strategy_mr
 
-    ml_pred = None
-    if cfg.apply_ml_gate:
-        try:
-            from .ml import predict as ml_pred
-            if not ml_pred.is_available():
-                ml_pred = None
-        except Exception:
-            ml_pred = None
+    ml_pred = None   # ML subsystem removed 2026-06-03 (proven inert)
 
     spy_daily = cache["spy_daily"]
     soxx_daily = cache.get("soxx_daily")
@@ -395,16 +388,6 @@ def simulate_v3(
                 n_sector_blocked += 1
                 return None
 
-        # ML veto (+ optional conviction sizing, mirroring live main.py)
-        ml_proba = None
-        if ml_pred is not None:
-            try:
-                ml_proba = ml_pred.predict_proba(window, symbol=sym)
-                if ml_proba is not None and ml_proba < ml_pred.ML_VETO_THRESHOLD:
-                    return None
-            except Exception:
-                ml_proba = None
-
         # Earnings gate (live earnings.earnings_block): block a NEW entry when an
         # earnings report falls within `earnings_avoid_days` ahead of this bar.
         # Replays the live forward-only rule bar-by-bar off the historical
@@ -424,14 +407,6 @@ def simulate_v3(
                 return None
             if rdd.dd_pct >= cfg.dd_size_cut_pct:
                 qty_mult = 0.5
-
-        # ML conviction sizing (mirrors live main.py:534): a passing-but-low-conviction
-        # proba (>= veto, < ML_BOOST_THRESHOLD) halves the position. Flag-gated +
-        # parity-suppressed. This is the live behaviour the veto-only ablation missed.
-        if _ml_conviction and ml_proba is not None \
-                and ml_proba < ml_pred.ML_BOOST_THRESHOLD:
-            qty_mult *= 0.5
-            n_ml_halved += 1
 
         # regime-scaled sizing
         if cfg.use_regime_scaling and regime is not None and regime.bullish:

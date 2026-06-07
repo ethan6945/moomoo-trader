@@ -357,14 +357,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
     from .config import settings as _settings
     if cfg.apply_mr_strategy:
         from . import strategy_momentum, strategy_mr
-    ml_pred = None
-    if cfg.apply_ml_gate:
-        try:
-            from .ml import predict as ml_pred
-            if not ml_pred.is_available():
-                ml_pred = None
-        except Exception:
-            ml_pred = None
+    ml_pred = None   # ML subsystem removed 2026-06-03 (proven inert)
 
     tf = cache["tf"]
     spy_daily = cache["spy_daily"]
@@ -616,14 +609,6 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
                 regime = regime_mod.assess(s_until)
                 if cfg.apply_regime_gate and regime.block_new_entries:
                     continue
-
-        if ml_pred is not None:
-            try:
-                proba = ml_pred.predict_proba(window, symbol=sym)
-                if proba is not None and proba < ml_pred.ML_VETO_THRESHOLD:
-                    continue
-            except Exception:
-                pass
 
         # --- DD circuit breaker (TRUE portfolio-level now that we're chronological) ---
         # is_halted() also handles the 7-day auto-release so a stuck halt
@@ -914,37 +899,8 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
         for bundle in per_ticker.values():
             bundle["intraday"]["vix"] = 15.0
 
-    # ── 2026-05-29: join SEC EDGAR insider history (rolling 30-day net log $).
-    # Powers the `insider_30d_net_log` feature. Cached to data/sec_edgar/ so
-    # subsequent backtests don't re-fetch.
-    try:
-        from .sec_edgar import insider_rolling_30d_net
-        for sym, bundle in per_ticker.items():
-            try:
-                ins_df = insider_rolling_30d_net(sym, days=max(cfg.days + 60, 730))
-            except Exception as e:
-                log.debug("[prefetch] insider %s failed: %s", sym, e)
-                bundle["intraday"]["insider_30d_net_log"] = 0.0
-                continue
-            if ins_df.empty:
-                bundle["intraday"]["insider_30d_net_log"] = 0.0
-                continue
-            # Shift +1 day so bar reads yesterday's rolling net (no look-ahead).
-            ins_shifted = ins_df.copy()
-            ins_shifted.index = ins_shifted.index + pd.Timedelta(days=1)
-            df = bundle["intraday"]
-            bar_dates = pd.to_datetime(df.index).tz_localize(None).normalize()
-            df["insider_30d_net_log"] = (
-                ins_shifted["insider_30d_net_log"]
-                .reindex(bar_dates, method="ffill")
-                .ffill().fillna(0.0)
-                .values
-            )
-        log.info("[prefetch] joined SEC EDGAR insider history")
-    except Exception as e:
-        log.warning("[prefetch] insider join failed: %s — feature defaults to 0", e)
-        for bundle in per_ticker.values():
-            bundle["intraday"]["insider_30d_net_log"] = 0.0
+    # (SEC EDGAR insider join removed 2026-06-03 with the ML subsystem — the
+    # insider_30d_net_log feature was ablated to zero importance / zero $/day.)
 
     # ── 2026-05-28 v2: join sector-ETF close per ticker for `rs_vs_sector_5d`.
     # Fetches each unique sector ETF once (same MooMoo path), then re-indexes

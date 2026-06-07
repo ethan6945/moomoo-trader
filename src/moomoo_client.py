@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import hashlib
 import logging
+import math
 import threading
 import time
 from contextlib import contextmanager
@@ -32,6 +33,13 @@ from moomoo import (
 from .config import settings
 
 log = logging.getLogger(__name__)
+
+# US regular session = 6.5h = 390 min → bars per trading day by timeframe.
+# Used to size history-kline windows so .tail(bars) always returns RECENT candles.
+_BARS_PER_TRADING_DAY = {
+    KLType.K_1M: 390, KLType.K_3M: 130, KLType.K_5M: 78, KLType.K_10M: 39,
+    KLType.K_15M: 26, KLType.K_30M: 13, KLType.K_60M: 7, KLType.K_DAY: 1,
+}
 
 
 # ---------- process-level sliding-window rate limiter ----------
@@ -156,12 +164,30 @@ class MoomooClient:
             ktype = _tf().kltype
 
         end_d = date.today()
-        if ktype == KLType.K_DAY:
-            window_days = bars * 3
-        elif ktype == KLType.K_60M:
-            window_days = max(30, int(bars / 6.5 * 2))
+        # Size the date window so it holds ~`bars` candles ending TODAY, and keep
+        # max_count ABOVE the window's bar count.
+        #
+        # Why this matters (was a real bug): request_history_kline returns the
+        # OLDEST `max_count` candles inside [start, end]. If the window holds more
+        # bars than max_count, .tail(bars) lands on STALE candles. The old code
+        # used a 15-day window for every intraday tf with max_count=200, so a 5-min
+        # request (≈78 bars/day → >1000 bars in 15 days) returned candles from ~2
+        # weeks ago. Fix: a tight, timeframe-aware window + generous max_count.
+        bpd = _BARS_PER_TRADING_DAY.get(ktype)
+        if bpd:
+            trading_days = max(1, math.ceil(bars / bpd))
+            window_days = math.ceil(trading_days * 7 / 5) + (5 if ktype == KLType.K_DAY else 3)
+            # Cap the window so its bar count stays under the API's ~1000-row
+            # single-request return limit (else we truncate to the OLDEST 1000 and
+            # lose the latest candles). Use trading-day basis (≤ calendar days) so
+            # even 1-min (390 bars/day) stays under the cap and ends at the latest bar.
+            max_window_days = max(2, int(1000 / bpd))
+            window_days = min(window_days, max_window_days)
+            max_count = 1000
         else:
-            window_days = max(15, int(bars / 26 * 2))
+            # Coarse timeframes (weekly/monthly/…): few bars, generous window.
+            window_days = bars * 10
+            max_count = max(bars * 3, 200)
         start_d = end_d - timedelta(days=window_days)
         code = self._format_code(symbol)
 
@@ -174,7 +200,7 @@ class MoomooClient:
                 start=start_d.isoformat(),
                 end=end_d.isoformat(),
                 ktype=ktype,
-                max_count=max(bars * 2, 200),
+                max_count=max_count,
                 autype="qfq",
             )
             if ret == RET_OK:

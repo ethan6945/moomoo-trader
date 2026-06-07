@@ -64,18 +64,18 @@ REFRESH_MS = 5000
 # ── Theme ──────────────────────────────────────────────────────────────────
 
 DARK = {
-    "bg":          "#0d1117",
-    "sidebar_bg":  "#161b22",
-    "card_bg":     "#1c2128",
-    "border":      "#30363d",
-    "primary":     "#58a6ff",
+    "bg":          "#0b0e14",   # deeper, slightly cooler near-black
+    "sidebar_bg":  "#12161f",
+    "card_bg":     "#1a1f2b",   # richer card surface (subtle elevation)
+    "border":      "#2a313c",   # softer hairline
+    "primary":     "#4d9dff",   # a touch more vibrant
     "success":     "#3fb950",
     "danger":      "#f85149",
     "warning":     "#d29922",
     "muted":       "#8b949e",
-    "text":        "#c9d1d9",
+    "text":        "#cdd5e0",   # slightly brighter body text
     "text_strong": "#f0f6fc",
-    "accent1":     "#58a6ff",
+    "accent1":     "#4d9dff",
     "accent2":     "#a371f7",
     "accent3":     "#3fb950",
     "accent4":     "#d29922",
@@ -107,8 +107,8 @@ def _build_qss(t: dict) -> str:
 QMainWindow, QDialog, QWidget {{
     background-color: {t["bg"]};
     color: {t["text"]};
-    font-family: "-apple-system", "SF Pro Display", "Helvetica Neue", sans-serif;
-    font-size: 12px;
+    font-family: "Inter", "-apple-system", "SF Pro Display", "Helvetica Neue", sans-serif;
+    font-size: 13px;
 }}
 QToolTip {{
     background-color: {t["card_bg"]};
@@ -128,9 +128,9 @@ NavButton {{
     color: {t["text"]};
     border: none;
     text-align: left;
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-size: 12px;
+    padding: 10px 16px;
+    border-radius: 9px;
+    font-size: 13px;
 }}
 NavButton:hover {{
     background-color: {t["border"]};
@@ -139,12 +139,12 @@ NavButton:hover {{
 NavButton:pressed {{ background-color: {t["card_bg"]}; }}
 NavAccentButton {{
     background-color: {t["primary"]};
-    color: #000000;
+    color: #ffffff;
     border: none;
     text-align: left;
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-size: 12px;
+    padding: 10px 16px;
+    border-radius: 9px;
+    font-size: 13px;
     font-weight: bold;
 }}
 NavAccentButton:hover {{ background-color: {t["success"]}; }}
@@ -152,13 +152,13 @@ NavAccentButton:hover {{ background-color: {t["success"]}; }}
 StatCard {{
     background-color: {t["card_bg"]};
     border: 1px solid {t["border"]};
-    border-radius: 8px;
+    border-radius: 14px;
 }}
 /* status/info strips */
 StatusStrip, InfoStrip {{
     background-color: {t["card_bg"]};
     border: 1px solid {t["border"]};
-    border-radius: 6px;
+    border-radius: 9px;
 }}
 /* table */
 QTableWidget {{
@@ -166,7 +166,7 @@ QTableWidget {{
     alternate-background-color: {t["sidebar_bg"]};
     gridline-color: {t["border"]};
     border: 1px solid {t["border"]};
-    border-radius: 6px;
+    border-radius: 9px;
     color: {t["text"]};
     selection-background-color: {t["primary"]};
     selection-color: #ffffff;
@@ -187,7 +187,7 @@ QPlainTextEdit, QTextEdit {{
     background-color: {t["bg"]};
     color: {t["muted"]};
     border: 1px solid {t["border"]};
-    border-radius: 6px;
+    border-radius: 9px;
     font-family: "Menlo", "Monaco", "Courier New", monospace;
     font-size: 11px;
     selection-background-color: {t["primary"]};
@@ -197,9 +197,9 @@ QPushButton {{
     background-color: {t["border"]};
     color: {t["text"]};
     border: none;
-    border-radius: 6px;
+    border-radius: 9px;
     padding: 6px 14px;
-    font-size: 12px;
+    font-size: 13px;
 }}
 QPushButton:hover {{ background-color: {t["card_bg"]}; color: {t["text_strong"]}; }}
 QPushButton:disabled {{ background-color: {t["sidebar_bg"]}; color: {t["muted"]}; }}
@@ -207,10 +207,10 @@ PrimaryButton {{
     background-color: {t["success"]};
     color: #ffffff;
     border: none;
-    border-radius: 6px;
+    border-radius: 9px;
     padding: 7px 16px;
     font-weight: bold;
-    font-size: 12px;
+    font-size: 13px;
 }}
 PrimaryButton:hover {{ background-color: #46d260; }}
 PrimaryButton:disabled {{ background-color: {t["border"]}; color: {t["muted"]}; }}
@@ -218,9 +218,9 @@ DangerButton {{
     background-color: transparent;
     color: {t["danger"]};
     border: 1px solid {t["danger"]};
-    border-radius: 6px;
+    border-radius: 9px;
     padding: 7px 16px;
-    font-size: 12px;
+    font-size: 13px;
 }}
 DangerButton:hover {{ background-color: {t["danger"]}; color: #ffffff; }}
 /* input fields */
@@ -228,9 +228,9 @@ QLineEdit, QComboBox, QSpinBox {{
     background-color: {t["sidebar_bg"]};
     color: {t["text"]};
     border: 1px solid {t["border"]};
-    border-radius: 6px;
+    border-radius: 9px;
     padding: 4px 8px;
-    font-size: 12px;
+    font-size: 13px;
 }}
 QLineEdit:focus {{ border-color: {t["primary"]}; }}
 QComboBox::drop-down {{ border: none; width: 20px; }}
@@ -255,7 +255,7 @@ QTabBar::tab {{
     border-bottom: none;
     padding: 6px 18px;
     margin-right: 2px;
-    border-radius: 6px 6px 0 0;
+    border-radius: 9px 6px 0 0;
 }}
 QTabBar::tab:selected {{
     background-color: {t["bg"]};
@@ -288,7 +288,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
 QTreeWidget, QListWidget {{
     background-color: {t["bg"]};
     border: 1px solid {t["border"]};
-    border-radius: 6px;
+    border-radius: 9px;
     color: {t["text"]};
     outline: none;
 }}
@@ -358,7 +358,7 @@ class StatCard(QFrame):
         inner.setStyleSheet(f"background-color: {T['card_bg']}; border: none;")
         self._inner = inner
         inner_lay = QVBoxLayout(inner)
-        inner_lay.setContentsMargins(14, 10, 14, 12)
+        inner_lay.setContentsMargins(18, 14, 18, 16)
         inner_lay.setSpacing(4)
         layout.addWidget(inner)
 
@@ -368,7 +368,7 @@ class StatCard(QFrame):
 
         self.value_lbl = QLabel("—")
         self.value_lbl.setStyleSheet(
-            f"color: {T['text_strong']}; font-size: 22px; font-weight: bold;"
+            f"color: {T['text_strong']}; font-size: 26px; font-weight: bold;"
         )
         inner_lay.addWidget(self.value_lbl)
 
@@ -381,7 +381,7 @@ class StatCard(QFrame):
         self.value_lbl.setText(text)
         if color:
             self.value_lbl.setStyleSheet(
-                f"color: {color}; font-size: 22px; font-weight: bold;"
+                f"color: {color}; font-size: 26px; font-weight: bold;"
             )
 
     def recolor(self, t: dict) -> None:
@@ -521,18 +521,6 @@ class ScanWorker(QThread):
             self.error.emit(str(e))
         finally:
             self.done.emit()
-
-
-class WatchlistRefreshWorker(QThread):
-    done = pyqtSignal(str)
-
-    def run(self):
-        try:
-            from src.watchlist_updater import refresh
-            tickers = refresh()
-            self.done.emit(f"✓ Watchlist refreshed: {len(tickers)} tickers")
-        except Exception as e:
-            self.done.emit(f"⚠ Refresh failed: {e}")
 
 
 class ManualCloseWorker(QThread):
@@ -729,10 +717,7 @@ class App(QMainWindow):
         self._nav(lay, f"🔬 {_t('btn_backtest')}",  self.open_backtest)
         self._nav(lay, f"📊 {_t('btn_equity')}",    self.open_equity)
         self._nav(lay, f"🔍 {_t('btn_audit')}",     self.open_audit)
-        self._nav(lay, f"📋 {_t('btn_watchlist')}", self.open_watchlist)
-        self._nav(lay, "🔄 Refresh WL",              self.refresh_watchlist)
         self._nav(lay, f"🗺  {_t('btn_sectors')}",  self.open_sectors)
-        self._nav(lay, f"🤖 {_t('btn_ml')}",        self.open_ml)
         self._nav(lay, "📡 Signal Reporter",          self.open_signal_reporter)
         self._nav(lay, "✅ Approvals",                 self.open_approvals)
 
@@ -758,7 +743,7 @@ class App(QMainWindow):
                   self.lbl_market, self.lbl_clock, self.lbl_heart, self.lbl_regime):
             ss_lay.addWidget(w)
             sep = QLabel(" │ ")
-            sep.setStyleSheet(f"color: {T['border']}; font-size: 12px;")
+            sep.setStyleSheet(f"color: {T['border']}; font-size: 13px;")
             ss_lay.addWidget(sep)
         ss_lay.addStretch(1)
         lay.addWidget(self._status_strip)
@@ -767,7 +752,7 @@ class App(QMainWindow):
         cards_row = QWidget()
         cards_lay = QHBoxLayout(cards_row)
         cards_lay.setContentsMargins(0, 0, 0, 0)
-        cards_lay.setSpacing(8)
+        cards_lay.setSpacing(14)
 
         self._card_budget   = StatCard(_t("budget_label_total"),    T["accent1"])
         self._card_deployed = StatCard(_t("budget_label_deployed"),  T["accent2"])
@@ -782,7 +767,7 @@ class App(QMainWindow):
         budget_row_lay.setSpacing(4)
         self.lbl_budget = QLabel("$—")
         self.lbl_budget.setStyleSheet(
-            f"color: {T['text_strong']}; font-size: 22px; font-weight: bold;"
+            f"color: {T['text_strong']}; font-size: 26px; font-weight: bold;"
         )
         self.lbl_budget.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lbl_budget.mousePressEvent = lambda _: self._edit_budget()
@@ -888,8 +873,10 @@ class App(QMainWindow):
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(300)
-        lay.addWidget(self.log_view, 1)
+        self.log_view.setMaximumBlockCount(60)
+        self.log_view.setFixedHeight(66)   # ~3 lines — compact recent-activity strip
+        lay.addWidget(self.log_view)
+        lay.addStretch(1)                  # pack content to the top; no big empty log
 
     # ── Actions ────────────────────────────────────────────────────────────
 
@@ -948,12 +935,6 @@ class App(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setText(f"⚡ {_t('btn_scan')}")
 
-    def refresh_watchlist(self):
-        self._toast("Refreshing watchlist from S&P 500…")
-        self._wl_worker = WatchlistRefreshWorker()
-        self._wl_worker.done.connect(self._toast)
-        self._wl_worker.start()
-
     def open_logs(self):
         subprocess.run(["open", str(LOG_FILE)])
 
@@ -969,14 +950,8 @@ class App(QMainWindow):
     def open_audit(self):
         AuditDialog(self).show()
 
-    def open_watchlist(self):
-        WatchlistDialog(self).show()
-
     def open_sectors(self):
         SectorHeatmapDialog(self).show()
-
-    def open_ml(self):
-        MLDialog(self).show()
 
     def open_signal_reporter(self):
         SignalReporterDialog(self).show()
@@ -1205,12 +1180,7 @@ class App(QMainWindow):
         self.lbl_thresh.setText(f"{_t('entry_threshold')} {account.get('entry_threshold', '—')}")
         self.lbl_interval.setText(f"{_t('scan_every')} {account.get('scan_interval_min', '—')}m")
         self.lbl_hold.setText(f"{_t('max_hold')} {account.get('max_hold_days', '—')}d")
-        ml_on = account.get("ml_enabled") and account.get("ml_available")
-        ml_w  = account.get("ml_blend_weight", 0)
-        self.lbl_ml_cfg.setText(
-            _t("ml_on", weight=ml_w) if ml_on else
-            (_t("ml_no_model") if account.get("ml_enabled") else _t("ml_off"))
-        )
+        self.lbl_ml_cfg.setText("")   # ML subsystem removed 2026-06-03
 
         # Positions table
         per_pos = account.get("per_position") or {}
@@ -1830,72 +1800,6 @@ class ApprovalsDialog(QDialog):
 
 # ── Watchlist Dialog ───────────────────────────────────────────────────────
 
-class WatchlistDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Watchlist Editor")
-        self.resize(460, 580)
-        self._build()
-        self._load()
-
-    def _build(self):
-        lay = QVBoxLayout(self)
-        desc = QLabel("Edit candidate tickers. Auto-refreshed weekly from S&P 500.")
-        desc.setStyleSheet(f"color: {T['muted']}; font-size: 10px;")
-        desc.setWordWrap(True)
-        lay.addWidget(desc)
-
-        top = QWidget(); tl = QHBoxLayout(top); tl.setContentsMargins(0,0,0,0)
-        tl.addWidget(QLabel("Symbol:"))
-        self.le_new = QLineEdit(); self.le_new.setFixedWidth(100); self.le_new.setPlaceholderText("AAPL")
-        self.le_new.returnPressed.connect(self._add)
-        tl.addWidget(self.le_new)
-        btn_add = QPushButton("➕ Add"); btn_add.clicked.connect(self._add); tl.addWidget(btn_add)
-        btn_rem = QPushButton("🗑 Remove"); btn_rem.clicked.connect(self._remove); tl.addWidget(btn_rem)
-        tl.addStretch(1)
-        btn_save = PrimaryButton("💾 Save"); btn_save.clicked.connect(self._save); tl.addWidget(btn_save)
-        lay.addWidget(top)
-
-        self.list_w = QListWidget()
-        lay.addWidget(self.list_w)
-
-        self.lbl_status = QLabel("")
-        self.lbl_status.setStyleSheet(f"color: {T['muted']}; font-size: 10px;")
-        lay.addWidget(self.lbl_status)
-
-    def _load(self):
-        if not WATCHLIST_FILE.exists(): return
-        try:
-            data = json.loads(WATCHLIST_FILE.read_text())
-            for t in data.get("tickers", []): self.list_w.addItem(t)
-            self.lbl_status.setText(f"Loaded {self.list_w.count()} tickers")
-        except Exception as e:
-            self.lbl_status.setText(f"Load error: {e}")
-
-    def _add(self):
-        sym = self.le_new.text().strip().upper()
-        if not sym: return
-        existing = {self.list_w.item(i).text() for i in range(self.list_w.count())}
-        if sym in existing: self.lbl_status.setText(f"{sym} already in list"); return
-        self.list_w.addItem(sym); self.le_new.clear()
-        self.lbl_status.setText(f"Added {sym} — click Save to persist")
-
-    def _remove(self):
-        for item in self.list_w.selectedItems():
-            self.list_w.takeItem(self.list_w.row(item))
-        self.lbl_status.setText("Removed — click Save to persist")
-
-    def _save(self):
-        tickers = [self.list_w.item(i).text() for i in range(self.list_w.count())]
-        try:
-            WATCHLIST_FILE.write_text(json.dumps({"tickers": tickers}, indent=2))
-            self.lbl_status.setText(f"✓ Saved {len(tickers)} tickers")
-        except Exception as e:
-            self.lbl_status.setText(f"Save failed: {e}")
-
-
-# ── Sector Heatmap Dialog ──────────────────────────────────────────────────
-
 class SectorCanvas(QWidget):
     PADDING = 12; CARD_GAP = 12; CARD_MIN_W = 210; HEADER_H = 42; LINE_H = 20; MAX_COLS = 4
 
@@ -2027,165 +1931,6 @@ class SectorHeatmapDialog(QDialog):
 
 # ── ML Dialog ──────────────────────────────────────────────────────────────
 
-class MLDialog(QDialog):
-    META_FILE = ROOT / "data" / "ml" / "model_meta.json"
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("ML Model")
-        self.resize(840, 680)
-        self._fi_data: dict = {}
-        self._build()
-        self._refresh()
-
-    def _build(self):
-        lay = QVBoxLayout(self)
-        top = QWidget(); tl = QHBoxLayout(top); tl.setContentsMargins(0,0,0,0)
-        self.lbl_status = QLabel("—")
-        self.lbl_status.setStyleSheet(f"color: {T['text_strong']}; font-size: 13px; font-weight: bold;")
-        tl.addWidget(self.lbl_status); tl.addStretch(1)
-        btn_ref = QPushButton("🔄 Refresh"); btn_ref.clicked.connect(self._refresh); tl.addWidget(btn_ref)
-        self.btn_train = PrimaryButton("🧠 Train Now"); self.btn_train.clicked.connect(self._train); tl.addWidget(self.btn_train)
-        lay.addWidget(top)
-
-        tabs = QTabWidget()
-
-        # Overview
-        t1 = QWidget(); t1l = QVBoxLayout(t1)
-        self.txt_metrics = QPlainTextEdit(); self.txt_metrics.setReadOnly(True)
-        self.txt_metrics.setFont(QFont("Menlo", 11)); self.txt_metrics.setMaximumHeight(160)
-        t1l.addWidget(self.txt_metrics)
-        t1l.addWidget(QLabel("Feature Importance (top 20):"))
-        self.fi_widget = FeatureImportanceWidget(); t1l.addWidget(self.fi_widget)
-        tabs.addTab(t1, "Overview")
-
-        # Calibration
-        t2 = QWidget(); t2l = QVBoxLayout(t2)
-        self.lbl_brier = QLabel("—")
-        self.lbl_brier.setStyleSheet(f"color: {T['text_strong']}; font-size: 12px; font-weight: bold;")
-        t2l.addWidget(self.lbl_brier)
-        cal_cols = ["Range","N","Mean Proba","Win Rate","Diff","Mean R"]
-        self.cal_tree = QTableWidget(0, len(cal_cols)); self.cal_tree.setHorizontalHeaderLabels(cal_cols)
-        self.cal_tree.setAlternatingRowColors(True); self.cal_tree.verticalHeader().setVisible(False)
-        self.cal_tree.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        t2l.addWidget(self.cal_tree)
-        self.lbl_cal_note = QLabel(""); self.lbl_cal_note.setWordWrap(True)
-        self.lbl_cal_note.setStyleSheet(f"color: {T['muted']}; font-size: 10px;")
-        t2l.addWidget(self.lbl_cal_note)
-        tabs.addTab(t2, "Calibration")
-        lay.addWidget(tabs)
-
-    def _refresh(self):
-        if not self.META_FILE.exists():
-            self.lbl_status.setText("⚪ No trained model. Click 'Train Now'.")
-            self.txt_metrics.setPlainText("Train: python -m src.ml.train --days 365")
-            return
-        try:
-            meta = json.loads(self.META_FILE.read_text())
-        except Exception as e:
-            self.lbl_status.setText(f"⚠ {e}"); return
-        self.lbl_status.setText(f"🟢 Trained {meta.get('trained_at','?')[:19]}  ({meta.get('n_rows_total',0):,} rows)")
-        lc = meta.get("label_config", {})
-        lines = [
-            f"Holdout accuracy : {meta.get('accuracy_holdout',0)*100:.1f}%",
-            f"Holdout AUC      : {meta.get('auc_holdout',0):.3f}",
-            f"Positive rate    : {meta.get('positive_rate_holdout',0)*100:.1f}%",
-            f"Logloss          : {meta.get('logloss_holdout',0):.3f}",
-            f"Best iteration   : {meta.get('best_iteration','?')}",
-            f"Label config     : horizon={lc.get('horizon_bars','?')} bars, "
-            f"TP={lc.get('tp_pct',0)*100:.1f}%, SL={lc.get('sl_pct',0)*100:.1f}%",
-        ]
-        self.txt_metrics.setPlainText("\n".join(lines))
-        self.fi_widget.set_data(meta.get("feature_importance", {}))
-        self._refresh_calibration()
-
-    def _refresh_calibration(self):
-        try:
-            from src.ml.calibration import load as load_calib, compute as compute_calib
-            data = load_calib()
-            if not data.get("overall",{}).get("total_trades_with_proba",0):
-                data = compute_calib()
-        except Exception:
-            data = {"overall": {"total_trades_with_proba": 0}, "buckets": []}
-        overall = data.get("overall", {})
-        n = overall.get("total_trades_with_proba", 0)
-        brier = overall.get("brier_score")
-        if n == 0:
-            self.lbl_brier.setText("n=0  (no calibration data yet)")
-        else:
-            self.lbl_brier.setText(f"Brier score: {brier:.3f}  |  n={n}")
-        self.cal_tree.setRowCount(0)
-        for b in data.get("buckets", []):
-            wr = b.get("winrate"); mp = b.get("mean_proba")
-            diff = (wr-mp) if (wr is not None and mp is not None) else None
-            row = self.cal_tree.rowCount(); self.cal_tree.insertRow(row)
-            vals = [b.get("range","—"), str(b.get("n",0)),
-                    f"{mp:.2f}" if mp is not None else "—",
-                    f"{wr*100:.0f}%" if wr is not None else "—",
-                    f"{diff*100:+.0f}%" if diff is not None else "—",
-                    f"{b.get('mean_r',0):+.2f}" if b.get('mean_r') is not None else "—"]
-            for col, v in enumerate(vals):
-                self.cal_tree.setItem(row, col, QTableWidgetItem(v))
-
-    def _train(self):
-        reply = QMessageBox.question(self, "Train ML model?",
-            "Fetches 1 year of klines + trains XGBoost. ~3-5 min. Continue?")
-        if reply != QMessageBox.StandardButton.Yes: return
-        self.lbl_status.setText("⏳ Training…")
-        self.btn_train.setEnabled(False)
-        threading.Thread(target=self._do_train, daemon=True).start()
-
-    def _do_train(self):
-        try:
-            proc = subprocess.run([PYTHON, "-m", "src.ml.train", "--days","365"],
-                cwd=str(ROOT), capture_output=True, text=True, timeout=900)
-            ok = proc.returncode == 0
-            tail = (proc.stdout+proc.stderr)[-1200:]
-            QTimer.singleShot(0, lambda: self._post_train(ok, tail))
-        except Exception as e:
-            QTimer.singleShot(0, lambda: self._post_train(False, str(e)))
-
-    def _post_train(self, ok: bool, tail: str):
-        self.btn_train.setEnabled(True)
-        self.lbl_status.setText("🟢 Trained OK" if ok else "⚠ Training failed")
-        self.txt_metrics.appendPlainText("\n--- output ---\n" + tail[-800:])
-        if ok: self._refresh()
-
-
-class FeatureImportanceWidget(QWidget):
-    """Custom QPainter-based horizontal bar chart."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._data: dict = {}
-        self.setMinimumHeight(420)
-
-    def set_data(self, data: dict):
-        self._data = data or {}
-        self.update()
-
-    def paintEvent(self, event):
-        if not self._data: return
-        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        items = list(self._data.items())[:20]
-        max_imp = max(v for _, v in items) or 1
-        bar_w = max(50, self.width() - 220)
-        y = 8
-        p.setFont(QFont("Menlo", 10))
-        for name, imp in items:
-            p.setPen(QColor(T["text"]))
-            p.drawText(6, y+12, name[:28])
-            bw = int(bar_w * imp / max_imp)
-            p.setBrush(QBrush(QColor(T["primary"]))); p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(190, y, bw, 15, 3, 3)
-            p.setPen(QColor(T["muted"]))
-            p.drawText(194+bw, y+12, f"{imp:.3f}")
-            y += 20
-        p.end()
-
-
-# ── Signal Reporter Dialog ─────────────────────────────────────────────────
-
 class SignalReporterDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2206,7 +1951,7 @@ class SignalReporterDialog(QDialog):
         # Scheduler controls
         ctl = QWidget(); cl = QHBoxLayout(ctl); cl.setContentsMargins(8, 8, 8, 8)
         self.lbl_sr_status = QLabel("⚪ Stopped")
-        self.lbl_sr_status.setStyleSheet(f"color: {T['muted']}; font-size: 12px; font-weight: bold;")
+        self.lbl_sr_status.setStyleSheet(f"color: {T['muted']}; font-size: 13px; font-weight: bold;")
         cl.addWidget(self.lbl_sr_status); cl.addSpacing(12)
         btn_start = PrimaryButton("▶ Start"); btn_start.clicked.connect(self._start); cl.addWidget(btn_start)
         btn_stop  = DangerButton("■ Stop");  btn_stop.clicked.connect(self._stop);  cl.addWidget(btn_stop)
@@ -2257,10 +2002,10 @@ class SignalReporterDialog(QDialog):
         pid = self._read_signal_pid()
         if pid:
             self.lbl_sr_status.setText(f"🟢 Running (PID {pid})")
-            self.lbl_sr_status.setStyleSheet(f"color: {T['success']}; font-size: 12px; font-weight: bold;")
+            self.lbl_sr_status.setStyleSheet(f"color: {T['success']}; font-size: 13px; font-weight: bold;")
         else:
             self.lbl_sr_status.setText("⚪ Stopped")
-            self.lbl_sr_status.setStyleSheet(f"color: {T['muted']}; font-size: 12px; font-weight: bold;")
+            self.lbl_sr_status.setStyleSheet(f"color: {T['muted']}; font-size: 13px; font-weight: bold;")
 
     def _auto_refresh(self):
         if not self.isVisible(): return

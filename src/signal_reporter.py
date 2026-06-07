@@ -570,7 +570,12 @@ def _call_gemini(prompt: str) -> Optional[dict]:
             for attempt in range(2):
                 try:
                     client = genai.Client(api_key=key)
-                    resp = client.models.generate_content(model=model_name, contents=prompt)
+                    # Low temperature → stable, repeatable decisions (less run-to-run
+                    # swing in score/action). Was default (~1.0) which made the same
+                    # setup swing e.g. 5/10 ↔ 8/10 between calls.
+                    resp = client.models.generate_content(
+                        model=model_name, contents=prompt,
+                        config={"temperature": 0.15})
                     raw  = re.sub(r"```json|```", "", resp.text.strip()).strip()
                     result = json.loads(raw)
                     result["_model"] = model_name
@@ -835,6 +840,9 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
     vol_v   = _volume_surge(vol)
     mom_v   = _momentum(close)
     sr_v    = _sr(df_d) if df_d is not None else {"support": 0, "resistance": 0}
+    # Intraday swing S/R from the bars themselves (last 20) — tight, scalp-relevant
+    # levels, unlike the wide daily 30-bar range. Critical for ultra-short entries.
+    isr_v   = _sr(df, lookback=20)
 
     buy_s, sell_s, alerts = _score(price, rsi_v, macd_v, ema9, ema21,
                                    boll_v, vol_v, stoch_v, vwap_v, mom_v)
@@ -857,10 +865,259 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
         "vol":        vol_v,
         "mom":        mom_v,
         "sr":         sr_v,
+        "isr":        isr_v,   # intraday swing S/R (tight) — used by the scalp card
         "buy_score":  buy_s,
         "sell_score": sell_s,
         "alerts":     alerts,
     }
+
+
+# ─── 超短线 30-MIN SCALP 决策仪表盘（多周期 + AI）─────────────────────────────
+# 灵感来自 daily_stock_analysis 的「决策仪表盘」，但为 *超短线*（持仓 15-60min）
+# 重新设计：主周期 30M（结构/趋势）+ 触发周期 5M（精确入场），点位贴近现价。
+# 价格全部来自 MooMoo 券商实时源（snapshot last_price + 已修复的 kline）。
+
+def _trend_label(tech: dict) -> str:
+    """一句话趋势：多头 / 空头 / 震荡 —— 看 EMA9/21 排列 + 价格位置 + MACD。"""
+    ema9, ema21, price = tech["ema9"], tech["ema21"], tech["price"]
+    above = price > tech["vwap"]
+    if ema9 > ema21 and price > ema9:
+        return "🟢多头" + ("·强" if (tech["macd"]["above"] and above) else "")
+    if ema9 < ema21 and price < ema9:
+        return "🔴空头" + ("·强" if (not tech["macd"]["above"] and not above) else "")
+    return "🟡震荡"
+
+
+def _call_deepseek_json(prompt: str) -> Optional[dict]:
+    """通用 DeepSeek 调用，返回第一个 {...} JSON 对象 dict，失败返回 None。
+    deepseek 是 reasoning 模型 → max_tokens 给足，否则 JSON 被推理内容挤断。"""
+    if not settings.deepseek_key:
+        return None
+    import requests
+    try:
+        r = requests.post(
+            f"{settings.deepseek_base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.deepseek_key}",
+                     "Content-Type": "application/json"},
+            json={"model": settings.deepseek_model,
+                  "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.1, "stream": False, "max_tokens": 4000},
+            timeout=60,
+        )
+        r.raise_for_status()
+        content = (r.json()["choices"][0]["message"].get("content") or "").strip()
+        s, e = content.find("{"), content.rfind("}")
+        if s == -1 or e <= s:
+            return None
+        out = json.loads(content[s:e + 1])
+        out["_model"] = settings.deepseek_model
+        return out
+    except Exception as ex:
+        log.warning("scalp DeepSeek call failed: %s", ex)
+        return None
+
+
+def _scalp_ai(t30: dict, t5: dict, ticker_news: list, macro_news: list,
+              ctx_text: str) -> dict:
+    """超短线 AI 决策。Gemini → DeepSeek → 纯技术 fallback。返回富 dict。"""
+    news_text = "\n".join(
+        f"- {n['title'][:78]}" for n in ticker_news[:4]) or "无近期新闻"
+    macro_text = "\n".join(f"- {n['title'][:64]}" for n in macro_news[:2]) or "无"
+    atr5 = t5["atr"]
+
+    prompt = f"""你是顶级美股超短线 scalper（持仓 15-60 分钟，分钟级进出）。基于多周期实时数据给出一份*超短线决策仪表盘*。
+
+【{t30['ticker']} {t30['company']}】 实时价 ${t30['price']} | 当日 {t30['chg1']:+.2f}%
+
+主周期 30分钟K线（结构/趋势）:
+- RSI(7)={t30['rsi']} | MACD hist={t30['macd']['hist']:+.4f}(金叉={t30['macd']['cross_up']} 死叉={t30['macd']['cross_down']})
+- EMA9={t30['ema9']:.2f}/EMA21={t30['ema21']:.2f} | VWAP=${t30['vwap']} | BB%B={t30['boll']['pct_b']}({t30['boll']['breakout']})
+- Stoch K={t30['stoch']['k']}/D={t30['stoch']['d']} | ATR={t30['atr']} | 量比={t30['vol']['ratio']}x | 动能={t30['mom']:+.2f}%
+- 技术评分 买{t30['buy_score']}/卖{t30['sell_score']} | 警报:{', '.join(t30['alerts']) or '无'}
+
+触发周期 5分钟K线（精确入场）:
+- RSI(7)={t5['rsi']} | MACD hist={t5['macd']['hist']:+.4f}(金叉={t5['macd']['cross_up']} 死叉={t5['macd']['cross_down']})
+- EMA9={t5['ema9']:.2f}/EMA21={t5['ema21']:.2f} | VWAP=${t5['vwap']} | Stoch K={t5['stoch']['k']} | 量比={t5['vol']['ratio']}x | 动能={t5['mom']:+.2f}% | ATR(5M)={atr5}
+
+日内结构(30M近20根): 支撑 ${t30['isr']['support']} | 压力 ${t30['isr']['resistance']}
+日线大区间: 低 ${t30['sr']['support']} | 高 ${t30['sr']['resistance']}
+市场背景:
+{ctx_text or '无'}
+个股新闻:
+{news_text}
+宏观:
+{macro_text}
+
+任务：超短线（分钟级）决策。点位必须*贴近现价*且紧凑——用 5分钟ATR({atr5})、VWAP、日内支撑/压力为锚。
+要求 30M 与 5M 多周期共振才给高分；逆势只给观望/低分。财报<2天一律保守。
+
+严格只返回 JSON（无代码块、无多余文字）:
+{{"score":1-10整数,"action":"强烈买入/买入/观望/卖出/强烈卖出","verdict":"核心结论一句话(≤30字)",
+"trend":"30M与5M多周期趋势是否共振(≤28字)","entry_low":数字,"entry_high":数字,
+"target_1":数字,"target_2":数字,"stop_loss":数字,"rr":"盈亏比如1:2.1",
+"risks":["风险(≤14字)"],"catalyst":"催化/新闻影响(≤22字)","checklist":["可执行步骤(≤20字)"],
+"hold":"预计持仓如15-45min","confidence":"高/中/低"}}"""
+
+    ai = _call_gemini(prompt) or _call_deepseek_json(prompt)
+    if ai:
+        log.info("scalp AI [%s] %s → %s (%s/10)", ai.get("_model", "?"),
+                 t30["ticker"], ai.get("action"), ai.get("score"))
+        # 防御：list 字段可能被模型返回成 str
+        for k in ("risks", "checklist"):
+            if isinstance(ai.get(k), str):
+                ai[k] = [ai[k]]
+            ai[k] = ai.get(k) or []
+        return ai
+
+    # 纯技术 fallback（AI 全挂）— 用 30M 评分 + 5M ATR 给紧凑点位
+    net = t30["buy_score"] - t30["sell_score"]
+    score = max(1, min(10, 5 + net // 2))
+    p, a5 = t30["price"], atr5
+    bullish = net >= 0
+    return {
+        "score": score, "action": _action_from_scores(t30["buy_score"], t30["sell_score"]),
+        "verdict": "AI不可用，纯技术信号",
+        "trend": f"30M {_trend_label(t30)} / 5M {_trend_label(t5)}",
+        "entry_low": round(p - a5 * 0.4, 2), "entry_high": round(p + a5 * 0.4, 2),
+        "target_1": round(p + a5 * (1.2 if bullish else -1.2), 2),
+        "target_2": round(p + a5 * (2.0 if bullish else -2.0), 2),
+        "stop_loss": round(p - a5 * (1.2 if bullish else -1.2), 2),
+        "rr": "1:1.7", "risks": ["AI不可用"], "catalyst": "未知",
+        "checklist": [f"现价{p}附近触发", f"破止损即离场"],
+        "hold": "15-45min", "confidence": "低", "_model": "fallback",
+    }
+
+
+def _build_scalp_card(t30: dict, t5: dict, ai: dict, ctx_text: str,
+                      sentiment: Optional[dict], ts: str) -> str:
+    score = int(ai.get("score") or 5)
+    act_e = ACTION_EMOJI.get(ai.get("action", "观望"), "🟡")
+    conf_e = CONF_EMOJI.get(ai.get("confidence", "中"), "✋")
+    chg1 = t30.get("chg1") or 0.0
+    arrow = "📈" if chg1 >= 0 else "📉"
+    src_tag = " 🕓盘前" if t30.get("price_src") == "pre" else ""
+    reson = "✅共振" if _trend_label(t30)[:3] == _trend_label(t5)[:3] and "震荡" not in _trend_label(t30) else "⚠️背离/震荡"
+    # rr 清洗：模型常把模板占位词("如2.1")混进来 → 只抽 "数字:数字"
+    _rr = str(ai.get("rr", "") or "")
+    _m = re.search(r"[\d.]+\s*[:：]\s*[\d.]+", _rr)
+    rr = _m.group(0).replace("：", ":") if _m else (_rr or "?")
+    risks = " · ".join(ai.get("risks", [])[:3]) or "无明显风险"
+    checklist = "\n".join(f"   {i+1}. {s}" for i, s in enumerate(ai.get("checklist", [])[:4])) or "   —"
+    finbert_line = _finbert_line(sentiment)
+    ctx_section = f"\n{ctx_text}\n" if ctx_text else ""
+
+    return (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ *超短线* {t30['ticker']} {t30['company']}\n"
+        f"${t30['price']} {arrow}{chg1:+.2f}%{src_tag}  ·  {ts}\n"
+        f"\n"
+        f"{act_e} *{ai.get('action','?')}*  {_score_bar(score)}\n"
+        f"🧭 {ai.get('verdict','')}\n"
+        f"\n"
+        f"📐 趋势 {reson}: {ai.get('trend','')}\n"
+        f"   30M {_trend_label(t30)} · 5M {_trend_label(t5)}\n"
+        f"\n"
+        f"🎯 入场 ${_ai_num(ai,'entry_low'):.2f} ~ ${_ai_num(ai,'entry_high'):.2f}\n"
+        f"📍 T1 *${_ai_num(ai,'target_1'):.2f}*  ·  T2 *${_ai_num(ai,'target_2'):.2f}*\n"
+        f"🛑 止损 *${_ai_num(ai,'stop_loss'):.2f}*  ·  盈亏比 {rr}  ·  ⏱ {ai.get('hold','?')}\n"
+        f"\n"
+        f"🚨 风险: {risks}\n"
+        f"🔮 催化: {ai.get('catalyst') or '-'}\n"
+        f"✅ 操作清单:\n{checklist}\n"
+        f"\n"
+        f"📊 30M 买{t30['buy_score']}/卖{t30['sell_score']} · RSI{t30['rsi']} · MACD{t30['macd']['hist']:+.3f} · VWAP${t30['vwap']} · Vol{t30['vol']['ratio']}x\n"
+        f"   5M  RSI{t5['rsi']} · MACD{t5['macd']['hist']:+.3f} · VWAP${t5['vwap']} · Vol{t5['vol']['ratio']}x · 动能{t5['mom']:+.2f}%\n"
+        f"   日内 支撑${t30['isr']['support']} · 压力${t30['isr']['resistance']} · ATR(5M){t5['atr']}\n"
+        f"   日线区间 ${t30['sr']['support']}~${t30['sr']['resistance']}\n"
+        f"{ctx_section}"
+        f"{finbert_line}"
+        f"🤖 {ai.get('_model','?')}  ·  {conf_e}{ai.get('confidence','?')}信心\n"
+        f"⚠️ 超短线高风险，仅供参考，严格止损。"
+    )
+
+
+def analyze_ultrashort(symbol: str, send: bool = False, min_net: int = 0) -> Optional[str]:
+    """单只股票的超短线 30-min 决策卡。返回卡片文本（None=数据不足/信心不足）。
+    send=True 时同时推送到 notifier。
+    min_net>0 时做 *确定性技术信心* 预筛：|30M 买-卖| < min_net 直接跳过(不调 AI、
+    不推送)。回测显示弱信号≈噪音，net≥5(强烈买/卖)才值得推 → 自动扫描传 min_net=5。"""
+    symbol = symbol.strip().upper()
+    import pytz
+    from datetime import datetime
+    ts = datetime.now(pytz.timezone("America/New_York")).strftime("%m-%d %H:%M ET")
+
+    df_d_cache: dict = {}
+    with _moomoo_client() as c:
+        t30 = _fetch_tech(c, symbol, KLType.K_30M, 120, df_d_cache)
+        t5 = _fetch_tech(c, symbol, KLType.K_5M, 120, df_d_cache)
+        if not t30 or not t5:
+            log.warning("scalp %s: data insufficient (30M=%s 5M=%s)",
+                        symbol, bool(t30), bool(t5))
+            return None
+        # 强信号预筛 — 在花 AI 调用前用便宜的技术信心过滤掉弱/观望信号。
+        net = t30["buy_score"] - t30["sell_score"]
+        if min_net > 0 and abs(net) < min_net:
+            log.info("scalp %s: 跳过（技术信心不足 net=%+d, 需 ≥%d）", symbol, net, min_net)
+            return None
+        # 市场背景（与盘前卡共用同一套 context helpers）
+        try:
+            vix_value = c.get_vix()
+        except Exception:
+            vix_value = 15.0
+        spy_snap = _snap_chg(c, "SPY")
+        sector_data = _sector_snap(c, symbol)
+        earnings_data = _earnings_info(symbol)
+        spread_pct = None
+        try:
+            spread_pct = c.get_spread_pct(symbol)
+        except Exception:
+            pass
+        ctx_text = _build_context_block(
+            ticker_chg_pct=t30.get("chg1", 0) or 0, vix=vix_value, spy=spy_snap,
+            sector=sector_data, earnings=earnings_data, premkt=None,
+            insider=None, spread_pct=spread_pct)
+
+    ticker_news = news_fetcher.fetch_ticker_news(symbol)
+    macro_news = news_fetcher.fetch_macro_news()
+    sentiment = None
+    if finbert_sentiment.is_available() and ticker_news:
+        sentiment = finbert_sentiment.score_headlines(
+            [n.get("title", "") for n in ticker_news[:8]])
+
+    ai = _scalp_ai(t30, t5, ticker_news, macro_news, ctx_text)
+    card = _build_scalp_card(t30, t5, ai, ctx_text, sentiment, ts)
+    if send:
+        notifier.send(card)
+    return card
+
+
+def run_scalp(symbols: Optional[list[str]] = None, min_net: int = 5) -> None:
+    """超短线扫描：对 watchlist（或指定 symbols）逐只产决策卡并推送，按评分排序。
+    默认 min_net=5 → 只推「强烈买入/强烈卖出」级别的强信号（回测显示弱信号≈噪音）。
+    本轮无强信号时静默跳过，不推空消息（启动时已确认在运行）。"""
+    wl = symbols or load_watchlist()
+    if not wl:
+        log.info("scalp: watchlist empty")
+        return
+    cards = []
+    for sym in wl:
+        try:
+            card = analyze_ultrashort(sym, send=False, min_net=min_net)
+            if card:
+                # 提取评分用于排序（卡片里嵌的 _score_bar 含 *N/10*）
+                m = re.search(r"\*(\d+)/10\*", card)
+                cards.append((int(m.group(1)) if m else 5, card))
+        except Exception as e:
+            log.exception("scalp %s failed: %s", sym, e)
+        time.sleep(0.3)
+    if not cards:
+        log.info("scalp: 本轮无强信号（%d 只全部技术信心 <%d 或数据不足）— 静默跳过",
+                 len(wl), min_net)
+        return
+    cards.sort(key=lambda x: -x[0])
+    for _, card in cards:
+        notifier.send(card)
+    log.info("scalp done — %d 张强信号卡", len(cards))
 
 
 # ─── PUBLIC API ───────────────────────────────────────────────────────────────
@@ -1055,7 +1312,8 @@ def run_loop() -> None:
     """Start the signal reporter as a standalone scheduler.
 
     Premarket full analysis:  08:30 ET (15-min + AI, once daily)
-    Opening peak compact scan: 09:30 / 10:00 / 10:30 / 11:00 / 11:30 ET (5-min, no AI)
+    Ultra-short scalp scan:    every 30 min 09:30–16:00 ET (30M+5M multi-TF + AI)
+                               — replaced the old 5-min no-AI intraday quick-scan.
     """
     import pytz
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -1082,34 +1340,37 @@ def run_loop() -> None:
         except Exception as e:
             log.exception("premarket job failed: %s", e)
 
-    def _intraday():
+    def _scalp():
         if not _is_trading_day():
             return
         now = _ny_now()
         minutes = now.hour * 60 + now.minute
+        # only inside the regular session 09:30–16:00 ET (filters the 09:00 / 16:30
+        # cron edges); AI multi-TF scalp dashboard for the whole watchlist.
         if not (9 * 60 + 30 <= minutes <= 16 * 60):
             return
         try:
-            run_intraday()
+            run_scalp()
         except Exception as e:
-            log.exception("intraday job failed: %s", e)
+            log.exception("scalp job failed: %s", e)
 
     sched.add_job(_premarket, "cron",
                   day_of_week="mon-fri", hour=8, minute=30,
                   coalesce=True, misfire_grace_time=300, max_instances=1)
 
-    for _h, _m in [(9, 30), (10, 0), (10, 30), (11, 0), (11, 30)]:
-        sched.add_job(_intraday, "cron",
-                      day_of_week="mon-fri", hour=_h, minute=_m,
-                      coalesce=True, misfire_grace_time=120, max_instances=1)
+    # Every 30 min across the whole session. cron fires 09:00…16:30; the _scalp
+    # guard drops the 09:00 and 16:30 edges → runs 09:30,10:00,…,16:00 (14×/day).
+    sched.add_job(_scalp, "cron",
+                  day_of_week="mon-fri", hour="9-16", minute="0,30",
+                  coalesce=True, misfire_grace_time=120, max_instances=1)
 
     wl = load_watchlist()
     log.info("signal_reporter started | watchlist: %s", wl)
-    log.info("schedule: premarket@08:30, intraday@09:30/10:00/10:30/11:00/11:30 ET")
+    log.info("schedule: premarket@08:30, scalp every 30min 09:30-16:00 ET")
     notifier.send(
         f"📡 *Signal Reporter 已启动*\n"
         f"watchlist: {', '.join(wl)}\n"
-        f"盘前分析@08:30 · 盘中快讯@09:30-11:30 ET"
+        f"盘前分析@08:30 · ⚡超短线@每30min(09:30-16:00 ET)"
     )
     sched.start()
 
@@ -1130,7 +1391,7 @@ def main() -> None:
 
     # For direct one-shot calls (premarket/intraday) the scheduler's basicConfig
     # is never called, so we set up logging here so warnings have timestamps.
-    if cmd in ("premarket", "intraday"):
+    if cmd in ("premarket", "intraday", "scalp"):
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s | %(message)s",
@@ -1149,6 +1410,14 @@ def main() -> None:
         run_premarket()
     elif cmd == "intraday":
         run_intraday()
+    elif cmd == "scalp":
+        # python -m src.signal_reporter scalp MU   → 单只测试（打印，不推送）
+        # python -m src.signal_reporter scalp       → 全 watchlist 扫描并推送
+        if len(sys.argv) > 2:
+            card = analyze_ultrashort(sys.argv[2], send=False)
+            print(card or "数据不足，无法生成卡片")
+        else:
+            run_scalp()
     else:
         print(main.__doc__)
 

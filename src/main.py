@@ -20,11 +20,10 @@ from . import (
     adaptive_sizing, ai_validator, approvals, audit, blacklist, clock,
     cron_state, db, executor, history, indicators, kill_switch, notifier,
     portfolio, regime as regime_mod, risk_manager, runtime_config, self_improve,
-    self_review, strategy_momentum, strategy_mr, tg_approvals, watchlist_updater,
+    self_review, strategy_momentum, strategy_mr, tg_approvals,
 )
 from .config import settings
 from .earnings import earnings_block
-from .ml import predict as ml_predict
 from .moomoo_client import client
 from .reconcile import log_reconcile, reconcile
 
@@ -133,6 +132,7 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             for _, row in real_held.iterrows():
                 sym = row["code"].split(".")[-1]
                 per_pos[sym] = {
+                    "qty": int(float(row.get("qty", 0) or 0)),
                     "last": float(row.get("nominal_price") or 0)
                             or float(row.get("market_val", 0)) / max(float(row.get("qty", 1)), 1),
                     "pl_val": float(row.get("pl_val", 0) or 0),
@@ -165,10 +165,6 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "trade_stats": portfolio.trade_stats(50),
             "skip_gates": audit.gate_summary(200),
             "last_scan_utc": clock.utc_now_corrected().isoformat(),
-            "ml_enabled": settings.ml_enabled,
-            "ml_available": ml_predict.is_available(),
-            "ml_blend_weight": settings.ml_blend_weight,
-            "ml_trained_at": ml_predict.model_meta().get("trained_at", ""),
             "phase": "trade" if full else "manage_only",
             "clock": clock.status(),
             "per_position": per_pos,
@@ -324,6 +320,7 @@ def scan_once() -> None:
                 for _, row in real_held.iterrows():
                     sym = row["code"].split(".")[-1]
                     per_pos[sym] = {
+                        "qty": int(float(row.get("qty", 0) or 0)),
                         "last": float(row.get("nominal_price") or 0),
                         "pl_val": float(row.get("pl_val", 0) or 0),
                         "pl_ratio": float(row.get("pl_ratio", 0) or 0),
@@ -355,10 +352,6 @@ def scan_once() -> None:
                 "trade_stats": portfolio.trade_stats(50),
                 "skip_gates": audit.gate_summary(200),
                 "last_scan_utc": clock.utc_now_corrected().isoformat(),
-                "ml_enabled": settings.ml_enabled,
-                "ml_available": ml_predict.is_available(),
-                "ml_blend_weight": settings.ml_blend_weight,
-                "ml_trained_at": ml_predict.model_meta().get("trained_at", ""),
                 "phase": "trade",
                 "clock": clock.status(),
                 "per_position": per_pos,
@@ -384,11 +377,6 @@ def scan_once() -> None:
         # For each ticker, keep the higher-scoring signal — they're complementary
         # and rarely both fire (trend wants ADX↑, MR wants ADX↓).
         ranked: list[indicators.Signal] = []
-        ml_scores: dict[str, float] = {}     # symbol → ML proba (0-1)
-        ml_active = settings.ml_enabled and ml_predict.is_available()
-        if ml_active:
-            log.info("ML model active (trained %s)",
-                     ml_predict.model_meta().get("trained_at", "?"))
         # Marginal-setup buffer: anything within 10 pts BELOW threshold also
         # enters the funnel, but gets half-conviction (smaller position).
         # Without this buffer the bot scores ~60 for most US large-caps and
@@ -430,10 +418,6 @@ def scan_once() -> None:
                     sig_mr = strategy_mr.evaluate(sym, df)
                     if sig_mr.score >= threshold_floor:
                         ranked.append(sig_mr)
-                if ml_active:
-                    proba = ml_predict.predict_proba(df, symbol=sym)
-                    if proba is not None:
-                        ml_scores[sym] = proba
             except Exception as e:
                 log.warning("scoring %s failed: %s", sym, e)
 
@@ -552,23 +536,11 @@ def scan_once() -> None:
             except Exception:
                 pass
 
-            # --- Layer 2: ML proba → conviction (NOT score blend) ---
-            ml_proba = ml_scores.get(sig.symbol)
-            ml_conviction = 1.0
-            ml_tag = ""
-            if ml_active and ml_proba is not None:
-                ml_tag = f" ml={ml_proba:.2f}"
-                if ml_proba < ml_predict.ML_VETO_THRESHOLD:
-                    _skip("ml_veto", f"ML proba {ml_proba:.2f} < {ml_predict.ML_VETO_THRESHOLD}")
-                    continue
-                # Neutral zone (0.35-0.55) → half size; high conviction → full size
-                ml_conviction = 0.5 if ml_proba < ml_predict.ML_BOOST_THRESHOLD else 1.0
+            # Position conviction (ML removed 2026-06-03; with the hard
+            # threshold, setup_conviction is 1.0 — kept for the VIX/DD sizing path).
+            conviction = setup_conviction
 
-            # Compose: setup quality × ML confidence. Both bands can independently
-            # halve the size — marginal-rule + neutral-ML = 0.25 quartersize.
-            conviction = setup_conviction * ml_conviction
-
-            # --- Layer 3: AI verdict (Gemini + Tavily news, independent veto) ---
+            # --- AI verdict (Gemini + Tavily news, independent advisory) ---
             # Stacking add-ons skip AI consult — we've already done the diligence
             # on the original entry, and the AI budget should reserve for fresh
             # names where context might differ. (Audit 2026-05-28.)
@@ -579,8 +551,8 @@ def scan_once() -> None:
             else:
                 ai_pass, ai_score, ai_reason = ai_validator.validate(sig)
                 ai_budget -= 1
-            log.info("%s rule=%.1f%s ai=%s conviction=%.2f (%s)",
-                     sig.symbol, sig.score, ml_tag,
+            log.info("%s rule=%.1f ai=%s conviction=%.2f (%s)",
+                     sig.symbol, sig.score,
                      "pass" if ai_pass else "veto", conviction, ai_reason)
             # 2026-06-03 live↔backtest parity: the backtest has no AI layer, so AI
             # is ADVISORY by default (logged, shown in the card) and does NOT block
@@ -609,7 +581,7 @@ def scan_once() -> None:
             # portfolio.heat_check() is kept as the heat primitive but not called.
 
             try:
-                executor.open_position(c, sig, qty, ml_proba=ml_proba)
+                executor.open_position(c, sig, qty)
                 if not is_stack_candidate:
                     new_names_opened += 1
                     held_syms.add(sig.symbol)
@@ -618,7 +590,6 @@ def scan_once() -> None:
                              extra={"qty": qty, "price": sig.price,
                                     "stop": sig.stop_loss, "tp": sig.take_profit,
                                     "vix": vix, "regime": regime.label,
-                                    "ml_proba": round(ml_proba, 3) if ml_proba is not None else None,
                                     "conviction": conviction,
                                     "setup_quality": "marginal" if marginal_setup else "full",
                                     "is_stack": is_stack_candidate,
@@ -706,31 +677,6 @@ def in_market_hours() -> bool:
         return False
     minutes = now.hour * 60 + now.minute
     return 9 * 60 + 30 <= minutes <= 16 * 60
-
-
-def _monthly_retrain_job() -> None:
-    """Background ML retrain — runs 1st of each month at 02:00 ET.
-    Uses current watchlist + 365 days. Skips on data fetch failure."""
-    log.info("monthly retrain: starting")
-    try:
-        import json
-        from .ml.train import _fetch_history, train_model, save_model
-        from .ml.dataset import LabelConfig
-        tickers = json.loads(WATCHLIST_FILE.read_text())["tickers"]
-        klines = _fetch_history(tickers, days=365, timeframe=settings.timeframe)
-        if not klines:
-            log.warning("monthly retrain aborted: no data fetched")
-            return
-        model, metrics = train_model(klines, LabelConfig())
-        save_model(model, metrics)
-        notifier.send(f"🧠 *ML retrained* AUC={metrics['auc_holdout']:.3f}  "
-                      f"acc={metrics['accuracy_holdout']*100:.1f}%  "
-                      f"({metrics['n_rows_total']:,} rows)")
-        log.info("monthly retrain: done")
-        cron_state.record_run("ml_retrain")
-    except Exception as e:
-        log.exception("monthly retrain failed: %s", e)
-        notifier.send(f"⚠ ML monthly retrain failed: {e}")
 
 
 def _weekly_backtest_validation_job() -> None:
@@ -842,25 +788,6 @@ def _daily_blacklist_review_job() -> None:
         cron_state.record_run("daily_blacklist")
     except Exception as e:
         log.exception("blacklist review failed: %s", e)
-
-
-def _weekly_watchlist_refresh_job() -> None:
-    """Sunday 22:00 ET — rebuild watchlist from S&P 500 via yfinance.
-    The scheduler will read the new file on its next scan automatically.
-    """
-    log.info("weekly watchlist refresh: starting")
-    try:
-        tickers = watchlist_updater.refresh()
-        notifier.send(
-            f"📋 Watchlist refreshed: {len(tickers)} tickers\n"
-            + ", ".join(tickers[:15])
-            + (f" ... (+{len(tickers)-15})" if len(tickers) > 15 else "")
-        )
-        log.info("weekly watchlist refresh: done (%d tickers)", len(tickers))
-        cron_state.record_run("watchlist_refresh")
-    except Exception as e:
-        log.exception("weekly watchlist refresh failed: %s", e)
-        notifier.send(f"⚠ Watchlist refresh failed: {e}")
 
 
 def _weekly_self_review_job() -> None:
@@ -984,18 +911,12 @@ def run_loop() -> None:
         misfire_grace_time=60,
         max_instances=1,
     )
-    # 2026-06-03 DISABLED (feedback 铁律 — no silent execution):
-    #   • Monthly ML retrain silently OVERWROTE data/ml/model.joblib with no
-    #     quality/approval gate (and ran even with ML_ENABLED=false).
-    #   • Weekly watchlist refresh silently REWROTE config/watchlist.json,
-    #     able to swap out the pinned universe behind the owner's back.
-    # Both functions are kept and remain available as MANUAL, owner-initiated
-    # GUI actions (which is acceptable — the owner triggers them knowingly).
-    #   sched.add_job(_monthly_retrain_job, "cron", day=1, hour=2, minute=0, ...)
-    #   sched.add_job(_weekly_watchlist_refresh_job, "cron", day_of_week="sun", ...)
+    # 2026-06-03: watchlist is PINNED to 10; universe changes go through the
+    # weekly self-review → approval queue (no auto-refresh, no manual button).
+    # ML retrain removed entirely (subsystem deleted after proving inert).
 
     # Weekly backtest validation: Sunday 22:30 ET — health-check the strategy
-    # on a rolling 90-day window. Runs AFTER watchlist refresh so we evaluate
+    # on a rolling 90-day window.
     # on the fresh ticker set.
     sched.add_job(_weekly_backtest_validation_job, "cron",
                   day_of_week="sun", hour=22, minute=30,
