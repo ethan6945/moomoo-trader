@@ -34,15 +34,13 @@ class Settings:
     gemini_keys: tuple = tuple(
         k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()
     )
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
     tavily_key: str = os.getenv("TAVILY_API_KEY", "")
 
-    # DeepSeek — autonomous optimizer (OpenAI-compatible API). Owner adds the
-    # key to .env later; blank = optimizer stays in rules-only suggest mode.
-    deepseek_key: str = os.getenv("DEEPSEEK_API_KEY", "")
-    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-    deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    # (DeepSeek removed 2026-06-08 — the whole system is unified on Gemini 3.5
+    # Flash. The autonomous optimizer now asks Gemini for proposals via
+    # gemini_model below; no second provider/key to manage.)
 
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -101,6 +99,24 @@ class Settings:
     # multipliers (2×, 2.5×) were over-fit noise on ~40 trades — do not chase them.
     regime_bull_mult: float = _float("REGIME_BULL_MULT", 1.0)
     regime_vix_calm: float = _float("REGIME_VIX_CALM", 20.0)
+
+    # Gap-risk sentinel (2026-06-08): for HELD positions, exit DURING regular hours
+    # before a likely overnight gap (a stop can't catch a gap — it fills past the
+    # stop). Two layers: (1) deterministic — exit if earnings is within
+    # GAP_EXIT_EARNINGS_DAYS; (2) AI — Gemini judges fresh PUBLIC bad news and only
+    # sells on a high-confidence verdict (≥ GAP_SENTINEL_AI_MIN_CONF), fail-safe to
+    # HOLD on any error. Default OFF (inert) — set GAP_SENTINEL_ENABLED=true to arm.
+    # The AI decision overrides the strategy's hold; every exit fires a notification.
+    gap_sentinel_enabled: bool = os.getenv("GAP_SENTINEL_ENABLED", "false").lower() in ("1", "true", "yes")
+    gap_exit_earnings_days: int = _int("GAP_EXIT_EARNINGS_DAYS", 1)
+    gap_sentinel_ai: bool = os.getenv("GAP_SENTINEL_AI", "true").lower() in ("1", "true", "yes")
+    gap_sentinel_ai_min_conf: int = _int("GAP_SENTINEL_AI_MIN_CONF", 70)
+    # Cost control: the AI gap layer uses ONE fixed model (not the entry cascade),
+    # runs at PRE-MARKET only by default (gap_sentinel_ai_intraday=False skips the
+    # ~11 per-scan AI calls/day — the deterministic earnings layer still runs every
+    # scan for free), and skips the Gemini call entirely when there's no fresh news.
+    gap_sentinel_model: str = os.getenv("GAP_SENTINEL_MODEL", "gemini-2.5-flash-lite")
+    gap_sentinel_ai_intraday: bool = os.getenv("GAP_SENTINEL_AI_INTRADAY", "false").lower() in ("1", "true", "yes")
 
     # 3-tranche scale-out (2026-05-30 cash-frontier finding: banking partials and
     # recycling the cash is the best NO-LEVERAGE lever for a real $5k account —
@@ -166,19 +182,19 @@ def derive_max_positions(capital: float) -> int:
     n = round(capital / slot)
     return max(settings.max_positions, min(settings.max_positions_cap, n))
 
-# Free-tier model cascade: strongest → lightest.
-# GEMINI_MODEL is tried first; on 429 the cascade continues downward.
-# User can override the starting model via GEMINI_MODEL env var
-# (e.g. "gemini-2.5-pro" if they want the strongest available).
+# Model cascade: GEMINI_MODEL is tried first; on 429/quota it continues downward
+# to a cheaper fallback so a transient quota hit doesn't blank the AI. The system
+# is unified on Gemini 3.5 Flash (2026-06-08); the lite tier is only an emergency
+# quota fallback. Override the starting model via the GEMINI_MODEL env var.
 GEMINI_FREE_CASCADE = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
 ]
 
 
 def gemini_cascade() -> list[str]:
     """Full cascade starting from the configured model, deduped."""
-    primary = settings.gemini_model or "gemini-2.5-flash"
+    primary = settings.gemini_model or "gemini-3.5-flash"
     seen: set[str] = set()
     result = []
     for m in [primary] + GEMINI_FREE_CASCADE:

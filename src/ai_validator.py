@@ -113,3 +113,90 @@ def validate(signal: Signal) -> tuple[bool, int, str]:
 
     log.warning("AI validator: all models exhausted for %s — defaulting to pass", signal.symbol)
     return True, 50, "AI quota exhausted across all models — neutral"
+
+
+GAP_PROMPT = """You are an EXIT risk gate for an automated US-stock trading bot.
+
+The bot currently HOLDS {symbol}. We want to avoid carrying it into a likely
+GAP-DOWN at the next session (an overnight gap fills past our stop-loss, so the
+stop can't protect us — the only defense is to exit NOW, during regular hours,
+while there is still liquidity).
+
+Recent news (last 3 days):
+{ticker_news}
+
+Macro / market context:
+{macro_news}
+
+Judge ONLY concrete, already-PUBLIC catalysts that raise overnight gap-DOWN risk:
+- a fresh analyst downgrade, price-target cut, or sell rating
+- a lawsuit, SEC action, fraud/accounting probe, or guidance cut
+- sector-wide bad news (tariffs, regulation, a peer's blow-up) hitting tonight
+- a scheduled binding event tonight/tomorrow that reads clearly negative
+Do NOT try to predict an earnings NUMBER — you cannot, and an unknown coin-flip
+is NOT a reason to sell. Sell ONLY on concrete negative news above.
+
+Respond with STRICT JSON, no markdown fence:
+{{"action": "sell" | "hold", "confidence": 0-100, "reason": "one sentence citing the specific headline; if holding, say why"}}
+
+If you have no concrete negative catalyst, default to "hold".
+"""
+
+
+def assess_gap_risk(symbol: str) -> tuple[bool, int, str]:
+    """EXIT-side check for a HELD name: is there concrete public bad news raising
+    overnight gap-DOWN risk? Returns (should_sell, confidence_0_100, reason).
+
+    FAIL-SAFE: any missing key / quota / error / malformed reply → (False, 0, ...)
+    i.e. HOLD. We never liquidate a real position on AI doubt — only on a clear,
+    high-confidence 'sell' verdict citing concrete negative news.
+    """
+    keys = list(settings.gemini_keys)
+    if not keys:
+        return False, 0, "no Gemini key — sentinel AI layer inert (hold)"
+
+    # Cost control: skip the Gemini call entirely when there is no fresh ticker
+    # news — no news ⇒ no concrete catalyst ⇒ hold, for free.
+    try:
+        news_items = news_fetcher.fetch_ticker_news(symbol)
+    except Exception as e:
+        return False, 0, f"news fetch failed ({e}) — hold"
+    if not news_items:
+        return False, 0, "no fresh ticker news — hold (no AI call)"
+
+    try:
+        ticker_news = news_fetcher.format_news(news_items, "Ticker news")
+        macro_news = news_fetcher.format_news(news_fetcher.fetch_macro_news(), "Macro")
+    except Exception as e:
+        return False, 0, f"news format failed ({e}) — hold"
+    prompt = GAP_PROMPT.format(symbol=symbol, ticker_news=ticker_news, macro_news=macro_news)
+
+    # Cost control: ONE fixed cheap model (not the strongest-first entry cascade).
+    import time
+    model_name = settings.gap_sentinel_model
+    for key in keys:
+        for attempt in range(2):
+            try:
+                client = genai.Client(api_key=key)
+                resp = client.models.generate_content(model=model_name, contents=prompt)
+                text = resp.text.strip()
+                match = re.search(r"\{.*\}", text, re.DOTALL)
+                payload = json.loads(match.group(0) if match else text)
+                action = str(payload.get("action", "hold")).lower()
+                confidence = int(payload.get("confidence", 0))
+                reason = payload.get("reason", "")
+                should_sell = action == "sell"
+                log.info("gap sentinel [%s] %s → %s (%d)", model_name, symbol, action, confidence)
+                return should_sell, confidence, reason
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    break  # quota on this key → try next key
+                if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
+                    time.sleep(4)
+                    continue
+                log.warning("gap sentinel: %s error on %s: %s", model_name, symbol, e)
+                break
+    # Exhausted → FAIL-SAFE hold (never sell on AI unavailability).
+    log.warning("gap sentinel: AI unavailable for %s — holding (fail-safe)", symbol)
+    return False, 0, "AI unavailable — hold (fail-safe)"

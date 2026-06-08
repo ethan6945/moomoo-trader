@@ -1,14 +1,14 @@
-"""Autonomous optimizer (DeepSeek v4-flash) — PROPOSES, never decides.
+"""Autonomous optimizer (Gemini 3.5 Flash) — PROPOSES, never decides.
 
-Given the weekly real-fill self-review, it asks DeepSeek for parameter-change
+Given the weekly real-fill self-review, it asks Gemini for parameter-change
 proposals (entry threshold / TP / SL) and writes them to the APPROVAL QUEUE.
 The owner approves in the GUI/CLI; only then does a change take effect (runtime
 override, no restart). This is the feedback-铁律 implementation of requirement
 #8 — the system can optimize itself, but every change passes through the owner.
 
-DeepSeek's API is OpenAI-compatible; we call it over plain HTTPS (requests) so
-no extra SDK dependency is needed. With DEEPSEEK_API_KEY blank, this is a no-op
-(the rules-based suggestions in self_review still run).
+Uses the same Gemini model the rest of the system runs on (unified 2026-06-08;
+DeepSeek removed). With no GEMINI_API_KEYS configured this is a no-op (the
+rules-based suggestions in self_review still run).
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import json
 import logging
 
 from . import approvals, runtime_config
-from .config import settings
+from .config import settings, gemini_cascade
 
 log = logging.getLogger(__name__)
 
@@ -40,50 +40,43 @@ def _current_params() -> dict:
     }
 
 
-def _call_deepseek(review: dict) -> list[dict]:
-    """Call DeepSeek chat completions. Returns parsed proposals or []."""
-    if not settings.deepseek_key:
+def _call_gemini(review: dict) -> list[dict]:
+    """Ask Gemini (unified system model) for parameter-change proposals. Returns
+    parsed proposals or []. No-op when no Gemini key is configured."""
+    keys = list(settings.gemini_keys)
+    if not keys:
         return []
-    import requests
-    payload = {
-        "model": settings.deepseek_model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content":
-                "Current params: " + json.dumps(_current_params())
-                + "\nReal-fill review (last week): " + json.dumps({
-                    k: review.get(k) for k in
-                    ("n_trades", "per_day", "win_rate", "avg_r_multiple",
-                     "by_strategy", "by_exit", "target_note")
-                })},
-        ],
-        "temperature": 0.2,
-        "stream": False,
-        # deepseek-v4-flash is a REASONING model: completion tokens cover
-        # reasoning_content FIRST, then the answer. Too few tokens and the JSON
-        # gets truncated mid-string. 4000 leaves ample room for both.
-        "max_tokens": 4000,
-    }
-    try:
-        r = requests.post(
-            f"{settings.deepseek_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.deepseek_key}",
-                     "Content-Type": "application/json"},
-            json=payload, timeout=60,
-        )
-        r.raise_for_status()
-        content = (r.json()["choices"][0]["message"].get("content") or "").strip()
-        # Robust extraction: pull the first [...] JSON array out of the content
-        # (tolerates code fences or stray prose around it).
-        start, end = content.find("["), content.rfind("]")
-        if start == -1 or end == -1 or end <= start:
-            log.warning("DeepSeek optimizer: no JSON array in response")
-            return []
-        proposals = json.loads(content[start:end + 1])
-        return proposals if isinstance(proposals, list) else []
-    except Exception as e:
-        log.warning("DeepSeek optimizer call failed: %s", e)
-        return []
+    from google import genai
+    prompt = (
+        _SYSTEM
+        + "\n\nCurrent params: " + json.dumps(_current_params())
+        + "\nReal-fill review (last week): " + json.dumps({
+            k: review.get(k) for k in
+            ("n_trades", "per_day", "win_rate", "avg_r_multiple",
+             "by_strategy", "by_exit", "target_note")
+        })
+        + "\n\nReply ONLY with the JSON array."
+    )
+    for model_name in gemini_cascade():
+        for key in keys:
+            try:
+                client = genai.Client(api_key=key)
+                resp = client.models.generate_content(model=model_name, contents=prompt)
+                content = (resp.text or "").strip()
+                # Pull the first [...] array out (tolerates fences / stray prose).
+                start, end = content.find("["), content.rfind("]")
+                if start == -1 or end == -1 or end <= start:
+                    log.warning("Gemini optimizer: no JSON array in response")
+                    return []
+                proposals = json.loads(content[start:end + 1])
+                return proposals if isinstance(proposals, list) else []
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    continue  # quota on this key → next key
+                log.warning("Gemini optimizer call failed (%s): %s", model_name, e)
+                break
+    return []
 
 
 # Map a tunable param key → the BacktestConfig field it overrides.
@@ -164,7 +157,7 @@ def _prep_base():
 
 
 def validate_proposals(proposals: list[dict]) -> list[dict]:
-    """YIELD-seeking gate (for DeepSeek's threshold/tp/sl ideas): keep only
+    """YIELD-seeking gate (for the LLM's threshold/tp/sl ideas): keep only
     proposals that BEAT baseline $/day on BOTH windows AND don't worsen drawdown
     by more than DD_TOLERANCE_PP — so chasing $/day can't rubber-stamp reckless
     settings. Annotated with deltas + dd. Empty if the backtest can't run."""
@@ -247,12 +240,12 @@ def backtest_risk_change(value: float) -> dict | None:
 
 
 def propose_from_review(review: dict) -> int:
-    """Weekly: DeepSeek proposes param tweaks → each is BACKTESTED on the honest
+    """Weekly: Gemini proposes param tweaks → each is BACKTESTED on the honest
     engine → only proposals that beat the current config on BOTH 180d & 360d are
     enqueued for your approval (annotated with the measured $/day gain). Plausible-
-    but-unvalidated LLM ideas are dropped. No-op (0) without a DeepSeek key.
+    but-unvalidated LLM ideas are dropped. No-op (0) without a Gemini key.
     """
-    proposals = _call_deepseek(review)
+    proposals = _call_gemini(review)
     if not proposals:
         return 0
     validated = validate_proposals(proposals)
@@ -266,7 +259,7 @@ def propose_from_review(review: dict) -> int:
                 f"+${d.get(360, 0):.1f}/day(360d,DD{dd.get(360, 0):.1f}%)")
         approvals.enqueue(
             kind="param_change",
-            detail=f"DeepSeek (验证过): {key} {cur} → {value} — {gain}. {p.get('rationale', '')}",
+            detail=f"Gemini (验证过): {key} {cur} → {value} — {gain}. {p.get('rationale', '')}",
             action=f"Set {key} = {value} (live, no restart)",
             payload={"key": key, "value": float(value)},
         )

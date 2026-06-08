@@ -648,6 +648,44 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
             except Exception as e:
                 log.warning("blacklist auto-close %s failed: %s", symbol, e)
 
+    # --- Auto-flush 0.5: gap-risk sentinel (earnings + AI, pre-close exit) ---
+    # Exit a held name DURING regular hours when it carries a known overnight
+    # gap-down catalyst (earnings imminent, or fresh public bad news). A stop
+    # can't catch a gap, so this acts before it. AI decision overrides the
+    # strategy's hold; FAIL-SAFE (holds on any doubt). Every exit notifies.
+    from .config import settings as _settings
+    if _settings.gap_sentinel_enabled:
+        from . import gap_sentinel
+        for symbol in list(trades.keys()):
+            try:
+                # RTH per-scan: earnings layer always; AI only if intraday AI is on
+                # (default off → no per-scan Gemini cost; pre-market job does AI).
+                should_exit, reason = gap_sentinel.assess(
+                    symbol, use_ai=_settings.gap_sentinel_ai_intraday)
+            except Exception as e:
+                log.warning("gap-sentinel assess %s failed: %s — holding", symbol, e)
+                continue
+            if not should_exit:
+                continue
+            last = _last_price(client, symbol)
+            if last is None:
+                continue   # halted/anomalous — don't sell at $0, re-check next scan
+            try:
+                pnl, action = _force_close(client, symbol, trades[symbol],
+                                           last, "GAP_RISK")
+                actions.append(action)
+                trades.pop(symbol)
+                log.warning("Gap-sentinel close: %s @ $%.2f (pnl=%.2f) — %s",
+                            symbol, last, pnl, reason)
+                try:
+                    from . import notifier
+                    notifier.send(f"⚠️ 跳空哨兵平仓: {symbol} @ ${last:.2f} "
+                                  f"(已实现 ${pnl:+.0f}) — {reason}")
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning("gap-sentinel close %s failed: %s", symbol, e)
+
     # --- Auto-flush 1: over-capacity flush ---
     # If we hold MORE than MAX_POSITIONS (e.g. user just tightened the cap),
     # close the worst-performing one (most negative unrealized R) to free a slot.
@@ -694,6 +732,32 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
 
     _save_open_trades(trades)
     return actions
+
+
+def close_position(client: MoomooClient, symbol: str, reason: str = "MANUAL") -> dict:
+    """Cancel any bracket legs, then market-sell the tracked position at a FRESH
+    real-time price (refuses if halted/anomalous, leaving brackets intact). The
+    `reason` labels the trade log + returned action. Used by the gap-sentinel
+    at-open exit so the fill happens against real liquidity, not a stale price."""
+    trades = _load_open_trades()
+    if symbol not in trades:
+        raise RuntimeError(f"no tracked position for {symbol}")
+    trade = trades[symbol]
+    last = _last_price(client, symbol)
+    if last is None:
+        raise RuntimeError(f"{symbol} price looks halted/anomalous — refusing to "
+                           f"market-sell at ~$0; brackets left intact, retry next cycle.")
+    for key in ("stop_order_id", "tp_order_id"):
+        oid = trade.get(key)
+        if oid:
+            ok = client.cancel_order(oid)
+            log.info("close_position(%s): cancel %s leg %s → %s", reason, key, oid, ok)
+    client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
+    pnl = _close_and_log(symbol, trade, trade["qty"], last, reason)
+    trades.pop(symbol)
+    _save_open_trades(trades)
+    return {"type": reason.lower(), "symbol": symbol, "qty": trade["qty"],
+            "price": last, "pnl": pnl}
 
 
 def manual_close(client: MoomooClient, symbol: str) -> dict:

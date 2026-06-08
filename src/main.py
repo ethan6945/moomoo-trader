@@ -18,7 +18,7 @@ from moomoo import KLType
 
 from . import (
     adaptive_sizing, ai_validator, approvals, audit, blacklist, clock,
-    cron_state, db, executor, history, indicators, kill_switch, notifier,
+    cron_state, db, executor, gap_sentinel, history, indicators, kill_switch, notifier,
     portfolio, regime as regime_mod, risk_manager, runtime_config, self_improve,
     self_review, strategy_momentum, strategy_mr, tg_approvals,
 )
@@ -826,15 +826,15 @@ def _weekly_self_review_job() -> None:
                  si.get("kelly_proposed"), si.get("universe_dropped_proposed"))
     except Exception as e:
         log.warning("self-improve proposals failed: %s", e)
-    # Autonomous DeepSeek optimizer — INDEPENDENT step so a review/notify failure
+    # Autonomous Gemini optimizer — INDEPENDENT step so a review/notify failure
     # doesn't silently skip the one auto path that proposes param changes. Reuses
-    # this run's report, else recomputes. No-op until DEEPSEEK_API_KEY is set.
+    # this run's report, else recomputes. No-op until GEMINI_API_KEYS is set.
     try:
         from . import optimizer_ai
         rev = report if report is not None else self_review.weekly_review(days=7)
         n = optimizer_ai.propose_from_review(rev)
         if n:
-            notifier.send(f"🤖 DeepSeek 优化器提了 {n} 条参数建议 — 待你在 GUI/CLI 批准。")
+            notifier.send(f"🤖 Gemini 优化器提了 {n} 条参数建议 — 待你在 GUI/CLI 批准。")
     except Exception as e:
         log.warning("weekly optimizer step failed: %s", e)
     # Bookkeeping — also independent so it always runs.
@@ -912,6 +912,65 @@ def _run_catchup_on_startup() -> None:
         pass
 
 
+def _premarket_gap_sentinel_job() -> None:
+    """PRE-OPEN (09:00 ET): pull the latest overnight news for each HELD name and
+    AI-assess overnight gap-down risk, then alert + QUEUE the flagged names for
+    exit at the open. Analysis only — places no orders (pre-market liquidity is
+    thin; the actual sell runs at the open against real liquidity)."""
+    if not settings.gap_sentinel_enabled:
+        return
+    try:
+        with client() as c:
+            positions = c.get_positions()
+        held: list[str] = []
+        if positions is not None and not positions.empty:
+            rh = positions[positions["qty"].astype(float) > 0]
+            held = [code.split(".")[-1] for code in rh["code"].tolist()]
+        flagged: list[tuple[str, str]] = []
+        for sym in held:
+            try:
+                ok, reason = gap_sentinel.assess(sym)
+                if ok:
+                    flagged.append((sym, reason))
+            except Exception as e:
+                log.warning("premarket sentinel assess %s failed: %s", sym, e)
+        gap_sentinel.queue_exits(flagged)
+        if flagged:
+            lines = "\n".join(f"• {s} — {r}" for s, r in flagged)
+            notifier.send(f"🌅 盘前跳空预警 — 开盘清仓:\n{lines}")
+        else:
+            log.info("premarket gap sentinel: %d holdings checked, none flagged", len(held))
+        cron_state.record_run("premarket_gap_sentinel")
+    except Exception as e:
+        log.exception("premarket gap sentinel failed: %s", e)
+
+
+def _open_gap_exit_job() -> None:
+    """AT THE OPEN (09:31 ET): sell the names the pre-market sentinel flagged, at
+    a fresh real-time price (real liquidity). Runs before the 09:45 entry scan so
+    a known overnight catalyst is exited at the open, not 15 minutes into it."""
+    if not settings.gap_sentinel_enabled:
+        return
+    pending = gap_sentinel.pending_exits()
+    if not pending:
+        return
+    try:
+        with client() as c:
+            for sym, reason in pending:
+                try:
+                    action = executor.close_position(c, sym, "GAP_RISK")
+                    notifier.send(f"⚠️ 开盘跳空清仓: {sym} @ ${action['price']:.2f} "
+                                  f"(已实现 ${action['pnl']:+.0f}) — {reason}")
+                except Exception as e:
+                    # Already closed (stopped out overnight), halted, or untracked
+                    # — log + skip; never abort the rest of the queue.
+                    log.warning("open gap-exit %s skipped: %s", sym, e)
+        gap_sentinel.clear_queue()
+        cron_state.record_run("open_gap_exit")
+    except Exception as e:
+        log.exception("open gap-exit job failed: %s", e)
+
+
 def run_loop() -> None:
     # Detect missed scheduled jobs and run them once before the normal loop
     # takes over. Synchronous on purpose — a quick Telegram lets the user
@@ -942,6 +1001,17 @@ def run_loop() -> None:
     # 2026-06-03: watchlist is PINNED to 10; universe changes go through the
     # weekly self-review → approval queue (no auto-refresh, no manual button).
     # ML retrain removed entirely (subsystem deleted after proving inert).
+
+    # Gap-risk sentinel — pre-open news/AI analysis (09:00 ET) + at-open exit
+    # (09:31 ET), weekdays. Analyze overnight catalysts on holdings BEFORE the
+    # open, then sell the flagged names at the open against real liquidity (a
+    # stop can't catch a gap). No-op unless GAP_SENTINEL_ENABLED.
+    sched.add_job(_premarket_gap_sentinel_job, "cron",
+                  day_of_week="mon-fri", hour=9, minute=0,
+                  coalesce=True, misfire_grace_time=1200, max_instances=1)
+    sched.add_job(_open_gap_exit_job, "cron",
+                  day_of_week="mon-fri", hour=9, minute=31,
+                  coalesce=True, misfire_grace_time=600, max_instances=1)
 
     # Weekly backtest validation: Sunday 22:30 ET — health-check the strategy
     # on a rolling 90-day window.

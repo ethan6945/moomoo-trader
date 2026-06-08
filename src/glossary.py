@@ -633,7 +633,7 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
                 "每次扫描限 5 次调用 — 不会爆 Gemini 1500 req/day 免费额度。"
             ),
             "where": "src/ai_validator.py",
-            "value": "gemini-2.5-flash",
+            "value": "gemini-3.5-flash",
         },
         "自适应仓位 (Adaptive Sizing)": {
             "name": "Adaptive Position Sizing",

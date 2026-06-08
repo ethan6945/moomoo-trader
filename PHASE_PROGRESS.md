@@ -68,6 +68,23 @@ main,optimizer_ai,portfolio,risk_manager,self_improve,self_review}.py` `web/serv
 - **诚实备注**：edge 小且全在顺风窗口量的（逆风无数据验证）。另动文件：`src/config.py`
   `src/risk_manager.py` `src/main.py` `src/backtest.py` `.env`/`.env.example`。
 
+**G — 单股 cap 70% + AI 跳空哨兵（2026-06-08，用户决定）**
+- 纠正用户"SL 能挡隔夜跳空"的误解：止损在跳空时按跳空价成交（穿过止损），OCO/软止损/盘前盘后
+  盯盘都挡不住——**跳空只能靠仓位小防**。用户从 all-in 退到 cap 70%（`MAX_POSITION_PCT` 0.40→0.70；
+  回测峰值 ~$44.6/day 90d/$5k，100% 反而不如 70%）。
+- 新建 **AI 跳空哨兵**（对已持仓、常规时段、跳空前主动出场）：L1 财报（确定性，≤
+  `GAP_EXIT_EARNINGS_DAYS` 天就收盘前清仓）；L2 AI（Gemini+Tavily 判公开坏消息，信心 ≥
+  `GAP_SENTINEL_AI_MIN_CONF` 才卖，**fail-safe：出错/超时/无 key/不确定一律持有，绝不误卖**）。
+  执行=自动卖+立刻 Telegram 通知；AI 决定压过策略持有。**防不了突发财报暴雷（靠 sizing 兜底）**。
+- 文件：新建 `src/gap_sentinel.py`；`ai_validator.assess_gap_risk()`；`config` 加 4 个 GAP_*
+  开关（默认 OFF）；`executor.manage_open_trades` 加 Auto-flush 0.5 层。`.env` 已 GAP_SENTINEL_ENABLED=true。
+- **盘前时点修正（用户要"盘前抓最新消息分析"，非盘后）**：新增 2 个 cron（`timezone=NY`）——
+  `_premarket_gap_sentinel_job`（09:00 ET 周一-五：抓隔夜新闻+AI 评估持仓+预警 Telegram+排队，
+  纯分析不下单）；`_open_gap_exit_job`（09:31 ET：用开盘**真实价**卖掉排队的名字，赶在 09:45
+  开仓扫描前）。**卖在开盘不在盘前**——盘前流动性薄、旧价挂单会挂不掉/成交更烂（用户认可）。
+  队列存 `db` kv_state（带日期戳，隔日失效）；新增 `executor.close_position(reason)`。RTH 层
+  `manage_open_trades` 保留 → 盘中突发新闻也覆盖。文件：`main.py` `executor.py` `gap_sentinel.py`。
+
 ---
 
 ## 🛠 2026-06-03 重构执行日志（ultracode，审计后落地中）

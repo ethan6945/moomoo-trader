@@ -888,38 +888,9 @@ def _trend_label(tech: dict) -> str:
     return "🟡震荡"
 
 
-def _call_deepseek_json(prompt: str) -> Optional[dict]:
-    """通用 DeepSeek 调用，返回第一个 {...} JSON 对象 dict，失败返回 None。
-    deepseek 是 reasoning 模型 → max_tokens 给足，否则 JSON 被推理内容挤断。"""
-    if not settings.deepseek_key:
-        return None
-    import requests
-    try:
-        r = requests.post(
-            f"{settings.deepseek_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.deepseek_key}",
-                     "Content-Type": "application/json"},
-            json={"model": settings.deepseek_model,
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.1, "stream": False, "max_tokens": 4000},
-            timeout=60,
-        )
-        r.raise_for_status()
-        content = (r.json()["choices"][0]["message"].get("content") or "").strip()
-        s, e = content.find("{"), content.rfind("}")
-        if s == -1 or e <= s:
-            return None
-        out = json.loads(content[s:e + 1])
-        out["_model"] = settings.deepseek_model
-        return out
-    except Exception as ex:
-        log.warning("scalp DeepSeek call failed: %s", ex)
-        return None
-
-
 def _scalp_ai(t30: dict, t5: dict, ticker_news: list, macro_news: list,
               ctx_text: str) -> dict:
-    """超短线 AI 决策。Gemini → DeepSeek → 纯技术 fallback。返回富 dict。"""
+    """超短线 AI 决策。Gemini → 纯技术 fallback。返回富 dict。"""
     news_text = "\n".join(
         f"- {n['title'][:78]}" for n in ticker_news[:4]) or "无近期新闻"
     macro_text = "\n".join(f"- {n['title'][:64]}" for n in macro_news[:2]) or "无"
@@ -958,7 +929,7 @@ def _scalp_ai(t30: dict, t5: dict, ticker_news: list, macro_news: list,
 "risks":["风险(≤14字)"],"catalyst":"催化/新闻影响(≤22字)","checklist":["可执行步骤(≤20字)"],
 "hold":"预计持仓如15-45min","confidence":"高/中/低"}}"""
 
-    ai = _call_gemini(prompt) or _call_deepseek_json(prompt)
+    ai = _call_gemini(prompt)
     if ai:
         log.info("scalp AI [%s] %s → %s (%s/10)", ai.get("_model", "?"),
                  t30["ticker"], ai.get("action"), ai.get("score"))
