@@ -13,7 +13,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import db
-from .config import settings
+from .config import derive_max_positions, settings
 from .indicators import Signal
 
 log = logging.getLogger(__name__)
@@ -128,6 +128,14 @@ def sizing_capital() -> float:
     return min(b, le) if le else b
 
 
+def max_positions() -> int:
+    """Live position-slot cap, derived from the allocated budget so it scales when
+    the owner changes capital (req#1). Mirrors the backtest engine's
+    derive_max_positions(cfg.account_usd); at the $4.5k default both clamp to the
+    max_positions floor (5), so behaviour is unchanged until capital grows."""
+    return derive_max_positions(budget_usd())
+
+
 def current_drawdown_pct() -> float:
     """Account-level drawdown as a percent, computed from peak_equity in state.
 
@@ -204,19 +212,27 @@ def _dd_size_multiplier() -> float:
 
 
 def calc_position_size(signal: Signal, vix: float = 15.0,
-                       conviction: float = 1.0) -> int:
-    """Risk-based sizing with three independent scaling layers.
+                       conviction: float = 1.0, regime_mult: float = 1.0) -> int:
+    """Risk-based sizing with independent scaling layers.
 
     Layer 1 — Base risk:      account_usd × risk_per_trade  (e.g. 2% of $4500 = $90)
     Layer 2 — Drawdown mult:  100% / 75% / 50% by recent loss streak
     Layer 3 — VIX mult:       100% / 50% / 25% by vol regime
     Layer 4 — ML conviction:  caller-supplied 0.0-1.0 multiplier
                               (0.5 for neutral-zone ML, 1.0 for high-conviction)
+    Layer 5 — Regime boost:   caller-supplied ≥1.0 UP-scaler, used ONLY in a
+                              confirmed strong bull + calm VIX (owner-approved
+                              tailwind press; default 1.0 = no change). Mirrors
+                              the honest engine's use_regime_scaling for parity.
 
-    Final qty = floor(min(risk_qty, cap_qty)) — all multipliers compose.
+    Final qty = floor(min(risk_qty, cap_qty)) — all multipliers compose, and the
+    regime boost still bows to the per-name cap so it can't breach concentration.
     """
     if conviction <= 0:
         return 0
+    # Defensive: Layer 5 is an UP-scaler only — never let a stray <1 value secretly
+    # shrink risk (that's what the DD/VIX/conviction layers are for).
+    regime_mult = max(1.0, float(regime_mult))
     dd_mult = _drawdown_risk_multiplier()
     # Account-level DD breaker (new): independent of loss-streak.
     dd_size_mult = _dd_size_multiplier()
@@ -233,7 +249,7 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     # risk_per_trade is runtime-overridable (half-Kelly proposal, owner-approved).
     from . import runtime_config
     risk_dollars = (cap * runtime_config.risk_per_trade()
-                    * dd_mult * dd_size_mult * adaptive_mult * conviction)
+                    * dd_mult * dd_size_mult * adaptive_mult * conviction * regime_mult)
 
     stop_distance = signal.price - signal.stop_loss
     if stop_distance <= 0:
@@ -392,8 +408,9 @@ def can_open_new(
     # name doesn't count — it's the same broker position with bigger qty.
     if not is_stack:
         unique_names = len(set(held_symbols) | set(pending_symbols))
-        if unique_names >= settings.max_positions:
-            return False, f"max positions ({settings.max_positions}) reached (incl. pending)"
+        cap = max_positions()
+        if unique_names >= cap:
+            return False, f"max positions ({cap}) reached (incl. pending)"
     else:
         # Stacking path — gated by stacks-count + min unrealised R-multiple.
         ok, reason = _can_stack_onto(signal, held)

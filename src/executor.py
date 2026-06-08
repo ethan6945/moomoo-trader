@@ -651,8 +651,9 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
     # --- Auto-flush 1: over-capacity flush ---
     # If we hold MORE than MAX_POSITIONS (e.g. user just tightened the cap),
     # close the worst-performing one (most negative unrealized R) to free a slot.
-    if len(trades) > _settings.max_positions:
-        excess = len(trades) - _settings.max_positions
+    cap = risk_manager.max_positions()
+    if len(trades) > cap:
+        excess = len(trades) - cap
         per_symbol_r: list[tuple[str, float]] = []
         for symbol, trade in trades.items():
             last = _last_price(client, symbol)

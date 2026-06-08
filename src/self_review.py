@@ -199,14 +199,8 @@ def run_and_notify(days: int = 7) -> dict:
                               action=s.get("action", ""), payload=s)
     except Exception as e:
         log.debug("approval enqueue skipped (channel not ready): %s", e)
-    # Autonomous optimizer (DeepSeek) — proposes param tweaks into the same
-    # approval queue. No-op until DEEPSEEK_API_KEY is set. Never auto-applies.
-    try:
-        from . import optimizer_ai
-        n = optimizer_ai.propose_from_review(report)
-        if n:
-            from . import notifier
-            notifier.send(f"🤖 DeepSeek 优化器提了 {n} 条参数建议 — 待你在 GUI/CLI 批准。")
-    except Exception as e:
-        log.debug("optimizer_ai skipped: %s", e)
+    # The autonomous DeepSeek optimizer is invoked by the caller
+    # (_weekly_self_review_job) as an INDEPENDENT step (since 2026-06-07), so a
+    # notify/review hiccup here can no longer silently skip the one auto path
+    # that proposes param changes.
     return report

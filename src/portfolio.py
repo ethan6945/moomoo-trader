@@ -49,14 +49,20 @@ def current_open_risk() -> float:
 
 
 def heat_check(signal: Signal, qty: int) -> tuple[bool, str]:
-    """Block entry if portfolio heat would exceed cap."""
+    """Block entry if portfolio heat would exceed cap.
+
+    NOTE: kept as a primitive but NOT called on the live entry path since
+    2026-06-03 (structurally redundant with per-trade risk + the budget cash
+    wall — see main.py). The cap now derives from the dynamic budget so it stays
+    correct if ever re-enabled, instead of anchoring to the static .env capital."""
     if qty <= 0:
         return False, "qty=0"
     new_risk = (signal.price - signal.stop_loss) * qty
     if new_risk <= 0:
         return True, "no positive risk"
     open_risk = current_open_risk()
-    cap = settings.account_usd * PORTFOLIO_HEAT_PCT
+    from . import risk_manager   # local import avoids any import-time cycle
+    cap = risk_manager.budget_usd() * PORTFOLIO_HEAT_PCT
     total = open_risk + new_risk
     if total > cap:
         return False, (

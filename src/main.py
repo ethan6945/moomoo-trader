@@ -428,11 +428,12 @@ def scan_once() -> None:
         # Compute current unique-symbol count (matches risk_manager's
         # MAX_POSITIONS semantics: 1 ticker = 1 slot regardless of stacks).
         held_syms = set(symbols) | set(pending_symbols)
-        currently_full = len(held_syms) >= settings.max_positions
+        cap = risk_manager.max_positions()
+        currently_full = len(held_syms) >= cap
         was_full = bool(risk_manager._load_state().get("portfolio_full_notified"))
         if currently_full and not was_full:
             notifier.send(
-                f"📦 仓位已满 {len(held_syms)}/{settings.max_positions} — "
+                f"📦 仓位已满 {len(held_syms)}/{cap} — "
                 f"暂停寻新单（仍会扫加仓机会）。\n"
                 f"持仓: {', '.join(sorted(held_syms))}"
             )
@@ -573,7 +574,16 @@ def scan_once() -> None:
                 _skip("risk", reason)
                 continue
 
-            qty = risk_manager.calc_position_size(sig, vix=vix, conviction=conviction)
+            # Regime up-scaling (owner-approved tailwind press) — mirror the honest
+            # engine exactly: boost size ONLY in a confirmed strong bull AND calm
+            # VIX. settings.regime_bull_mult defaults to 1.0 (inert) until the
+            # owner sets REGIME_BULL_MULT in .env.
+            regime_mult = (settings.regime_bull_mult
+                           if (regime is not None and regime.bullish
+                               and vix < settings.regime_vix_calm)
+                           else 1.0)
+            qty = risk_manager.calc_position_size(
+                sig, vix=vix, conviction=conviction, regime_mult=regime_mult)
 
             # 2026-06-03: portfolio.heat_check gate removed — structurally
             # non-binding (heat cap = 20% of account while per-trade risk is also
@@ -792,29 +802,47 @@ def _daily_blacklist_review_job() -> None:
 
 def _weekly_self_review_job() -> None:
     """Sunday 23:00 ET — review the past week's REAL fills and emit suggestions
-    (analyze→notify→approve). Never changes live behavior on its own."""
+    (analyze→notify→approve). Never changes live behavior on its own. Each
+    autonomous step runs in its OWN try, so a failure in one (e.g. a notify hiccup
+    in the review) can't silently skip self-improvement or the optimizer."""
     log.info("weekly self-review: starting")
+    report = None
     try:
         report = self_review.run_and_notify(days=7)
         log.info("weekly self-review done: %d trades, $%.2f/day, %d suggestions",
                  report.get("n_trades", 0), report.get("per_day", 0.0),
                  len(report.get("suggestions", [])))
-        # Evidence-based self-improvement proposals (half-Kelly risk + universe
-        # review) → approval queue. Suggest-only; owner approves.
-        try:
-            si = self_improve.run_all()
-            log.info("self-improve: kelly_proposed=%s universe_drops=%s",
-                     si.get("kelly_proposed"), si.get("universe_dropped_proposed"))
-        except Exception as e:
-            log.warning("self-improve proposals failed: %s", e)
-        approvals.purge_resolved()   # keep the approval queue bounded
-        cron_state.record_run("self_review")
     except Exception as e:
         log.exception("weekly self-review failed: %s", e)
         try:
             notifier.send(f"⚠ Weekly self-review failed: {e}")
         except Exception:
             pass
+    # Evidence-based self-improvement (half-Kelly risk + universe review) → approval
+    # queue. Reads real fills directly, so it's independent of the review/notify above.
+    try:
+        si = self_improve.run_all()
+        log.info("self-improve: kelly_proposed=%s universe_drops=%s",
+                 si.get("kelly_proposed"), si.get("universe_dropped_proposed"))
+    except Exception as e:
+        log.warning("self-improve proposals failed: %s", e)
+    # Autonomous DeepSeek optimizer — INDEPENDENT step so a review/notify failure
+    # doesn't silently skip the one auto path that proposes param changes. Reuses
+    # this run's report, else recomputes. No-op until DEEPSEEK_API_KEY is set.
+    try:
+        from . import optimizer_ai
+        rev = report if report is not None else self_review.weekly_review(days=7)
+        n = optimizer_ai.propose_from_review(rev)
+        if n:
+            notifier.send(f"🤖 DeepSeek 优化器提了 {n} 条参数建议 — 待你在 GUI/CLI 批准。")
+    except Exception as e:
+        log.warning("weekly optimizer step failed: %s", e)
+    # Bookkeeping — also independent so it always runs.
+    try:
+        approvals.purge_resolved()
+        cron_state.record_run("self_review")
+    except Exception as e:
+        log.warning("self-review bookkeeping failed: %s", e)
 
 
 def _run_catchup_on_startup() -> None:

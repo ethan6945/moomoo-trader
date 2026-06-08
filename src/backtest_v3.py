@@ -199,7 +199,7 @@ def simulate_v3(
     from .indicators import (check_gap, daily_trend_bullish, evaluate,
                              relative_strength, sector_regime_bullish)
     from . import regime as regime_mod
-    from .config import settings as _settings
+    from .config import derive_max_positions, settings as _settings
 
     # parity_mode = the mechanism-validation lens: deleveraged accounting is
     # turned OFF (size like the incumbent) and pyramiding is suppressed, so the
@@ -218,7 +218,8 @@ def simulate_v3(
     # so the A-vs-B diff-test stays byte-exact; they only bite in the strategy lens.
     _rs_gate = bool(cfg.apply_rs_gate) and not parity_mode
     _sector_regime = bool(cfg.apply_sector_regime_gate) and not parity_mode
-    _ml_conviction = bool(cfg.apply_ml_conviction_sizing) and not parity_mode
+    # (ML conviction sizing removed 2026-06-03 — apply_ml_conviction_sizing stays
+    # as an inert BacktestConfig flag; nothing reads it now.)
     # Fidelity fix 2026-06-03: live (main.py) ALWAYS scores trend + momentum_break
     # and takes the max; the honest engine previously only ran momentum when
     # apply_mr_strategy was on, so the production run (MR off) was trend-only and
@@ -598,7 +599,7 @@ def simulate_v3(
             continue
 
         # ================= (B) consider a new entry =================
-        if cfg.apply_max_positions and len(open_pos) >= _settings.max_positions:
+        if cfg.apply_max_positions and len(open_pos) >= derive_max_positions(cfg.account_usd):
             continue
 
         if cfg.sl_cooldown_hours > 0 and sym in last_sl_at:

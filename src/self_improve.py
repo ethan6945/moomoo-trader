@@ -79,14 +79,35 @@ def half_kelly_proposal(rows: list[dict] | None = None) -> bool:
     if risk is None:
         log.info("half-Kelly: %s", reason)
         return False
-    current = settings.risk_per_trade
+    # Compare against the value actually in force (runtime override beats the
+    # frozen .env), so a once-approved change converges instead of re-proposing
+    # the same card every week.
+    current = runtime_config.risk_per_trade()
     # Only propose on a material change (>= 0.5 percentage point).
     if abs(risk - current) < 0.005:
         log.info("half-Kelly: %.1f%% ≈ current %.1f%% — no change", risk * 100, current * 100)
         return False
+    # Backtest-validate on the honest engine — RISK-adjusted: a protective
+    # down-size whose $/day dips is allowed if it cuts drawdown more (Calmar↑).
+    # A change that worsens risk-adjusted return on either window is dropped. If
+    # the backtest can't run (OpenD hiccup) we still enqueue — Kelly is itself an
+    # evidence-based estimate from real fills — but mark it un-backtested.
+    from . import optimizer_ai
+    bt = optimizer_ai.backtest_risk_change(risk)
+    if bt is not None and not bt["risk_adjusted_ok"]:
+        log.info("half-Kelly: risk_per_trade %.1f%%→%.1f%% worsens risk-adjusted "
+                 "return on backtest — not enqueued", current * 100, risk * 100)
+        return False
+    if bt is not None:
+        evidence = (f" — 回测 180d ${bt['per_day'][180]:.1f}/day DD{bt['dd'][180]:.1f}% "
+                    f"vs 当前 ${bt['base_per_day'][180]:.1f}/day DD{bt['base_dd'][180]:.1f}%")
+        tag = "half-Kelly(回测验证)"
+    else:
+        evidence = " — 回测未跑(OpenD?)，依据真实成交 Kelly 估计"
+        tag = "half-Kelly"
     approvals.enqueue(
         kind="param_change",
-        detail=f"half-Kelly: risk_per_trade {current:.1%} → {risk:.1%} — {reason}",
+        detail=f"{tag}: risk_per_trade {current:.1%} → {risk:.1%} — {reason}{evidence}",
         action=f"Set risk_per_trade = {risk} (live, no restart)",
         payload={"key": "risk_per_trade", "value": risk},
     )

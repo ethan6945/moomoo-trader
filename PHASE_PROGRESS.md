@@ -1,5 +1,75 @@
 # moomoo-trader — Phase 进度交接 Note
 
+## 🤖 2026-06-07 AI 化重设计收口（A/B/C/D，ultracode + Opus 4.8，代码未 commit）
+
+> 承接 commit `a10dd52`。本批 13 文件 +261/-74，已过对抗性 review（3 视角）并修完
+> 1 must-fix + 2 should-fix + 2 nit。90d parity 回测 = **$36.47/day**（与 baseline 一致，
+> 主路径未坏）。**代码留给用户 commit**（铁律：AI 不擅自 commit/改风控）。
+
+**A — 本金动态化收口（req#1）**
+- `config.derive_max_positions(capital)`：仓位槽数由本金/`SLOT_TARGET_USD`(1000) 推导，
+  `max_positions`(5) 作 FLOOR，`max_positions_cap`(10≈池子大小) 作天花板。$4.5k 默认下
+  round(4.5)=4 被 FLOOR 抬回 5 → 行为不变，本金涨过 ~$5.5k 才开更多槽。
+- live 路径 `risk_manager.max_positions()` = `derive_max_positions(budget_usd())`，
+  `budget_usd()` 认运行时 db-state `budget_usd` 覆盖；`main`/`executor`/`portfolio` 全改读它，
+  不再硬编码 5/$5k/$4500。两个回测引擎也改 `derive_max_positions(cfg.account_usd)`。
+
+**B — 自主优化环加固（req#3）**
+- `optimizer_ai.backtest_risk_change()`：half-Kelly 改动走**风险调整 Calmar 闸**（per_day/DD 不得
+  变差）+ 绝对 DD 上限（≤base+`DD_TOLERANCE_PP`3pp），允许"降仓护盘但 $/day 略降"通过、堵住
+  "比例放大但 DD 恶化"。base 用**运行时有效** `risk_per_trade`（非冻结 .env 值）。
+- `self_improve.half_kelly_proposal`：先回测验证再进审批队列，回测没过直接 drop；None 不静默放行。
+- `main._weekly_self_review_job`：拆成独立 try（self_review / self_improve / optimizer / 记账），
+  一块挂了不拖垮其余；`self_review` 不再内部调 optimizer（改由 caller 作独立步骤）。
+- 所有 proposal 仍只进**审批队列**，绝不 auto-apply（不违反 no-silent-execution）。
+
+**C — Web 安全加固（req#4）**
+- `web/server.py`：登录失败**锁定**（per-IP，5 次/300s）+ `secure=request.is_secure` 自适应
+  cookie（HTTPS 才置 Secure，明文 LAN 不丢 cookie）+ 明文访问告警。
+- review 后补：`_login_fails` 字典**剪枝 + 滚动窗口**（加 last_seen），防轮换源 IP 无界增长，
+  且不剪当前 IP（否则计数被自己清零、锁永不触发）。
+
+**D — ML 删除收口**
+- `requirements.txt` 去掉 xgboost/scikit-learn/joblib；`.env.example` 把 ML 段换成 DeepSeek
+  Autonomous Optimizer 段;`backtest_v3` 删死变量。
+- 附带优化：`optimizer_ai._metrics` 去掉多余 `rich_metrics=True`（lean 路径已含
+  net_pnl_usd + max_dd_mtm_pct，省掉每 proposal 的 Sharpe/Sortino/MonteCarlo 白算）。
+
+**改动文件（13）**：`.env.example` `requirements.txt` `src/{backtest,backtest_v3,config,executor,
+main,optimizer_ai,portfolio,risk_manager,self_improve,self_review}.py` `web/server.py`
+
+**E — DAILY 交易模式删除（2026-06-07，用户拍板）**
+- 背景对比（5k budget）：同窗口 90d **HOUR_1 $36.47/day DD8.05% 完胜 DAILY $22.87/day DD9.81%**；
+  HOUR_1 的"180d"是假数（OpenD 小时线只回溯 ~140d，43 笔全挤在最近 ~90d，1/16–3/7 空窗 0 单），
+  真实预期把空窗算进去 ≈ **$23/day @5k**，$36 是近期顺风季高点。
+- 删 `timeframe.DAILY` TF 对象 + `current()`/`_TF_BY_NAME` 兜底改 HOUR_1 + config 默认 HOUR_1。
+- **日线数据保留**（HOUR_1 的 MTF `daily_trend_bullish` / `check_gap` / SPY-regime / `DAILY_WEIGHTS`
+  兜底打分仍用），只删"DAILY 当主交易框"这条路径。
+- 归一化兜底（config `_timeframe()` + `BacktestConfig.__post_init__`）：任何残留 "DAILY" 字符串
+  强制→HOUR_1，杜绝"小时线数据 + MTF gate 被字符串跳过"的四不像垃圾数（修前实测 $3.13/day）。
+- 验证：DAILY 请求被强制成 HOUR_1，跑出与 HOUR_1 一致的 $36.47/day，零回归。
+- 另动文件：`src/timeframe.py` `src/glossary.py`（+ `.env` 注释）。
+
+**F — 顺风加注层（regime up-scaling，2026-06-08，用户批准 ×1.4）**
+- 起因：用户想"顺风压更多注/逆风玩短/逆风切10分钟"。数据探明：**MIN_10 只有 23 天历史**
+  （逆风期 1–3月零数据）→ "逆风切10分钟"无法回测、纯盲赌，**不做**；逆风做空（现金户不可）/
+  均值回归（已证净拖累）也是死路 → "逆风赚钱"= 未解的找新 alpha 难题，不画饼。
+- 能落地的只有"顺风加注"。回测（140d/$5k）：`use_regime_scaling`（强势牛市+VIX<calm 放大单仓）
+  +$1.6–2.3/day、回撤平、胜率稳；`use_pyramiding`（浮盈滚仓）**反而亏**（5k 现金墙下占槽，
+  43→33 单）→ 不开。bull_mult 2×/2.5× 是 ~40 单上的过拟合噪声（收益↑回撤↓不合理）→ 不追。
+- 实现：实盘 `risk_manager.calc_position_size` **本来只有减仓层**，新增 Layer 5 `regime_mult`
+  上调层（折进 risk_dollars，钳 ≥1.0，仍受 `max_position_pct` cap 约束 → 不会破集中度）；
+  `main.py` 调用点按回测**同款条件**算（`regime.bullish and vix<regime_vix_calm` 才 ×mult）；
+  `config` 加 `regime_bull_mult`(默认 **1.0=inert**)/`regime_vix_calm`(20)；`_run_live_engine`
+  镜像开启读 settings → **live↔backtest 同源 parity**。
+- 验证：`REGIME_BULL_MULT=1.0` → 回测仍 **$36.47**（零破坏）；`1.4` → $37.25（90d/$4500，+2%，
+  胜率 65→63%；140d/$5k 口径约 +7~10%）。单元测试：mult=1.4 受 cap 挡在 20 股、mult<1 钳回、
+  不传参=向后兼容。`.env` 已按用户批准设 **REGIME_BULL_MULT=1.4**（设回 1.0 即关）。
+- **诚实备注**：edge 小且全在顺风窗口量的（逆风无数据验证）。另动文件：`src/config.py`
+  `src/risk_manager.py` `src/main.py` `src/backtest.py` `.env`/`.env.example`。
+
+---
+
 ## 🛠 2026-06-03 重构执行日志（ultracode，审计后落地中）
 
 > 全审计报告见 `AUDIT_REPORT.md`。以下是已落地的改动（代码未 commit，等用户提交）。

@@ -8,7 +8,7 @@ Usage:
     python -m src.backtest                          # watchlist, 180 days, current TF
     python -m src.backtest --days 90
     python -m src.backtest --tickers AAPL MSFT NVDA
-    python -m src.backtest --timeframe DAILY
+    python -m src.backtest --timeframe HOUR_1
     python -m src.backtest --threshold 65           # lower entry bar to get more trades
 """
 from __future__ import annotations
@@ -198,6 +198,14 @@ class BacktestConfig:
     # is preserved exactly; only simulate_v3(use_pyramiding=True) adds add-ons.
     use_pyramiding: bool = False
 
+    def __post_init__(self) -> None:
+        # DAILY trading mode was removed 2026-06-07 (HOUR_1 won the head-to-head).
+        # Coerce any legacy/explicit "DAILY" to HOUR_1 so a stray value can't
+        # produce a half-converted run (hourly bars but the string-keyed MTF/gap
+        # branches skipped → nonsense metrics). Belt-and-suspenders with config.py.
+        if str(self.timeframe).upper() == "DAILY":
+            self.timeframe = "HOUR_1"
+
 
 # ---------- shared portfolio state (DD breaker) ----------
 
@@ -354,7 +362,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
     """
     from .indicators import check_gap, daily_trend_bullish, evaluate
     from . import regime as regime_mod
-    from .config import settings as _settings
+    from .config import derive_max_positions, settings as _settings
     if cfg.apply_mr_strategy:
         from . import strategy_momentum, strategy_mr
     ml_pred = None   # ML subsystem removed 2026-06-03 (proven inert)
@@ -561,7 +569,7 @@ def simulate_time_stepped(cfg: BacktestConfig, cache: dict, progress_cb=None) ->
 
         # --- (B) try to open a new position ---
         # Portfolio max_positions cap (true portfolio-level — what live enforces).
-        if cfg.apply_max_positions and len(open_trades) >= _settings.max_positions:
+        if cfg.apply_max_positions and len(open_trades) >= derive_max_positions(cfg.account_usd):
             continue
 
         # SL cooldown — refuse re-entry on a name we just stopped out of.
@@ -769,11 +777,11 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
         }
     """
     from .moomoo_client import MoomooClient
-    from .timeframe import DAILY, HOUR_1, MIN_10, MIN_30
+    from .timeframe import HOUR_1, MIN_10, MIN_30
     from moomoo import KLType
 
-    _TF_BY_NAME = {"DAILY": DAILY, "HOUR_1": HOUR_1, "MIN_10": MIN_10, "MIN_30": MIN_30}
-    tf = _TF_BY_NAME.get(cfg.timeframe.upper(), DAILY)
+    _TF_BY_NAME = {"HOUR_1": HOUR_1, "MIN_10": MIN_10, "MIN_30": MIN_30}
+    tf = _TF_BY_NAME.get(cfg.timeframe.upper(), HOUR_1)   # DAILY mode removed 2026-06-07
     kltype = tf.kltype
     total_bars = _bars_needed(cfg)
 
@@ -980,9 +988,16 @@ def simulate_with_cache(cfg: BacktestConfig, cache: dict, progress_cb=None) -> d
 def _run_live_engine(cfg: BacktestConfig, cache: dict, progress_cb=None,
                      rich_metrics: bool = True) -> dict:
     from .backtest_v3 import simulate_v3  # lazy: avoids a circular import at module load
+    # Mirror live sizing: trend + momentum_break, VIX/earnings/commissions, AND the
+    # owner-approved regime up-scaling (inert at the default REGIME_BULL_MULT=1.0,
+    # so the honest baseline is unchanged until the owner activates it in .env).
+    from .config import settings as _s
     cfg_live = replace(cfg, apply_vix_sizing=True, apply_earnings_gate=True,
                        use_realistic_commission=True,
-                       apply_momentum_strategy=True)  # mirror live: trend + momentum_break
+                       apply_momentum_strategy=True,
+                       use_regime_scaling=True,
+                       regime_bull_mult=_s.regime_bull_mult,
+                       regime_vix_calm=_s.regime_vix_calm)
     return simulate_v3(cfg_live, cache, enforce_cash=True,
                        rich_metrics=rich_metrics, progress_cb=progress_cb)
 
@@ -1119,7 +1134,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description="moomoo-trader backtester")
     ap.add_argument("--days", type=int, default=180, help="Lookback window in calendar days")
-    ap.add_argument("--timeframe", default=None, help="HOUR_1 or DAILY (default: from .env)")
+    ap.add_argument("--timeframe", default=None, help="HOUR_1 / MIN_10 / MIN_30 (default: from .env; DAILY mode removed)")
     ap.add_argument("--threshold", type=float, default=None, help="Entry score threshold (default: from .env)")
     ap.add_argument("--tickers", nargs="*", help="Specific tickers (default: watchlist)")
     args = ap.parse_args()

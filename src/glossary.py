@@ -61,11 +61,12 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
             "name": "Timeframe",
             "summary": "用哪个 K 线周期判断信号",
             "explain": (
-                "三种可用 (.env 里 TIMEFRAME=):\n\n"
-                "  • DAILY    — 日线 swing 交易，持仓 2-10 天\n"
-                "  • HOUR_1   — 1 小时 K，持仓 1-5 天 (✓ 当前)\n"
+                "可用 (.env 里 TIMEFRAME=):\n\n"
+                "  • HOUR_1   — 1 小时 K，持仓 1-5 天 (✓ 当前, 实盘交易框)\n"
                 "  • MIN_10   — 10 分钟，日内 (回测发现在当前市场亏钱)\n\n"
-                "HOUR_1 是 Optuna 验证后最稳的，180 天 Sortino +3.48。"
+                "HOUR_1 是 Optuna 验证后最稳的，180 天 Sortino +3.48。\n"
+                "(DAILY 日线交易模式已于 2026-06-07 删除 — 同窗口回测 HOUR_1 完胜\n"
+                " $36.5 vs $22.9/day 且回撤更低; 日线数据仍保留给 HOUR_1 的 MTF 确认用。)"
             ),
             "where": ".env: TIMEFRAME=HOUR_1",
             "value": "HOUR_1",

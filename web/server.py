@@ -72,6 +72,43 @@ _PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/favicon.ico"}
 _pw_cache = {"mtime": -1.0, "v": ""}
 _secret_cache = {"v": ""}
 
+# Login throttle — lock an IP out after repeated wrong passwords, so the control
+# panel (which can stop the scheduler / change budget / write .env keys) can't be
+# brute-forced online. In-memory: a restart resets it, which is fine since brute
+# force needs sustained attempts. Concurrency: dict ops are atomic under CPython's
+# GIL; an occasional miscount can't weaken the lock.
+_login_fails: dict = {}          # ip → [fail_count, locked_until_epoch, last_seen_epoch]
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SEC = 300
+
+
+def _login_locked(ip: str) -> bool:
+    rec = _login_fails.get(ip)
+    return bool(rec and rec[1] > time.time())
+
+
+def _login_record(ip: str, ok: bool) -> None:
+    if ok:
+        _login_fails.pop(ip, None)
+        return
+    now = time.time()
+    # Bound memory: an attacker rotating source IPs (only ever failing, never
+    # authenticating) would otherwise grow this dict without limit. Prune every
+    # OTHER entry that is not currently locked and has been idle for a full lock
+    # window — never the current ip (pruning it here would reset its own streak
+    # before the count below reads it, so the lockout could never trigger).
+    for k, v in list(_login_fails.items()):
+        if k != ip and v[1] < now and (now - v[2]) > LOGIN_LOCK_SEC:
+            _login_fails.pop(k, None)
+    rec = _login_fails.get(ip)
+    # Rolling window: if this ip is unlocked and has been quiet for a full lock
+    # window, start its fail streak fresh rather than accumulating forever.
+    if rec and rec[1] < now and (now - rec[2]) > LOGIN_LOCK_SEC:
+        rec = None
+    count = (rec[0] if rec else 0) + 1
+    locked = now + LOGIN_LOCK_SEC if count >= LOGIN_MAX_FAILS else 0.0
+    _login_fails[ip] = [count, locked, now]
+
 
 def _web_password() -> str:
     """Configured access password (re-read from .env when the file changes, so
@@ -135,12 +172,21 @@ def api_login():
     pw_cfg = _web_password()
     if not pw_cfg:
         return jsonify({"ok": True})      # no auth configured
+    ip = request.remote_addr or "?"
+    if _login_locked(ip):
+        return jsonify({"ok": False, "error": "尝试过多，请稍后再试"}), 429
     pw = (request.json or {}).get("password", "")
     if isinstance(pw, str) and hmac.compare_digest(pw, pw_cfg):
+        _login_record(ip, True)
         resp = make_response(jsonify({"ok": True}))
+        # secure follows the actual transport: on plain HTTP (LAN dev) we must NOT
+        # set Secure or the browser would drop the cookie; behind HTTPS it engages
+        # automatically for defence-in-depth.
         resp.set_cookie(AUTH_COOKIE, _auth_token(pw_cfg),
-                        max_age=60 * 60 * 24 * 30, httponly=True, samesite="Lax")
+                        max_age=60 * 60 * 24 * 30, httponly=True,
+                        samesite="Lax", secure=request.is_secure)
         return resp
+    _login_record(ip, False)
     return jsonify({"ok": False, "error": "wrong password"}), 401
 
 
@@ -495,6 +541,10 @@ def api_web_access():
             "port": port,
             "lan_ip": _lan_ip(),
             "tailscale_ip": _tailscale_ip(),
+            # Plain HTTP: on open WiFi the password + cookie travel unencrypted.
+            # Prefer the Tailscale address (encrypted tunnel) over the raw LAN IP.
+            "plaintext_warning": "局域网为明文 HTTP，密码/会话在同网段可被嗅探；"
+                                 "公共 WiFi 下建议走 Tailscale 地址而非裸 LAN IP。",
         })
     mode = (request.json or {}).get("mode")
     if mode not in ("lan", "local"):
@@ -571,6 +621,9 @@ def main():
         host = "127.0.0.1"
     if host != "127.0.0.1":
         print(f"🌐 Dashboard exposed on http://{host}:{port}  (password protected)")
+        print("⚠️  Plain HTTP — password + session cookie travel UNENCRYPTED on the "
+              "LAN. On open WiFi, reach it via Tailscale (encrypted) rather than the "
+              "raw LAN IP.", file=sys.stderr)
     app.run(host=host, port=port, threaded=True)
 
 

@@ -15,6 +15,13 @@ def _int(name: str, default: int) -> int:
     return int(os.getenv(name, default))
 
 
+def _timeframe(default: str = "HOUR_1") -> str:
+    # DAILY trading mode removed 2026-06-07 — coerce any legacy value to HOUR_1
+    # so no string-keyed branch (MTF/gap/scoring) ever sees a stale "DAILY".
+    tf = os.getenv("TIMEFRAME", default).upper()
+    return "HOUR_1" if tf == "DAILY" else tf
+
+
 @dataclass(frozen=True)
 class Settings:
     moomoo_host: str = os.getenv("MOOMOO_HOST", "127.0.0.1")
@@ -52,6 +59,15 @@ class Settings:
     risk_per_trade: float = _float("RISK_PER_TRADE", 0.02)
     max_positions: int = _int("MAX_POSITIONS", 5)
     max_position_pct: float = _float("MAX_POSITION_PCT", 0.20)
+    # Position-slot cap scales with capital (req#1: change budget → recompute
+    # params). max_positions acts as a FLOOR; larger accounts open more slots up
+    # to max_positions_cap (≈ universe size). At the $4.5k default round(4500/1000)
+    # = 4 (banker's rounding), which the max_positions FLOOR of 5 rescues — so the
+    # derived value == max_positions and behaviour is unchanged until capital grows
+    # past ~$5.5k. The cash wall (sizing_capital budget cap) stays the real
+    # constraint at small budgets.
+    slot_target_usd: float = _float("SLOT_TARGET_USD", 1000.0)
+    max_positions_cap: int = _int("MAX_POSITIONS_CAP", 10)
     daily_drawdown_stop: float = _float("DAILY_DRAWDOWN_STOP", 0.03)
 
     # Concentration mode — open fewer new names per scan, pyramid into winners.
@@ -66,13 +82,25 @@ class Settings:
     entry_threshold: float = _float("ENTRY_SCORE_THRESHOLD", 70)
     scan_interval_min: int = _int("SCAN_INTERVAL_MIN", 15)
     max_hold_days: int = _int("MAX_HOLD_DAYS", 10)
-    timeframe: str = os.getenv("TIMEFRAME", "DAILY")
+    timeframe: str = _timeframe()   # DAILY trading mode removed 2026-06-07 (coerced → HOUR_1)
 
     # Optuna-tuned exit knobs — moved out of code so .env can override.
     # TP = entry + TP_ATR_MULT × ATR ; SL = entry - SL_ATR_MULT × ATR.
     tp_atr_mult: float = _float("TP_ATR_MULT", 1.5)
     sl_atr_mult: float = _float("SL_ATR_MULT", 2.0)
     max_gap_pct: float = _float("MAX_GAP_PCT", 3.0)   # overnight gap filter
+
+    # Regime up-scaling (2026-06-08): press more size ONLY in a confirmed strong
+    # bull (regime.bullish, i.e. SPY > 50MA > 200MA) AND a calm tape (VIX <
+    # regime_vix_calm). Mirrors the honest engine's use_regime_scaling so live ↔
+    # backtest stay in parity. DEFAULT 1.0 = INERT (no behaviour change); set
+    # REGIME_BULL_MULT=1.4 in .env to activate the owner-approved tailwind boost.
+    # It only scales the risk-based qty and still obeys the max_position_pct cap,
+    # so it can never push a single name past its concentration limit. Backtests
+    # (140d, $5k) showed 1.35-1.5× lifts $/day a few % with DD flat; higher
+    # multipliers (2×, 2.5×) were over-fit noise on ~40 trades — do not chase them.
+    regime_bull_mult: float = _float("REGIME_BULL_MULT", 1.0)
+    regime_vix_calm: float = _float("REGIME_VIX_CALM", 20.0)
 
     # 3-tranche scale-out (2026-05-30 cash-frontier finding: banking partials and
     # recycling the cash is the best NO-LEVERAGE lever for a real $5k account —
@@ -120,6 +148,23 @@ class Settings:
 
 
 settings = Settings()
+
+
+def derive_max_positions(capital: float) -> int:
+    """Position-slot cap derived from allocated capital, so changing the budget
+    recomputes how many concurrent names the bot may hold (req#1) instead of a
+    hardcoded number. `max_positions` is the floor (never fewer slots than today);
+    slots scale by capital / SLOT_TARGET_USD up to `max_positions_cap` (≈ the
+    watchlist size, to avoid over-diversification). At the $4.5k default the raw
+    slot math gives round(4500/1000)=4, which the max_positions floor clamps back
+    up to 5 — so this returns exactly settings.max_positions and live + backtest
+    behaviour is unchanged until capital grows past ~$5.5k. The cash wall stays
+    binding at small budgets."""
+    slot = settings.slot_target_usd
+    if slot <= 0:
+        return settings.max_positions
+    n = round(capital / slot)
+    return max(settings.max_positions, min(settings.max_positions_cap, n))
 
 # Free-tier model cascade: strongest → lightest.
 # GEMINI_MODEL is tried first; on 429 the cascade continues downward.

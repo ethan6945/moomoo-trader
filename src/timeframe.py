@@ -1,10 +1,15 @@
 """Timeframe presets — one place to tune indicator periods.
 
-DAILY (default) is conservative swing trading (2-10 day holds).
-HOUR_1 is faster swing on 60-min bars (1-5 day holds), with VWAP/ADX/Stoch
-added because hourly action is noisier than daily and needs extra confirmation.
+HOUR_1 (the live trading frame) is swing on 60-min bars (1-5 day holds), with
+VWAP/ADX/Stoch added because hourly action is noisier and needs extra
+confirmation; it still pulls DAILY klines for the MTF trend gate + gap check.
 MIN_10 is intraday day-trading on 10-min bars; MIN_30 is the direction filter
 used alongside MIN_10 (fetch 30-min trend → enter on 10-min signal).
+
+The standalone DAILY *trading* frame was removed 2026-06-07 — backtests showed
+HOUR_1 dominated it on the same window ($36.5 vs $22.9/day, lower DD) and the
+bot is tuned for HOUR_1. (DAILY *data* and DAILY_WEIGHTS live on — HOUR_1's
+MTF/gap/SPY-regime checks and the MIN_30 scorer fallback still use them.)
 """
 from __future__ import annotations
 
@@ -33,22 +38,6 @@ class TF:
     adx_period: int
     stoch_k: int
     stoch_d: int
-
-
-DAILY = TF(
-    name="DAILY",
-    kltype=KLType.K_DAY,
-    bars=120,
-    ema_fast=20, ema_slow=50,
-    rsi_period=14,
-    macd_fast=12, macd_slow=26, macd_signal=9,
-    bb_period=20,
-    atr_period=14,
-    vol_ma=20,
-    breakout_lookback=20,
-    adx_period=14,
-    stoch_k=14, stoch_d=3,
-)
 
 
 HOUR_1 = TF(
@@ -103,10 +92,8 @@ MIN_10 = TF(
 
 def current() -> TF:
     tf = settings.timeframe.upper()
-    if tf == "HOUR_1":
-        return HOUR_1
     if tf == "MIN_10":
         return MIN_10
     if tf == "MIN_30":
         return MIN_30
-    return DAILY
+    return HOUR_1   # the live trading frame; also the fallback for any unset/legacy value
