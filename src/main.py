@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytz
+from logging.handlers import RotatingFileHandler
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from moomoo import KLType
@@ -53,9 +54,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(settings.root / "logs" / "trader.log"),
+        # Rotating file: cap each file at 10 MB, keep 5 backups → trader.log
+        # family tops out at ~60 MB instead of growing without bound.
+        RotatingFileHandler(
+            settings.root / "logs" / "trader.log",
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        ),
     ],
 )
+# Quiet the chatty INFO loggers. APScheduler prints a "Job executed
+# successfully" line after EVERY job run (~77% of the old log); httpx and
+# google_genai log one line per HTTP / AI call. The jobs still run — we just
+# stop logging each tick at INFO. Real warnings/errors still come through.
+for _noisy in ("apscheduler", "httpx", "google_genai"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("main")
 
 WATCHLIST_FILE = settings.root / "config" / "watchlist.json"
@@ -257,7 +271,7 @@ def scan_once() -> None:
 
         # 2b. Reconcile broker vs internal records — catch drift before trading.
         try:
-            recon = reconcile(positions)
+            recon = reconcile(positions, client=c)
             msg = log_reconcile(recon)
             if msg:
                 notifier.send(msg)
@@ -545,25 +559,31 @@ def scan_once() -> None:
             # Stacking add-ons skip AI consult — we've already done the diligence
             # on the original entry, and the AI budget should reserve for fresh
             # names where context might differ. (Audit 2026-05-28.)
+            #
+            # 2026-06-11 reorder: when AI is ADVISORY (default, parity with the
+            # backtest which has no AI layer), the consult runs AFTER the order
+            # is placed — it cannot change the decision, and running it first
+            # injected median 42s / p90 99s between signal and order, which the
+            # 0.2% chase tolerance now converts into missed fills. Only a
+            # BLOCKING veto (AI_VETO_BLOCKING=true) still pays latency up front.
+            ai_deferred = False
             if is_stack_candidate:
                 ai_pass, ai_score, ai_reason = True, 60, "stack — AI re-check skipped"
-            elif ai_budget <= 0:
-                ai_pass, ai_score, ai_reason = True, 50, "AI budget exhausted — neutral"
+            elif settings.ai_veto_blocking:
+                if ai_budget <= 0:
+                    ai_pass, ai_score, ai_reason = True, 50, "AI budget exhausted — neutral"
+                else:
+                    ai_pass, ai_score, ai_reason = ai_validator.validate(sig)
+                    ai_budget -= 1
+                if not ai_pass:
+                    _skip("ai_veto", ai_reason)
+                    continue
             else:
-                ai_pass, ai_score, ai_reason = ai_validator.validate(sig)
-                ai_budget -= 1
+                ai_deferred = True
+                ai_pass, ai_score, ai_reason = True, None, "advisory — consulted post-order"
             log.info("%s rule=%.1f ai=%s conviction=%.2f (%s)",
                      sig.symbol, sig.score,
                      "pass" if ai_pass else "veto", conviction, ai_reason)
-            # 2026-06-03 live↔backtest parity: the backtest has no AI layer, so AI
-            # is ADVISORY by default (logged, shown in the card) and does NOT block
-            # — live trades then match the backtest the $/day figure is built on.
-            # Set AI_VETO_BLOCKING=true to restore hard blocking.
-            if not ai_pass:
-                if settings.ai_veto_blocking:
-                    _skip("ai_veto", ai_reason)
-                    continue
-                ai_reason = f"[advisory veto, not blocking] {ai_reason}"
 
             # --- Risk / heat / sizing (all factor in conviction) ---
             ok, reason = risk_manager.can_open_new(
@@ -591,16 +611,42 @@ def scan_once() -> None:
             # portfolio.heat_check() is kept as the heat primitive but not called.
 
             try:
-                executor.open_position(c, sig, qty)
+                opened = executor.open_position(c, sig, qty)
+                if opened is None:
+                    # Market ran past the signal price — same no-fill the
+                    # backtest's open-only model books. Not an error.
+                    audit.record("skip", symbol=sig.symbol, gate="chase",
+                                 reason="market ran past signal price")
+                    continue
                 if not is_stack_candidate:
                     new_names_opened += 1
                     held_syms.add(sig.symbol)
+                # Deferred advisory consult — order is already resting, so this
+                # latency is free. Wrapped: an AI/network error must never lose
+                # the audit record of an order we just placed.
+                if ai_deferred:
+                    if ai_budget > 0:
+                        try:
+                            ai_pass, ai_score, ai_reason = ai_validator.validate(sig)
+                        except Exception as e:
+                            ai_pass, ai_score, ai_reason = True, None, f"AI consult failed: {e}"
+                        ai_budget -= 1
+                        if not ai_pass:
+                            ai_reason = f"[advisory veto, post-order] {ai_reason}"
+                    else:
+                        ai_score, ai_reason = 50, "AI budget exhausted — neutral"
                 audit.record("buy", symbol=sig.symbol, score=sig.score,
                              reason=ai_reason,
                              extra={"qty": qty, "price": sig.price,
                                     "stop": sig.stop_loss, "tp": sig.take_profit,
                                     "vix": vix, "regime": regime.label,
                                     "conviction": conviction,
+                                    # 2026-06-11: persist the numeric advisory
+                                    # verdict — without it no AI-vs-outcome
+                                    # calibration is possible (keep/drop the
+                                    # Gemini layer needs ~50 scored trades).
+                                    "ai_score": ai_score,
+                                    "ai_pass": bool(ai_pass),
                                     "setup_quality": "marginal" if marginal_setup else "full",
                                     "is_stack": is_stack_candidate,
                                     "strategy": getattr(sig, "strategy", "trend")})
@@ -689,6 +735,57 @@ def in_market_hours() -> bool:
     return 9 * 60 + 30 <= minutes <= 16 * 60
 
 
+def _universe_refresh_job() -> None:
+    """Sunday 22:00 ET — recompute the rule-based trading universe (Phase 1).
+
+    watchlist := top UNIVERSE_TOP_N of the liquidity pool by 6-1 momentum
+    (src/universe.py — same rule the backtest replays walk-forward, so live
+    trades exactly what the validation measured). Flag-gated by
+    DYNAMIC_UNIVERSE_ENABLED; every change is Telegram-notified (铁律: no
+    silent universe drift). Runs BEFORE the 22:30 weekly backtest so the
+    health check scores the list the bot will actually trade next week.
+    Positions in dropped names are unaffected — exits manage them out."""
+    if not settings.dynamic_universe_enabled:
+        cron_state.record_run("universe_refresh")   # keep catchup quiet while off
+        return
+    log.info("universe refresh: starting")
+    try:
+        from . import universe
+        with client() as c:
+            new_list = universe.compute_live_universe(c)
+        if len(new_list) < max(3, settings.universe_top_n // 2):
+            raise RuntimeError(
+                f"selection returned only {len(new_list)} names — refusing to "
+                "shrink the watchlist on bad/missing data")
+        old_list = load_watchlist()
+        if set(new_list) == set(old_list):
+            log.info("universe refresh: unchanged (%d names)", len(new_list))
+        else:
+            adds = sorted(set(new_list) - set(old_list))
+            drops = sorted(set(old_list) - set(new_list))
+            WATCHLIST_FILE.write_text(json.dumps({
+                "_comment": ("AUTO-GENERATED by the weekly universe refresh "
+                             "(src/universe.py: top-N of config/universe_pool.json "
+                             "by 6-1 momentum). Hand edits are overwritten on the "
+                             "next refresh — edit the POOL (liquidity criterion "
+                             "only) or UNIVERSE_TOP_N instead."),
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "tickers": new_list,
+            }, indent=2))
+            notifier.send(
+                "🔄 *Weekly universe refresh* (rule: top-{n} by 6-1 momentum)\n"
+                "  + {adds}\n  − {drops}\n  → {full}".format(
+                    n=settings.universe_top_n,
+                    adds=", ".join(adds) or "—",
+                    drops=", ".join(drops) or "—",
+                    full=", ".join(new_list)))
+            log.info("universe refresh: %d adds, %d drops", len(adds), len(drops))
+        cron_state.record_run("universe_refresh")
+    except Exception as e:
+        log.exception("universe refresh failed: %s", e)
+        notifier.send(f"⚠ Weekly universe refresh failed (watchlist unchanged): {e}")
+
+
 def _weekly_backtest_validation_job() -> None:
     """Sunday 22:30 ET — runs a 90-day backtest under current .env settings.
 
@@ -701,19 +798,19 @@ def _weekly_backtest_validation_job() -> None:
     """
     log.info("weekly backtest validation: starting")
     try:
-        from .backtest import BacktestConfig, run_backtest
-        cfg = BacktestConfig(
-            days=90,
-            timeframe=settings.timeframe,
-            threshold=settings.entry_threshold,
-            account_usd=settings.account_usd,
-            risk_per_trade=settings.risk_per_trade,
-            max_position_pct=settings.max_position_pct,
-            max_hold_days=settings.max_hold_days,
-            tp_atr_mult=settings.tp_atr_mult,
-            sl_atr_mult=settings.sl_atr_mult,
-            max_gap_pct=settings.max_gap_pct,
-        )
+        from .backtest import run_backtest
+        from .optimizer_ai import _base_cfg
+        # 2026-06-11: the health check MUST score the strategy the bot actually
+        # runs. _base_cfg handles both parity rules in one place: (a) runtime-
+        # effective threshold/tp/sl/risk/budget (not frozen .env — after an
+        # applied param_change the old construction health-checked parameters
+        # the bot no longer ran), and (b) the dynamic universe replayed
+        # WALK-FORWARD over the full pool. Building this cfg from the live
+        # watchlist file instead would backtest a list selected on recent
+        # momentum over the very window that selected it — the exact hindsight
+        # bias Phase 1 exists to kill, inflating the one signal that is
+        # supposed to catch strategy decay.
+        cfg = _base_cfg(days=90)
         result = run_backtest(cfg)
         m = result.get("metrics", {})
         mc = m.get("monte_carlo", {})
@@ -806,6 +903,14 @@ def _weekly_self_review_job() -> None:
     autonomous step runs in its OWN try, so a failure in one (e.g. a notify hiccup
     in the review) can't silently skip self-improvement or the optimizer."""
     log.info("weekly self-review: starting")
+    # Autopilot rollback check FIRST — if an auto-applied param is hurting live
+    # results, revert it before this week's review/optimizer reason about it.
+    try:
+        from . import autopilot
+        for note in autopilot.check_and_rollback():
+            notifier.send(note)
+    except Exception as e:
+        log.exception("autopilot rollback check failed: %s", e)
     report = None
     try:
         report = self_review.run_and_notify(days=7)
@@ -834,7 +939,16 @@ def _weekly_self_review_job() -> None:
         rev = report if report is not None else self_review.weekly_review(days=7)
         n = optimizer_ai.propose_from_review(rev)
         if n:
-            notifier.send(f"🤖 Gemini 优化器提了 {n} 条参数建议 — 待你在 GUI/CLI 批准。")
+            # Each change already got its own detailed notification from
+            # propose_from_review (auto-applied vs queued); this is just the
+            # weekly summary line. Pre-2026-06-12 it claimed everything was
+            # "待批准", which misled the owner when auto-apply was on.
+            if settings.auto_apply_params:
+                notifier.send(
+                    f"🤖 Gemini 优化器: {n} 条参数变更通过了回测验证 — "
+                    f"边界内的已自动应用(见上方单独通知), 越界的才会出现在审批队列。")
+            else:
+                notifier.send(f"🤖 Gemini 优化器提了 {n} 条参数建议 — 待你在 GUI/CLI/Telegram 批准。")
     except Exception as e:
         log.warning("weekly optimizer step failed: %s", e)
     # Bookkeeping — also independent so it always runs.
@@ -868,6 +982,11 @@ def _run_catchup_on_startup() -> None:
          _daily_blacklist_review_job, "Daily blacklist review"),
         # watchlist_refresh + ml_retrain catch-up removed 2026-06-03 (see run_loop):
         # both were silent-execution violations; now manual GUI actions only.
+        # universe_refresh (Phase 1) is different: it's a RULE the owner enabled
+        # explicitly via DYNAMIC_UNIVERSE_ENABLED, and every change telegrams.
+        ("universe_refresh",
+         cron_state.expected_last_fire_weekly(6, 22, 0),   # Sunday 22:00
+         _universe_refresh_job, "Weekly universe refresh"),
         ("weekly_backtest",
          cron_state.expected_last_fire_weekly(6, 22, 30),  # Sunday 22:30
          _weekly_backtest_validation_job, "Weekly backtest"),
@@ -990,14 +1109,52 @@ def run_loop() -> None:
     #   • coalesce=True       → if N runs were missed (laptop slept etc), only fire ONCE
     #   • misfire_grace_time  → drop runs more than this many seconds late
     #   • max_instances=1     → never let two scans overlap (prevents API rate-limit blowups)
-    sched.add_job(
-        job, "interval",
-        minutes=settings.scan_interval_min,
-        next_run_time=clock.ny_now(),
-        coalesce=True,
-        misfire_grace_time=60,
-        max_instances=1,
-    )
+    #
+    # Phase 0 (2026-06-10): scans ALIGN to hourly-bar closes (:30) instead of
+    # free-running from process start. A free-running 30-min interval could
+    # fire at e.g. :17/:47 — half a bar stale on every signal. :31 sees the
+    # freshly closed hourly bar; :01 is the mid-bar management/missed-fill pass.
+    if settings.scan_interval_min == 30:
+        sched.add_job(
+            job, "cron", minute="1,31",
+            next_run_time=clock.ny_now(),
+            coalesce=True,
+            misfire_grace_time=60,
+            max_instances=1,
+        )
+    else:
+        sched.add_job(
+            job, "interval",
+            minutes=settings.scan_interval_min,
+            next_run_time=clock.ny_now(),
+            coalesce=True,
+            misfire_grace_time=60,
+            max_instances=1,
+        )
+
+    # Phase 0 (2026-06-10): 5-minute position-management tick between scans.
+    # Live soft stops were filled a full scan late (measured −1.38R average vs
+    # the −1R model — ≈$212 of the first −$572); checking every 5 minutes
+    # shrinks the overshoot ~6× and catches TP touches the 30-min grid missed.
+    # Cheap: skips without a broker connection when the book is flat, and the
+    # executor lock serializes it against the scan's own manage pass.
+    def _manage_tick():
+        if not in_market_hours():
+            return
+        if not executor.has_open_trades():
+            return
+        try:
+            with client() as c:
+                actions = executor.manage_open_trades(c)
+                for a in actions:
+                    notifier.send(notifier.trade_action_msg(a))
+                if actions:
+                    _refresh_account_snapshot(c, full=False)
+        except Exception as e:
+            log.exception("manage tick failed: %s", e)
+
+    sched.add_job(_manage_tick, "cron", minute="6,11,16,21,26,36,41,46,51,56",
+                  coalesce=True, misfire_grace_time=60, max_instances=1)
     # 2026-06-03: watchlist is PINNED to 10; universe changes go through the
     # weekly self-review → approval queue (no auto-refresh, no manual button).
     # ML retrain removed entirely (subsystem deleted after proving inert).
@@ -1012,6 +1169,13 @@ def run_loop() -> None:
     sched.add_job(_open_gap_exit_job, "cron",
                   day_of_week="mon-fri", hour=9, minute=31,
                   coalesce=True, misfire_grace_time=600, max_instances=1)
+
+    # Weekly universe refresh: Sunday 22:00 ET (Phase 1) — rule-based watchlist
+    # rebuild, BEFORE the 22:30 backtest so the health check scores next week's
+    # actual list. No-op unless DYNAMIC_UNIVERSE_ENABLED.
+    sched.add_job(_universe_refresh_job, "cron",
+                  day_of_week="sun", hour=22, minute=0,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
 
     # Weekly backtest validation: Sunday 22:30 ET — health-check the strategy
     # on a rolling 90-day window.
@@ -1044,6 +1208,25 @@ def run_loop() -> None:
             log.debug("tg approval sync failed: %s", e)
     sched.add_job(_tg_sync, "interval", seconds=60,
                   coalesce=True, misfire_grace_time=30, max_instances=1)
+
+    # Autopilot health watchdog: 17:30 ET weekdays (after the close) — detects
+    # silent scan stalls, garbage backtest results, overdue jobs, reconcile
+    # drift, and reminds about active runtime overrides. Notifies only when
+    # something is wrong (no daily noise).
+    def _watchdog_job():
+        try:
+            from . import autopilot
+            issues = autopilot.health_check()
+            if issues:
+                notifier.send("🩺 *Autopilot 健康检查*\n" +
+                              "\n".join(f"  • {i}" for i in issues))
+                log.warning("watchdog: %d issue(s): %s", len(issues), issues)
+            else:
+                log.info("watchdog: all healthy")
+        except Exception as e:
+            log.exception("watchdog failed: %s", e)
+    sched.add_job(_watchdog_job, "cron", day_of_week="mon-fri", hour=17, minute=30,
+                  coalesce=True, misfire_grace_time=3600, max_instances=1)
 
     # Daily blacklist review: 23:00 ET every weekday. Reads recent closed
     # trades, adds chronic losers, removes recovered names, extends watch on

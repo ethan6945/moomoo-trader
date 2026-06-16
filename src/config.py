@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,6 +132,39 @@ class Settings:
     tp1_r: float = _float("TP1_R", 3.0)
     tp2_r: float = _float("TP2_R", 6.0)
 
+    # Breakeven stop (2026-06-11 exit audit): once price has been
+    # +BREAKEVEN_TRIGGER_R × R in profit (R = entry − initial stop), ratchet
+    # the stop up to entry — a former winner can no longer turn into a loser.
+    # Engine-measured (dynamic top-15, honest lens): PnL-neutral on 140d
+    # ($18.0 vs $18.8/day) but PF 3.15→3.44, MTM-DD 11.3%→9.8%, and the choppy
+    # recent window flips −$8.5→+$37.8/day. 72% of trades reach +1R.
+    use_breakeven_stop: bool = os.getenv("USE_BREAKEVEN_STOP", "true").lower() in ("1", "true", "yes")
+    breakeven_trigger_r: float = _float("BREAKEVEN_TRIGGER_R", 1.0)
+
+    # Stall-out (close positions that go nowhere for 3 business days).
+    # 2026-06-11: DEFAULT OFF for exit parity — the validated engine has no
+    # stall-out and its MAX_HOLD bucket is net positive; live stall-outs were
+    # 2-for-2 losers. Turn on only after the engine models it and it passes
+    # the dual-window gate.
+    stall_out_enabled: bool = os.getenv("STALL_OUT_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    # ── Autopilot (2026-06-11): bounded autonomy for parameter changes ──
+    # When ON, an optimizer proposal that PASSED the dual-window honest-engine
+    # gate AND sits inside runtime_config.ALLOWED_PARAMS bounds is applied
+    # immediately (db-state override, no restart) with a Telegram notification;
+    # an auto-rollback watcher reverts it if live results degrade. When OFF
+    # (default), every change still queues for owner approval.
+    auto_apply_params: bool = os.getenv("AUTO_APPLY_PARAMS", "false").lower() in ("1", "true", "yes")
+
+    # ── Phase 1 (2026-06-11): rule-based dynamic universe ──
+    # Weekly: watchlist := top N of the liquidity pool (config/universe_pool.json)
+    # by 6-1 momentum (src/universe.py). OFF by default — flip
+    # DYNAMIC_UNIVERSE_ENABLED in .env to activate; every refresh that changes
+    # the list is Telegram-notified (no silent universe drift).
+    dynamic_universe_enabled: bool = os.getenv("DYNAMIC_UNIVERSE_ENABLED",
+                                               "false").lower() in ("1", "true", "yes")
+    universe_top_n: int = int(os.getenv("UNIVERSE_TOP_N", "15"))
+
     # Drawdown circuit breaker — discovered from the 142-day backtest where
     # Nov 2025 alone lost -$761 (17% of account) before the strategy recovered.
     # When account-level DD breaches these thresholds, we either halve qty or
@@ -164,6 +198,22 @@ class Settings:
 
 
 settings = Settings()
+
+# Phase 0 guard (2026-06-10): with R = sl_atr_mult × ATR, the first scale-out
+# partial sits at tp1_r × sl_atr_mult ATR above entry. If that is at/beyond the
+# full TP (tp_atr_mult × ATR), the whole position always closes first and
+# USE_SCALE_OUT=true is a silent no-op (exactly what shipped: TP1 = 3.0 × 3.5
+# = +10.5 ATR vs TP at +8 ATR). Surface it and disable cleanly so backtests
+# and live agree on what the exit actually is.
+if settings.use_scale_out and \
+        settings.tp1_r * settings.sl_atr_mult >= settings.tp_atr_mult:
+    logging.getLogger(__name__).warning(
+        "USE_SCALE_OUT=true but TP1 (%.1fR × %.1f ATR/R = +%.1f ATR) is at/"
+        "beyond the full TP (+%.1f ATR) — scale-out can never fire; treating "
+        "as DISABLED. Lower TP1_R/TP2_R or raise TP_ATR_MULT to activate it.",
+        settings.tp1_r, settings.sl_atr_mult,
+        settings.tp1_r * settings.sl_atr_mult, settings.tp_atr_mult)
+    object.__setattr__(settings, "use_scale_out", False)
 
 
 def derive_max_positions(capital: float) -> int:

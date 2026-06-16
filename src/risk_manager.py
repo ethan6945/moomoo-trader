@@ -255,7 +255,10 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     if stop_distance <= 0:
         return 0
     qty_by_risk = int(risk_dollars / stop_distance)
-    qty_by_cap = int(cap * settings.max_position_pct / signal.price)
+    # 2026-06-12: cap is runtime-tunable (cap ablation: 40% ≥ 70% on every
+    # in-sample metric; optimizer may tune within [0.20, 0.55] — the ceiling
+    # is the untunable tail-risk guard against single-name overnight gaps).
+    qty_by_cap = int(cap * runtime_config.max_position_pct() / signal.price)
     base = max(0, min(qty_by_risk, qty_by_cap))
     if base <= 0:
         return 0

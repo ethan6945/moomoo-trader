@@ -121,13 +121,19 @@ def _execute(item: dict) -> None:
             blacklist.add(sym, reason="weekly self-review (owner-approved)")
             log.info("approval applied: blacklisted %s", sym)
     elif kind == "param_change":
-        # Reserved for the future Anthropic optimizer: {"key": ..., "value": ...}
-        # written to runtime db-state (NOT .env) so it takes effect next scan.
+        # {"key": ..., "value": ...} → runtime db-state (NOT .env), effective
+        # next scan. 2026-06-11: routed through runtime_config.set_param so the
+        # change lands in param_history (which powers the autopilot rollback)
+        # and re-validates bounds at execution time.
         key = payload.get("key")
         value = payload.get("value")
         if key is not None:
-            db.update_state({f"param_{key}": value})
-            log.info("approval applied: param %s = %s", key, value)
+            from . import runtime_config
+            try:
+                runtime_config.set_param(key, value, source="owner-approved")
+                log.info("approval applied: param %s = %s", key, value)
+            except ValueError as e:
+                log.warning("approved param_change rejected at execution: %s", e)
     # strategy_flag / exit_balance: informational — nothing to execute.
 
 

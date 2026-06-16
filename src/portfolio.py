@@ -122,10 +122,23 @@ def record_close(
 
 
 def trade_stats(last_n: int = 50) -> dict:
-    """Quick summary of recent closed trades — now reads from SQLite."""
-    rows = db.closed_trades(last_n)
-    if not rows:
+    """Quick summary of recent closed trades — now reads from SQLite.
+
+    HEADLINE numbers measure the strategy only: orphan-recovery adoptions
+    (reconcile artifacts with fabricated stops, not strategy decisions) and
+    MANUAL owner closes are excluded — they polluted the first 43 live trades
+    (8 orphans at 12.5% WR / −$193 plus 4 manual closes). They stay visible in
+    the separate `ops` bucket so nothing is hidden."""
+    all_rows = db.closed_trades(last_n)
+    if not all_rows:
         return {"count": 0}
+    ops_rows = [r for r in all_rows
+                if (r.get("strategy") == "reconcile_orphan_recovery"
+                    or r.get("exit_reason") == "MANUAL")]
+    ops = {"n": len(ops_rows), "pnl": round(sum(r["pnl"] for r in ops_rows), 2)}
+    rows = [r for r in all_rows if r not in ops_rows]
+    if not rows:
+        return {"count": 0, "ops": ops}
     wins = [r for r in rows if r["pnl"] > 0]
     losses = [r for r in rows if r["pnl"] <= 0]
     avg_r = sum(r["r_multiple"] for r in rows) / len(rows)
@@ -162,4 +175,7 @@ def trade_stats(last_n: int = 50) -> dict:
         "by_strategy": by_strategy,
         "avg_mfe_pct": avg_mfe,
         "avg_mae_pct": avg_mae,
+        # Non-strategy closes (orphan adoptions, manual exits) — visible but
+        # excluded from the headline win-rate/PnL above.
+        "ops": ops,
     }

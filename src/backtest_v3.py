@@ -55,7 +55,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import asdict
-from datetime import date
+from datetime import date, time as dtime
 
 import pandas as pd
 
@@ -70,6 +70,12 @@ from .backtest import (
 )
 
 log = logging.getLogger(__name__)
+
+# Live kill_switch trade-phase windows (apply_trade_windows realism flag):
+# new entries only 09:45–15:30 ET, and none Friday from 14:00.
+_ENTRY_OPEN = dtime(9, 45)
+_ENTRY_CLOSE = dtime(15, 30)
+_FRI_CUTOFF = dtime(14, 0)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -226,6 +232,15 @@ def simulate_v3(
     # did NOT represent the live bot. Decoupled: momentum has its own flag, set
     # True by _run_live_engine, parity-suppressed so the diff-test stays exact.
     _momentum = bool(cfg.apply_momentum_strategy) and not parity_mode
+    # Phase 0 realism knobs (2026-06-10) — parity-suppressed like every other
+    # live-fidelity flag so the A-vs-B diff-test stays byte-exact.
+    _scan_exits = bool(cfg.scan_grid_exits) and not parity_mode
+    _ttl_entry = bool(cfg.entry_fill_open_only) and not parity_mode
+    _no_same_day = bool(cfg.no_same_day_daily) and not parity_mode
+    _reclamp = bool(cfg.reclamp_position_cap) and not parity_mode
+    _windows = bool(cfg.apply_trade_windows) and not parity_mode
+    # Phase 1 (2026-06-11): walk-forward dynamic universe — parity-suppressed.
+    _dyn_universe = bool(cfg.apply_dynamic_universe) and not parity_mode
 
     if cfg.apply_mr_strategy or _momentum:
         from . import strategy_momentum, strategy_mr
@@ -274,6 +289,21 @@ def simulate_v3(
     log.info("[v3] event stream: %d bars across %d tickers (enforce_cash=%s)",
              len(events), len(per_ticker), enforce_cash)
 
+    # Walk-forward universe: one top-N set per ISO week, ranked at that week's
+    # FIRST trading day from daily bars STRICTLY before it — replaying exactly
+    # the decision the live Sunday refresh would have shipped into that week.
+    active_by_week: dict[tuple, set] = {}
+    if _dyn_universe:
+        from .universe import select_universe
+        _daily_by_sym = {s: b.get("daily") for s, b in per_ticker.items()}
+        for ts0, _, _ in events:
+            wk0 = ts0.date().isocalendar()[:2]
+            if wk0 not in active_by_week:
+                active_by_week[wk0] = set(select_universe(
+                    _daily_by_sym, asof=ts0.date(), top_n=cfg.universe_top_n))
+        log.info("[v3] dynamic universe: %d weekly top-%d sets from a %d-name pool",
+                 len(active_by_week), cfg.universe_top_n, len(per_ticker))
+
     # ---------- account state ----------
     start_capital = cfg.account_usd
     cash = start_capital                    # real cash balance
@@ -292,6 +322,9 @@ def simulate_v3(
     n_rs_blocked = 0          # new entries blocked by the Phase 3-A RS gate
     n_sector_blocked = 0      # new entries blocked by the Phase 3-B sector-regime gate
     n_ml_halved = 0           # entries half-sized by ML conviction (Phase 4-2)
+    n_lev_entries = 0         # entries that left cash negative (conviction margin)
+    min_cash = start_capital  # deepest borrow point
+    borrow_bar_sum = 0.0      # Σ max(0, −cash) per event — for interest estimate
 
     def slip_frac(price: float, atr: float) -> float:
         if price <= 0:
@@ -315,6 +348,16 @@ def simulate_v3(
         if reason == "SL":
             last_sl_at[t.symbol] = ts
 
+    def _completed_daily(ddf, bar_ts):
+        """Daily bars visible from an intraday bar. The daily row stamped on the
+        SAME calendar day carries that day's FINAL close — information the live
+        bot cannot have mid-session — so the realism lens excludes it and gates
+        on completed days only (live uses the forming bar's partial close, which
+        sits between the two; yesterday's close is the honest lower bound)."""
+        if _no_same_day:
+            return ddf.loc[ddf.index < bar_ts.normalize()]
+        return ddf.loc[ddf.index <= bar_ts]
+
     def _consider_entry(sym, df, daily_df, bar, i, ts):
         """Shared signal → gates → size → cash funnel for BOTH a brand-new
         position (block B) AND a pyramid add-on (block A). Returns
@@ -328,6 +371,12 @@ def simulate_v3(
         new-entry path still matches the incumbent to the dollar after the
         refactor (proven by engine_compare's parity assertion)."""
         nonlocal n_skipped_cash, n_earnings_blocked, n_rs_blocked, n_sector_blocked, n_ml_halved
+        # Dynamic-universe gate first (cheapest): only this week's top-N may
+        # open NEW positions. Held names that drop out keep being managed by
+        # the exit logic — the gate covers entries (and pyramid add-ons) only.
+        if _dyn_universe and sym not in active_by_week.get(
+                ts.date().isocalendar()[:2], ()):
+            return None
         window = df.iloc[max(0, i + 1 - lookback): i + 1]
         try:
             sig = evaluate(sym, window)
@@ -345,9 +394,20 @@ def simulate_v3(
         if sig.score < cfg.threshold or sig.atr <= 0:
             return None
 
+        # Trade-phase windows (live kill_switch): new entries only between
+        # 09:45–15:30 ET, and none on Friday ≥ 14:00. Gate on the FILL bar's
+        # timestamp (i+1) since that is when live would be placing the order.
+        if _windows:
+            fill_ts = df.index[min(i + 1, len(df) - 1)]
+            ft = fill_ts.time()
+            if ft < _ENTRY_OPEN or ft >= _ENTRY_CLOSE:
+                return None
+            if fill_ts.weekday() == 4 and ft >= _FRI_CUTOFF:
+                return None
+
         # gates: MTF + gap
         if daily_df is not None and not daily_df.empty:
-            d_until = daily_df.loc[daily_df.index <= df.index[i]].tail(100)
+            d_until = _completed_daily(daily_df, df.index[i]).tail(100)
             if len(d_until) >= 2:
                 if cfg.apply_mtf_gate and cfg.timeframe == "HOUR_1":
                     ok, _ = daily_trend_bullish(d_until)
@@ -362,7 +422,7 @@ def simulate_v3(
         regime = None
         if (cfg.apply_regime_gate or cfg.use_regime_scaling) and \
                 spy_daily is not None and not spy_daily.empty:
-            s_until = spy_daily.loc[spy_daily.index <= df.index[i]].tail(250)
+            s_until = _completed_daily(spy_daily, df.index[i]).tail(250)
             if len(s_until) >= 200:
                 regime = regime_mod.assess(s_until)
                 if cfg.apply_regime_gate and regime.block_new_entries:
@@ -373,8 +433,8 @@ def simulate_v3(
         # bars ⇒ rs=0.0 which passes when rs_min_pct<=0 (graceful, like live).
         if _rs_gate and spy_daily is not None and not spy_daily.empty \
                 and daily_df is not None and not daily_df.empty:
-            st = daily_df.loc[daily_df.index <= df.index[i]].tail(cfg.rs_lookback_days + 5)
-            sp = spy_daily.loc[spy_daily.index <= df.index[i]].tail(cfg.rs_lookback_days + 5)
+            st = _completed_daily(daily_df, df.index[i]).tail(cfg.rs_lookback_days + 5)
+            sp = _completed_daily(spy_daily, df.index[i]).tail(cfg.rs_lookback_days + 5)
             rs, _ = relative_strength(st, sp, cfg.rs_lookback_days)
             if rs < cfg.rs_min_pct:
                 n_rs_blocked += 1
@@ -383,7 +443,7 @@ def simulate_v3(
         # Phase 3-B: fast sector-regime gate — pause new entries when SOXX EMA
         # fast <= slow (semiconductor roll, caught sooner than SPY-200MA).
         if _sector_regime and soxx_daily is not None and not soxx_daily.empty:
-            sx = soxx_daily.loc[soxx_daily.index <= df.index[i]].tail(cfg.sector_regime_slow + 10)
+            sx = _completed_daily(soxx_daily, df.index[i]).tail(cfg.sector_regime_slow + 10)
             ok, _ = sector_regime_bullish(sx, cfg.sector_regime_fast, cfg.sector_regime_slow)
             if not ok:
                 n_sector_blocked += 1
@@ -441,7 +501,10 @@ def simulate_v3(
         if cfg.realistic_limit_fills:
             if next_open <= limit_price:
                 entry_price = next_open * (1 + slip)
-            elif next_low <= limit_price:
+            elif not _ttl_entry and next_low <= limit_price:
+                # 60-min touch-fill window — only without the realism lens. Live
+                # limits are cancelled after ~5 minutes, so a touch later in the
+                # hour is a fill the live bot can never get.
                 entry_price = limit_price * (1 + slip)
             else:
                 return None
@@ -454,12 +517,24 @@ def simulate_v3(
         take_profit = round(entry_price + cfg.tp_atr_mult * sig.atr, 2)
         qty = _position_size(entry_price, stop_loss, cfg)
         qty = max(0, int(qty * qty_mult))
+        if _reclamp and qty > 0:
+            # Live applies regime_mult inside risk dollars and THEN takes
+            # min(qty_by_risk, qty_by_cap) — the cap always wins. Multiplying
+            # after _position_size let a 1.4× boost put up to 98% of the
+            # account in one name; re-clamp restores the live invariant.
+            qty = min(qty, int(cfg.account_usd * cfg.max_position_pct
+                               / max(entry_price, 1e-9)))
         if qty == 0:
             return None
 
         # ---- THE cash wall (the honest constraint) ----
         if enforce_cash:
-            affordable = int((cash - flat_commission) / max(entry_price, 1e-9))
+            # Conviction-gated margin experiment: a high-score entry may draw
+            # cash down to −(mult−1)×capital instead of 0 (flag, default off).
+            floor = 0.0
+            if cfg.conviction_lev_score > 0 and sig.score >= cfg.conviction_lev_score:
+                floor = -(cfg.conviction_lev_mult - 1.0) * start_capital
+            affordable = int((cash - flat_commission - floor) / max(entry_price, 1e-9))
             if affordable < qty:
                 if affordable <= 0:
                     n_skipped_cash += 1
@@ -471,6 +546,7 @@ def simulate_v3(
 
     total = len(events)
     step = max(1, total // 50)
+    _cap_ts, _cap_n = None, 0   # per-scan new-name counter (max_new_names_per_scan)
 
     for evt_idx, (ts, sym, i) in enumerate(events):
         if progress_cb is not None and evt_idx % step == 0:
@@ -535,13 +611,30 @@ def simulate_v3(
             # ---- resolve the bar's exit (conservative SL-before-TP order) ----
             exit_reason = None
             exit_price = 0.0
-            if lo <= pos.stop_loss:
-                trigger = min(o, pos.stop_loss)
+            sl_trigger = None
+            if _scan_exits:
+                # Live stops are SOFT: checked against a snapshot at scan
+                # boundaries and filled at market — never intrabar at the exact
+                # level (measured live cost −1.38R vs the −1R touch model).
+                # Hourly-bar equivalent: a gap-through open fills at the open,
+                # otherwise a CLOSE beyond the stop fills at the close, paying
+                # whatever overshoot accrued since the level broke. An intrabar
+                # dip that recovers by the close is NOT an exit (live skips it
+                # too). TP keeps touch-fill: the live 5-min manage tick books
+                # last ≥ TP within minutes of a touch (slightly BETTER than the
+                # exact level, so touch-fill here is the conservative side).
+                if o <= pos.stop_loss:
+                    sl_trigger = o
+                elif cl <= pos.stop_loss:
+                    sl_trigger = cl
+            elif lo <= pos.stop_loss:
+                sl_trigger = min(o, pos.stop_loss)
+            if sl_trigger is not None:
                 worsened = exit_slip * cfg.sl_breakaway_mult
-                exit_price = trigger * (1 - worsened)
+                exit_price = sl_trigger * (1 - worsened)
                 if pos.trail_active and pos.stop_loss > pos.entry_price:
                     exit_reason = "TRAIL"
-                elif pos.breakeven_set and trigger >= pos.entry_price:
+                elif pos.breakeven_set and sl_trigger >= pos.entry_price:
                     exit_reason = "BREAKEVEN"
                 else:
                     exit_reason = "SL"
@@ -588,6 +681,7 @@ def simulate_v3(
                         cash -= _merge_addon(pos, s_entry, s_stop, s_tp,
                                              s_qty, s_sig.atr)
             # mark-to-market AFTER managing, then move on (no new entry this bar)
+            borrow_bar_sum += max(0.0, -cash)
             equity_mtm = cash + sum(p.qty * last_close.get(p.symbol, p.entry_price)
                                     for p in open_pos.values())
             peak_mtm = max(peak_mtm, equity_mtm)
@@ -602,6 +696,15 @@ def simulate_v3(
         if cfg.apply_max_positions and len(open_pos) >= derive_max_positions(cfg.account_usd):
             continue
 
+        # Per-scan new-name cap (live: max_new_names_per_scan=2). Events at the
+        # same timestamp = candidates of the same scan; once the cap is hit,
+        # the rest of that bar's candidates wait for the next scan, like live.
+        if cfg.max_new_names_per_scan > 0 and not parity_mode:
+            if ts != _cap_ts:
+                _cap_ts, _cap_n = ts, 0
+            if _cap_n >= cfg.max_new_names_per_scan:
+                continue
+
         if cfg.sl_cooldown_hours > 0 and sym in last_sl_at:
             if (ts - last_sl_at[sym]).total_seconds() / 3600 < cfg.sl_cooldown_hours:
                 continue
@@ -613,6 +716,11 @@ def simulate_v3(
 
         cost = qty * entry_price
         cash -= cost   # debit (may go negative when enforce_cash=False → implicit margin)
+        if cfg.max_new_names_per_scan > 0 and not parity_mode:
+            _cap_n += 1
+        if enforce_cash and cash < -1e-6:
+            n_lev_entries += 1
+            min_cash = min(min_cash, cash)
 
         open_pos[sym] = Trade(
             symbol=sym, entry_bar=i + 1,
@@ -624,6 +732,7 @@ def simulate_v3(
         )
 
         # mark-to-market after the entry
+        borrow_bar_sum += max(0.0, -cash)
         gross = sum(p.qty * last_close.get(p.symbol, p.entry_price)
                     for p in open_pos.values())
         peak_gross = max(peak_gross, gross)
@@ -647,6 +756,14 @@ def simulate_v3(
                           max_dd_mtm, peak_gross, n_skipped_cash,
                           n_earnings_blocked, n_rs_blocked, n_sector_blocked,
                           n_ml_halved)
+    if cfg.conviction_lev_score > 0:
+        # Conviction-margin experiment telemetry. borrow_bar_sum accumulates
+        # once per EVENT (bar × ticker) — normalize to dollar-DAYS so the
+        # harness can price margin interest.
+        metrics["n_leveraged_entries"] = n_lev_entries
+        metrics["max_borrowed_usd"] = round(max(0.0, -min_cash), 2)
+        metrics["borrowed_dollar_days"] = round(
+            borrow_bar_sum / max(len(per_ticker), 1) / 7.0, 2)
     # rich_metrics: the production path (run_backtest → GUI panel + weekly Telegram
     # self-check) needs the full report shape the oracle emits — Sharpe/Sortino/
     # Calmar/MonteCarlo/by_symbol/monthly_pnl/avg_win_pct/max_drawdown_usd. We reuse
@@ -717,10 +834,24 @@ def _metrics_v3(trades, cfg, start_capital, ending_cash,
     for t in trades:
         reasons[t.exit_reason] = reasons.get(t.exit_reason, 0) + 1
 
+    # Per-POSITION win rate: scale-out partials are each booked as their own
+    # Trade with a profitable exit by construction, which inflates the per-fill
+    # win rate whenever scale-out/breakeven are active. Group fills by the
+    # position they came from (symbol + entry bar) and judge the NET PnL.
+    pos_pnl: dict[tuple, float] = {}
+    for t in trades:
+        key = (t.symbol, t.entry_bar, t.entry_date)
+        pos_pnl[key] = pos_pnl.get(key, 0.0) + t.pnl
+    n_pos = len(pos_pnl)
+    wr_pos = round(sum(1 for p in pos_pnl.values() if p > 0) / n_pos * 100, 1) \
+        if n_pos else 0.0
+
     final_equity = start_capital + net
     return {
         "total_trades": len(trades),
+        "total_positions": n_pos,
         "win_rate_pct": wr,
+        "win_rate_per_position_pct": wr_pos,
         "profit_factor": pf,
         "net_pnl_usd": net,
         "net_pnl_pct": round(net / start_capital * 100, 2),

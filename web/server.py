@@ -40,16 +40,21 @@ from flask import Flask, jsonify, make_response, redirect, request, send_from_di
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import approvals, db, risk_manager  # noqa: E402
+from src import approvals, db, keepawake, risk_manager  # noqa: E402
 from src.config import settings  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
 # Override only for running an isolated/secondary instance (e.g. tests). Default = repo .env.
 ENV_FILE = Path(os.getenv("WEB_ENV_FILE") or (ROOT / ".env"))
 ACCOUNT_FILE = ROOT / "data" / "account.json"
+OPEN_TRADES_FILE = ROOT / "data" / "open_trades.json"
 TRADER_LOG = ROOT / "logs" / "trader.log"
 SIGNAL_LOG = ROOT / "logs" / "signal_reporter.log"
+SIGNAL_PID = ROOT / "logs" / "signal_reporter.pid"
+SIGNAL_WL_FILE = ROOT / "config" / "signal_watchlist.json"
+SELF_REVIEW_FILE = ROOT / "data" / "self_review_last.json"
 SCHED_PID = ROOT / "logs" / "scheduler.pid"
+MENUBAR_PID = ROOT / "logs" / "menubar.pid"
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 
 app = Flask(__name__, static_folder=None)
@@ -213,13 +218,69 @@ def _tail(p: Path, n: int) -> list[str]:
         return []
 
 
-def _scheduler_running() -> bool:
+def _pid_running(pid_file: Path) -> int | None:
+    """Return the live PID recorded in pid_file, or None if not running."""
     try:
-        pid = int(SCHED_PID.read_text().strip())
+        pid = int(pid_file.read_text().strip())
         os.kill(pid, 0)   # signal 0 = liveness check
-        return True
+        return pid
     except Exception:
+        return None
+
+
+def _scheduler_running() -> bool:
+    return _pid_running(SCHED_PID) is not None
+
+
+def _launch_menubar() -> None:
+    """Spawn the menu-bar status app if it isn't already running. It mirrors the
+    scheduler's life: it quits itself once the scheduler stops, so its presence in
+    the menu bar == 'scheduler is running in the background'. Best-effort — a
+    failure here must never block starting the scheduler."""
+    if _pid_running(MENUBAR_PID) is not None:
+        return
+    try:
+        log = (ROOT / "logs" / "menubar.log").open("a")
+        proc = subprocess.Popen(
+            [str(VENV_PY), "-m", "src.menubar_app"],
+            cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
+        )
+        MENUBAR_PID.write_text(str(proc.pid))
+    except Exception as e:
+        print(f"menubar launch skipped: {e}", file=sys.stderr)
+
+
+def _stop_pid(pid_file: Path) -> bool:
+    """Gracefully stop the process group recorded in pid_file (mirrors the GUI):
+    SIGTERM the whole group, wait up to ~3s, then remove the pid file. Returns
+    True if there was a live process to signal."""
+    pid = _pid_running(pid_file)
+    if pid is None:
+        try:
+            pid_file.unlink()
+        except FileNotFoundError:
+            pass
         return False
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(15):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.2)
+    try:
+        pid_file.unlink()
+    except FileNotFoundError:
+        pass
+    return True
 
 
 def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
@@ -297,6 +358,23 @@ def api_status():
     acct["opend_status"], acct["opend_label"] = _opend_status(acct, sched)
     try:
         acct["budget"] = risk_manager.budget_usd()   # live override beats stale snapshot
+    except Exception:
+        pass
+    # Enrich per_position with the GUI's open-trade fields (entry/stop/tp/atr) so the
+    # web positions table mirrors the desktop GUI exactly. account.per_position only
+    # carries live price/PnL; the static trade params live in open_trades.json.
+    try:
+        trades = _read_json(OPEN_TRADES_FILE, {})
+        pp = acct.get("per_position") or {}
+        for sym, tr in trades.items():
+            cell = pp.setdefault(sym, {})
+            cell.setdefault("qty", tr.get("qty"))
+            cell["entry_price"] = tr.get("entry_price")
+            cell["stop_loss"]   = tr.get("stop_loss")
+            cell["take_profit"] = tr.get("take_profit")
+            cell["atr"]         = tr.get("atr")
+            cell["strategy"]    = tr.get("strategy")
+        acct["per_position"] = pp
     except Exception:
         pass
     try:
@@ -462,15 +540,27 @@ def api_scheduler(action):
             cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
         )
         SCHED_PID.write_text(str(proc.pid))
+        _launch_menubar()
         return jsonify({"ok": True, "pid": proc.pid})
     if action == "stop":
-        try:
-            pid = int(SCHED_PID.read_text().strip())
-            os.kill(pid, signal.SIGTERM)
-            return jsonify({"ok": True})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 400
+        had = _stop_pid(SCHED_PID)
+        return jsonify({"ok": True, "running": _scheduler_running(),
+                        "note": "not running" if not had else "stopped"})
     return jsonify({"ok": False, "error": "bad action"}), 400
+
+
+# ── keep-awake toggle ("caffeinate" — Amphetamine-style) ───────────────────────
+# All the logic lives in src/keepawake.py so the web dashboard and the menu-bar app
+# behave identically. Layer 1 = `caffeinate -i -s` (no idle/system sleep, screen may
+# still turn off). Layer 2 = `sudo pmset disablesleep` (also blocks lid-closed sleep)
+# via a one-time, tightly-scoped sudoers rule that the first enable installs through
+# a native macOS auth dialog.
+@app.route("/api/caffeinate", methods=["GET", "POST"])
+def api_caffeinate():
+    if request.method == "POST":
+        on = bool((request.get_json(silent=True) or {}).get("on"))
+        return jsonify(keepawake.turn_on() if on else keepawake.turn_off())
+    return jsonify(keepawake.status())
 
 
 # ── web access: toggle LAN/phone exposure from the panel (restarts this server) ─
@@ -560,11 +650,87 @@ def api_web_access():
 
 @app.route("/api/signal-run/<mode>", methods=["POST"])
 def api_signal_run(mode):
-    if mode not in ("premarket", "intraday", "scalp"):
-        return jsonify({"ok": False, "error": "mode must be premarket|intraday|scalp"}), 400
+    if mode not in ("brief", "review", "close", "premarket", "intraday"):
+        return jsonify({"ok": False,
+                        "error": "mode must be brief|review|close|premarket|intraday"}), 400
     subprocess.Popen([str(VENV_PY), "-m", "src.signal_reporter", mode],
                      cwd=str(ROOT), start_new_session=True)
     return jsonify({"ok": True, "mode": mode})
+
+
+# ── signal reporter scheduler (persistent loop) — mirrors the desktop GUI ──────
+@app.route("/api/signal-status")
+def api_signal_status():
+    pid = _pid_running(SIGNAL_PID)
+    return jsonify({"running": pid is not None, "pid": pid})
+
+
+@app.route("/api/signal-scheduler/<action>", methods=["POST"])
+def api_signal_scheduler(action):
+    if action == "start":
+        if _pid_running(SIGNAL_PID) is not None:
+            return jsonify({"ok": True, "running": True, "note": "already running"})
+        SIGNAL_LOG.parent.mkdir(parents=True, exist_ok=True)
+        log = SIGNAL_LOG.open("a")
+        proc = subprocess.Popen(
+            [str(VENV_PY), "-m", "src.signal_reporter", "run"],
+            cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
+        )
+        SIGNAL_PID.write_text(str(proc.pid))
+        return jsonify({"ok": True, "running": True, "pid": proc.pid})
+    if action == "stop":
+        had = _stop_pid(SIGNAL_PID)
+        return jsonify({"ok": True, "running": _pid_running(SIGNAL_PID) is not None,
+                        "note": "not running" if not had else "stopped"})
+    return jsonify({"ok": False, "error": "bad action"}), 400
+
+
+# ── signal watchlist editor (config/signal_watchlist.json) ─────────────────────
+@app.route("/api/signal-watchlist", methods=["GET", "POST"])
+def api_signal_watchlist():
+    if request.method == "GET":
+        data = _read_json(SIGNAL_WL_FILE, {})
+        tickers = [str(t).strip().upper() for t in (data.get("tickers") or []) if str(t).strip()]
+        return jsonify({"tickers": tickers})
+    body = request.get_json(silent=True) or {}
+    raw = body.get("tickers")
+    if not isinstance(raw, list):
+        return jsonify({"ok": False, "error": "tickers must be a list"}), 400
+    # Normalize: uppercase, strip, dedupe (preserve order) — same shape the bot reads.
+    seen, tickers = set(), []
+    for t in raw:
+        s = str(t).strip().upper()
+        if s and s not in seen:
+            seen.add(s); tickers.append(s)
+    try:
+        SIGNAL_WL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SIGNAL_WL_FILE.write_text(
+            json.dumps({"tickers": tickers}, indent=2, ensure_ascii=False)
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({"ok": True, "tickers": tickers})
+
+
+# ── weekly self-review ("retrain") — analyze real fills → suggestions ──────────
+@app.route("/api/self-review")
+def api_self_review():
+    """Last persisted weekly self-review result (for the dashboard pill)."""
+    data = _read_json(SELF_REVIEW_FILE, {})
+    return jsonify(data)
+
+
+@app.route("/api/self-review/run", methods=["POST"])
+def api_self_review_run():
+    """Trigger the weekly self-review now — same job as the Sunday cron
+    (analyze last 7d fills → notify → enqueue suggestions → optimizer proposals).
+    Runs detached; the dashboard polls /api/self-review for the fresh result."""
+    log = (ROOT / "logs" / "self_review.log").open("a")
+    subprocess.Popen(
+        [str(VENV_PY), "-m", "src.main", "review"],
+        cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
+    )
+    return jsonify({"ok": True, "started": True})
 
 
 # ── backtest (background thread) ──────────────────────────────────────────────
@@ -607,7 +773,34 @@ def api_backtest():
     return jsonify(_bt)
 
 
+def _self_review_catchup_on_boot() -> None:
+    """If the weekly self-review is overdue (laptop was off on its scheduled day),
+    fire it ONCE on startup — detached, so it never blocks the server. The trading
+    scheduler has its own catchup; this covers the common case where the user only
+    opens the web dashboard. cron_state.record_run() makes it idempotent: once it
+    runs, last_run is fresh and a quick restart won't re-fire it."""
+    try:
+        from src import cron_state
+        expected = cron_state.expected_last_fire_weekly(6, 23, 0)  # Sun 23:00 ET
+        if not cron_state.needs_catchup("self_review", expected):
+            return
+        last = cron_state.last_run("self_review")
+        print(f"🧠 Self-review overdue (last run: {last or 'never'}) — running catchup now.")
+        log = (ROOT / "logs" / "self_review.log").open("a")
+        subprocess.Popen(
+            [str(VENV_PY), "-m", "src.main", "review"],
+            cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
+        )
+    except Exception as e:
+        print(f"self-review catchup check skipped: {e}", file=sys.stderr)
+
+
 def main():
+    _self_review_catchup_on_boot()
+    # If the scheduler is already running (e.g. started yesterday), make sure the
+    # menu-bar status icon is up too — so opening the dashboard reattaches the icon.
+    if _scheduler_running():
+        _launch_menubar()
     port = int(os.getenv("WEB_PORT", "8770"))
     # Env override wins; otherwise the in-app toggle (persisted to .env) decides;
     # default localhost-only.

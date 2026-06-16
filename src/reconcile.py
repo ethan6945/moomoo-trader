@@ -30,7 +30,8 @@ RECONCILE_FILE = settings.root / "data" / "reconcile.json"
 NY = pytz.timezone("America/New_York")
 
 
-def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True) -> dict:
+def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
+              client=None) -> dict:
     """Compare our internal records to broker positions.
 
     2026-05-30 update: auto-fix the safe drifts instead of just logging.
@@ -92,12 +93,25 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True) -> dict:
                 log.warning("Reconcile orphan %s has zero cost_price — skipping auto-add",
                             sym)
                 continue
-            # ATR-derived stop/TP using the bot's LIVE exit multipliers (was a
-            # hardcoded -3.5%/+7%). atr_proxy = 2% of price (typical for these
-            # names); stop/TP then match how the bot actually exits, so an
-            # adopted orphan is managed consistently with a bot-opened position.
+            # ATR-derived stop/TP using the bot's LIVE exit multipliers. Use the
+            # REAL ATR(14) when a client is available — the old 2%-of-price
+            # proxy put stops in the wrong place for every name whose true ATR
+            # wasn't 2% (the first 8 adopted orphans went 1/8 at −$193 largely
+            # on fabricated levels). Falls back to the proxy only if the kline
+            # fetch fails.
             from . import runtime_config
             atr_proxy = cost * 0.02
+            if client is not None:
+                try:
+                    import pandas_ta_classic as ta
+                    kdf = client.get_kline(sym, bars=30)
+                    real_atr = float(ta.atr(kdf["high"], kdf["low"],
+                                            kdf["close"], length=14).iloc[-1])
+                    if real_atr > 0 and not pd.isna(real_atr):
+                        atr_proxy = real_atr
+                except Exception as e:
+                    log.warning("orphan %s: real ATR fetch failed (%s) — using 2%% proxy",
+                                sym, e)
             our_trades[sym] = {
                 "symbol": sym, "qty": o["broker_qty"],
                 "entry_price": cost,

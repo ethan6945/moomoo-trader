@@ -316,7 +316,11 @@ class MoomooClient:
         if ret != RET_OK or data is None or data.empty:
             return pd.DataFrame()
         return data[
-            data["order_status"].isin(["SUBMITTED", "SUBMITTING", "WAITING_SUBMIT"])
+            # FILLED_PART included (2026-06-10): a stale partially-filled buy
+            # must still be canceled — and its record kept at dealt_qty —
+            # otherwise it lingers all day and the leftover becomes an orphan.
+            data["order_status"].isin(["SUBMITTED", "SUBMITTING",
+                                       "WAITING_SUBMIT", "FILLED_PART"])
             & (data["trd_side"] == "BUY")
         ]
 

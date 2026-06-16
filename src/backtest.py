@@ -179,6 +179,37 @@ class BacktestConfig:
     apply_sector_regime_gate: bool = False
     sector_regime_fast: int = 20
     sector_regime_slow: int = 50
+    # ── Phase 0 realism knobs (2026-06-10) — close the exit/fill/lookahead gaps
+    # the live-parity audit measured (live SL averaged −1.38R vs the modeled −1R;
+    # entry limits live ~5 min not a full hour; daily gates read the same-day
+    # final close). All default OFF so parity_mode + engine_compare + every old
+    # run stay byte-exact; _run_live_engine flips them ON so each user-facing
+    # number pays the same frictions the live bot does.
+    scan_grid_exits: bool = False       # stops are SOFT live: gap-open or bar-close fill, never intrabar touch
+    entry_fill_open_only: bool = False  # fill only at next-bar open ≤ limit (≈ 5-min TTL, not 60-min window)
+    no_same_day_daily: bool = False     # daily-bar gates see COMPLETED days only (no same-day-close lookahead)
+    reclamp_position_cap: bool = False  # re-apply max_position_pct AFTER qty multipliers (regime mult broke it)
+    apply_trade_windows: bool = False   # entries only 09:45–15:30 ET, none Friday ≥ 14:00 (live kill_switch)
+    # ── Phase 1 (2026-06-11): walk-forward dynamic universe ──
+    # When on (and cfg.tickers = the liquidity pool), new entries are gated on
+    # membership in the week's top-N by 6-1 momentum, recomputed each week from
+    # daily bars STRICTLY before that week — the same decision the live weekly
+    # refresh makes. Kills the pinned-watchlist survivorship bias.
+    apply_dynamic_universe: bool = False
+    universe_top_n: int = 15
+    # Live caps how many NEW names may open per scan (config
+    # max_new_names_per_scan=2); the engine never modeled it (found 2026-06-11).
+    # 0 = uncapped (old behaviour); _run_live_engine passes the live value.
+    max_new_names_per_scan: int = 0
+    # ── EXPERIMENT (2026-06-12): conviction-gated margin ──
+    # When conviction_lev_score > 0, an entry whose rule score is at/above it
+    # may breach the cash wall: cash may go negative down to
+    # −(conviction_lev_mult − 1) × start_capital (i.e. 1.5 → borrow up to 50%
+    # of the account). Requires a REAL margin account to ever go live; the
+    # engine does NOT charge margin interest — the harness estimates it from
+    # the emitted borrowed dollar-days. Default 0 = off, parity untouched.
+    conviction_lev_score: float = 0.0
+    conviction_lev_mult: float = 1.5
     use_realistic_commission: bool = False  # moomoo per-order fees instead of flat $1
     commission_pct_per_order: float = 0.0003  # moomoo MY US: 0.03% × notional / order / side
     platform_fee_per_order: float = 0.99      # moomoo MY US: $0.99 / order / side
@@ -850,9 +881,14 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
                     log.warning("[prefetch] %s: only %d bars — skipping", sym, len(df))
                     continue
                 daily_df = None
-                if cfg.apply_mtf_gate or cfg.apply_gap_gate:
+                if cfg.apply_mtf_gate or cfg.apply_gap_gate or cfg.apply_dynamic_universe:
                     try:
-                        daily_df = _fetch(sym, bars=max(cfg.days + 60, 250),
+                        # Dynamic universe needs ~157 daily bars BEFORE the sim
+                        # start for the 6-1 momentum rank; all other consumers
+                        # are tail()-bounded, so extra depth never changes them.
+                        _d_bars = max(cfg.days + (220 if cfg.apply_dynamic_universe
+                                                  else 60), 250)
+                        daily_df = _fetch(sym, bars=_d_bars,
                                           ktype=KLType.K_DAY)
                     except Exception as e:
                         log.warning("[prefetch] daily fetch failed for %s: %s", sym, e)
@@ -992,12 +1028,23 @@ def _run_live_engine(cfg: BacktestConfig, cache: dict, progress_cb=None,
     # owner-approved regime up-scaling (inert at the default REGIME_BULL_MULT=1.0,
     # so the honest baseline is unchanged until the owner activates it in .env).
     from .config import settings as _s
+    from . import runtime_config as _rc
     cfg_live = replace(cfg, apply_vix_sizing=True, apply_earnings_gate=True,
                        use_realistic_commission=True,
                        apply_momentum_strategy=True,
                        use_regime_scaling=True,
                        regime_bull_mult=_s.regime_bull_mult,
-                       regime_vix_calm=_s.regime_vix_calm)
+                       regime_vix_calm=_s.regime_vix_calm,
+                       # Phase 0 realism (2026-06-10): pay live's exit/fill/
+                       # lookahead frictions in every user-facing number.
+                       scan_grid_exits=True,
+                       entry_fill_open_only=True,
+                       no_same_day_daily=True,
+                       reclamp_position_cap=True,
+                       apply_trade_windows=True,
+                       max_new_names_per_scan=_s.max_new_names_per_scan,
+                       use_breakeven_stop=_s.use_breakeven_stop,
+                       breakeven_trigger_r=_rc.breakeven_trigger_r())
     return simulate_v3(cfg_live, cache, enforce_cash=True,
                        rich_metrics=rich_metrics, progress_cb=progress_cb)
 
@@ -1022,6 +1069,16 @@ def run_backtest(
     `simulate_with_cache` (Optuna) and the engine_compare differential test.
     """
     cache = prefetch_data(cfg, progress_cb=progress_cb)
+    # Phase 0 guard (2026-06-10): a dead network/OpenD makes prefetch return 0
+    # tickers and the engine "completes" with 0 trades — which then OVERWRITES
+    # data/backtest_results.json with garbage the GUI displays as the honest
+    # number (happened on the 2026-06-08 Sunday catch-up run). Refuse loudly;
+    # the weekly job's except-branch telegrams the failure and the GUI keeps
+    # the last good result.
+    if not cache.get("per_ticker"):
+        raise RuntimeError(
+            "prefetch returned 0 tickers (network/OpenD down?) — "
+            "refusing to run and overwrite the last good backtest result")
     result = _run_live_engine(cfg, cache, progress_cb=progress_cb)
     # Log per-symbol trade counts for parity with the old behaviour.
     by_sym: dict[str, int] = {}

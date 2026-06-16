@@ -865,230 +865,290 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
         "vol":        vol_v,
         "mom":        mom_v,
         "sr":         sr_v,
-        "isr":        isr_v,   # intraday swing S/R (tight) — used by the scalp card
+        "isr":        isr_v,   # intraday swing S/R (tight) — used by the brief card
         "buy_score":  buy_s,
         "sell_score": sell_s,
         "alerts":     alerts,
     }
 
 
-# ─── 超短线 30-MIN SCALP 决策仪表盘（多周期 + AI）─────────────────────────────
-# 灵感来自 daily_stock_analysis 的「决策仪表盘」，但为 *超短线*（持仓 15-60min）
-# 重新设计：主周期 30M（结构/趋势）+ 触发周期 5M（精确入场），点位贴近现价。
-# 价格全部来自 MooMoo 券商实时源（snapshot last_price + 已修复的 kline）。
+# ─── 当日简报（盘前 08:30 + 开盘1小时 10:30 复盘）────────────────────────────
+# 用户需求 (2026-06-12)：每个交易日对 watchlist 两次推送——
+#   ① 盘前简报：宏观催化 + 盘前动态 + 开盘方向预判 + 支撑阶梯 + 日内多空 TP
+#   ② 开盘1小时复盘：结合①的盘前资料 + 开盘后实际走势，修正方向与 TP
+# 格式刻意压缩成 Telegram 一屏可读的紧凑卡片，只留可操作的关键信息。
+# 盘前简报会存盘到 data/daily_analysis/，10:30 复盘时读回来喂给 AI 对比。
 
-def _trend_label(tech: dict) -> str:
-    """一句话趋势：多头 / 空头 / 震荡 —— 看 EMA9/21 排列 + 价格位置 + MACD。"""
-    ema9, ema21, price = tech["ema9"], tech["ema21"], tech["price"]
-    above = price > tech["vwap"]
-    if ema9 > ema21 and price > ema9:
-        return "🟢多头" + ("·强" if (tech["macd"]["above"] and above) else "")
-    if ema9 < ema21 and price < ema9:
-        return "🔴空头" + ("·强" if (not tech["macd"]["above"] and not above) else "")
-    return "🟡震荡"
+_DAILY_DIR = settings.root / "data" / "daily_analysis"
+
+_BRIEF_FORMAT = """输出格式（Telegram 紧凑卡片，纯文本+emoji，总长 ≤900 字，严格按此结构，不要代码块/表格/多余寒暄）:
+
+🌐 宏观: <今日最核心的1-2条宏观/行业催化，及对市场情绪的影响，≤60字>
+📊 动态: <现价/盘前价与涨跌幅、盘前高低点(如有)、主力情绪，≤50字>
+🧭 开盘预判: <高开上升 / 低开回调 / 震荡，一句理由>
+🎯 支撑阶梯:
+  ① $<价> 短线交战区
+  ② $<价> 较安全买点
+  ③ $<价> 黄金抄底价
+⚡ 日内TP:
+  📈 做多: TP1 $<价> · TP2 $<价>
+  📉 做空: TP1 $<价> · TP2 $<价>
+🛠 提醒: <今日最核心的一句风控/操盘提示，≤40字>"""
+
+_CLOSE_FORMAT = """输出格式（Telegram 紧凑卡片，纯文本+emoji，总长 ≤1000 字，严格按此结构，不要代码块/表格/多余寒暄）:
+
+📈 今日走势: <开盘价→日内高低→收盘价与涨跌幅，一句话概括全天形态，≤60字>
+🔍 预测对账:
+  🌅 盘前预判: <当时的开盘方向预判> → <✅达标/⚠️部分/❌偏差> <一句实际对比>
+  🎯 支撑/TP: <盘前给的关键支撑位和TP是否被触及/守住，逐个简短判定，≤80字>
+  🔄 盘中修正: <10:30复盘的修正是否更准，≤40字>
+📊 达标结论: <✅基本达标 / ⚠️部分达标 / ❌失准> + <一句总评，哪里对哪里错>
+🧠 为什么这么走: <今天盘面按此趋势运行的根本原因——宏观/资金/筹码/消息，2-3句，≤100字>
+💡 明日启示: <对明天操作最有价值的一条经验，≤50字>"""
 
 
-def _scalp_ai(t30: dict, t5: dict, ticker_news: list, macro_news: list,
-              ctx_text: str) -> dict:
-    """超短线 AI 决策。Gemini → 纯技术 fallback。返回富 dict。"""
-    news_text = "\n".join(
-        f"- {n['title'][:78]}" for n in ticker_news[:4]) or "无近期新闻"
-    macro_text = "\n".join(f"- {n['title'][:64]}" for n in macro_news[:2]) or "无"
-    atr5 = t5["atr"]
+def _call_gemini_text(prompt: str, use_search: bool = True) -> Optional[str]:
+    """像 _call_gemini，但返回纯文本（简报卡片），并尽量启用 google_search
+    grounding 让模型自己补全最新宏观/个股新闻。不支持 tools 的模型/版本
+    自动降级为无搜索调用。"""
+    try:
+        from google import genai
+    except ImportError:
+        return None
+    keys = list(settings.gemini_keys)
+    if not keys:
+        return None
+    for model_name in gemini_cascade():
+        for key in keys:
+            configs = []
+            if use_search:
+                configs.append({"temperature": 0.3, "tools": [{"google_search": {}}]})
+            configs.append({"temperature": 0.3})
+            for cfg in configs:
+                try:
+                    client = genai.Client(api_key=key)
+                    resp = client.models.generate_content(
+                        model=model_name, contents=prompt, config=cfg)
+                    text = (resp.text or "").strip()
+                    if text:
+                        return text
+                except Exception as e:
+                    err = str(e)
+                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                        break  # 此 key 配额尽 → 换 key
+                    # tools 不支持等其他错误 → 试下一个 config / key
+                    continue
+    return None
 
-    prompt = f"""你是顶级美股超短线 scalper（持仓 15-60 分钟，分钟级进出）。基于多周期实时数据给出一份*超短线决策仪表盘*。
 
-【{t30['ticker']} {t30['company']}】 实时价 ${t30['price']} | 当日 {t30['chg1']:+.2f}%
+def _weekly_sr(c, sym: str) -> dict:
+    """周线级别大区间（52 周高低 + 近 10 周低点），给支撑阶梯当锚。"""
+    try:
+        df_w = c.get_kline(sym, bars=52, ktype=KLType.K_WEEK)
+        if df_w is None or len(df_w) < 5:
+            return {}
+        return {
+            "low_52w":  round(float(df_w["low"].min()), 2),
+            "high_52w": round(float(df_w["high"].max()), 2),
+            "low_10w":  round(float(df_w["low"].tail(10).min()), 2),
+        }
+    except Exception as e:
+        log.debug("weekly kline %s failed: %s", sym, e)
+        return {}
 
-主周期 30分钟K线（结构/趋势）:
-- RSI(7)={t30['rsi']} | MACD hist={t30['macd']['hist']:+.4f}(金叉={t30['macd']['cross_up']} 死叉={t30['macd']['cross_down']})
-- EMA9={t30['ema9']:.2f}/EMA21={t30['ema21']:.2f} | VWAP=${t30['vwap']} | BB%B={t30['boll']['pct_b']}({t30['boll']['breakout']})
-- Stoch K={t30['stoch']['k']}/D={t30['stoch']['d']} | ATR={t30['atr']} | 量比={t30['vol']['ratio']}x | 动能={t30['mom']:+.2f}%
-- 技术评分 买{t30['buy_score']}/卖{t30['sell_score']} | 警报:{', '.join(t30['alerts']) or '无'}
 
-触发周期 5分钟K线（精确入场）:
-- RSI(7)={t5['rsi']} | MACD hist={t5['macd']['hist']:+.4f}(金叉={t5['macd']['cross_up']} 死叉={t5['macd']['cross_down']})
-- EMA9={t5['ema9']:.2f}/EMA21={t5['ema21']:.2f} | VWAP=${t5['vwap']} | Stoch K={t5['stoch']['k']} | 量比={t5['vol']['ratio']}x | 动能={t5['mom']:+.2f}% | ATR(5M)={atr5}
+def _first_hour_stats(c, sym: str) -> dict:
+    """开盘后第一小时的 5M 高/低/量（取当日 09:30 起的 bars）。"""
+    try:
+        df = c.get_kline(sym, bars=80, ktype=KLType.K_5M)
+        if df is None or df.empty:
+            return {}
+        if "time_key" in df.columns:
+            import pytz
+            from datetime import datetime
+            today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+            day = df[df["time_key"].astype(str).str.startswith(today)]
+            if not day.empty:
+                df = day
+        df = df.tail(13)  # 最多一小时多一点
+        return {
+            "high": round(float(df["high"].max()), 2),
+            "low":  round(float(df["low"].min()), 2),
+            "vol":  int(df["volume"].sum()),
+        }
+    except Exception as e:
+        log.debug("first hour stats %s failed: %s", sym, e)
+        return {}
 
-日内结构(30M近20根): 支撑 ${t30['isr']['support']} | 压力 ${t30['isr']['resistance']}
-日线大区间: 低 ${t30['sr']['support']} | 高 ${t30['sr']['resistance']}
-市场背景:
-{ctx_text or '无'}
-个股新闻:
-{news_text}
-宏观:
-{macro_text}
 
-任务：超短线（分钟级）决策。点位必须*贴近现价*且紧凑——用 5分钟ATR({atr5})、VWAP、日内支撑/压力为锚。
-要求 30M 与 5M 多周期共振才给高分；逆势只给观望/低分。财报<2天一律保守。
+def _day_stats(c, sym: str) -> dict:
+    """当日完整 OHLC（收盘复盘用）。取日线最后一根 bar。"""
+    try:
+        df_d = c.get_kline(sym, bars=2, ktype=KLType.K_DAY)
+        if df_d is None or df_d.empty:
+            return {}
+        last = df_d.iloc[-1]
+        prev_close = float(df_d["close"].iloc[-2]) if len(df_d) >= 2 else None
+        out = {
+            "open":  round(float(last["open"]), 2),
+            "high":  round(float(last["high"]), 2),
+            "low":   round(float(last["low"]), 2),
+            "close": round(float(last["close"]), 2),
+            "vol":   int(last["volume"]),
+        }
+        if prev_close:
+            out["chg_pct"] = round((out["close"] / prev_close - 1) * 100, 2)
+        return out
+    except Exception as e:
+        log.debug("day stats %s failed: %s", sym, e)
+        return {}
 
-严格只返回 JSON（无代码块、无多余文字）:
-{{"score":1-10整数,"action":"强烈买入/买入/观望/卖出/强烈卖出","verdict":"核心结论一句话(≤30字)",
-"trend":"30M与5M多周期趋势是否共振(≤28字)","entry_low":数字,"entry_high":数字,
-"target_1":数字,"target_2":数字,"stop_loss":数字,"rr":"盈亏比如1:2.1",
-"risks":["风险(≤14字)"],"catalyst":"催化/新闻影响(≤22字)","checklist":["可执行步骤(≤20字)"],
-"hold":"预计持仓如15-45min","confidence":"高/中/低"}}"""
 
-    ai = _call_gemini(prompt)
-    if ai:
-        log.info("scalp AI [%s] %s → %s (%s/10)", ai.get("_model", "?"),
-                 t30["ticker"], ai.get("action"), ai.get("score"))
-        # 防御：list 字段可能被模型返回成 str
-        for k in ("risks", "checklist"):
-            if isinstance(ai.get(k), str):
-                ai[k] = [ai[k]]
-            ai[k] = ai.get(k) or []
-        return ai
-
-    # 纯技术 fallback（AI 全挂）— 用 30M 评分 + 5M ATR 给紧凑点位
-    net = t30["buy_score"] - t30["sell_score"]
-    score = max(1, min(10, 5 + net // 2))
-    p, a5 = t30["price"], atr5
-    bullish = net >= 0
+def _daily_brief_data(c, sym: str) -> Optional[dict]:
+    """采集一只股票做简报所需的全部数据。"""
+    df_d_cache: dict = {}
+    tech = _fetch_tech(c, sym, KLType.K_15M, 120, df_d_cache)
+    if not tech:
+        return None
+    snap = _live_snap(c, sym)
+    try:
+        vix_value = c.get_vix()
+    except Exception:
+        vix_value = None
+    spy_snap = _snap_chg(c, "SPY")
     return {
-        "score": score, "action": _action_from_scores(t30["buy_score"], t30["sell_score"]),
-        "verdict": "AI不可用，纯技术信号",
-        "trend": f"30M {_trend_label(t30)} / 5M {_trend_label(t5)}",
-        "entry_low": round(p - a5 * 0.4, 2), "entry_high": round(p + a5 * 0.4, 2),
-        "target_1": round(p + a5 * (1.2 if bullish else -1.2), 2),
-        "target_2": round(p + a5 * (2.0 if bullish else -2.0), 2),
-        "stop_loss": round(p - a5 * (1.2 if bullish else -1.2), 2),
-        "rr": "1:1.7", "risks": ["AI不可用"], "catalyst": "未知",
-        "checklist": [f"现价{p}附近触发", f"破止损即离场"],
-        "hold": "15-45min", "confidence": "低", "_model": "fallback",
+        "tech": tech,
+        "snap": snap,
+        "vix": vix_value,
+        "spy": spy_snap,
+        "weekly": _weekly_sr(c, sym),
+        "premkt": _premarket(sym),
+        "earnings": _earnings_info(sym),
     }
 
 
-def _build_scalp_card(t30: dict, t5: dict, ai: dict, ctx_text: str,
-                      sentiment: Optional[dict], ts: str) -> str:
-    score = int(ai.get("score") or 5)
-    act_e = ACTION_EMOJI.get(ai.get("action", "观望"), "🟡")
-    conf_e = CONF_EMOJI.get(ai.get("confidence", "中"), "✋")
-    chg1 = t30.get("chg1") or 0.0
-    arrow = "📈" if chg1 >= 0 else "📉"
-    src_tag = " 🕓盘前" if t30.get("price_src") == "pre" else ""
-    reson = "✅共振" if _trend_label(t30)[:3] == _trend_label(t5)[:3] and "震荡" not in _trend_label(t30) else "⚠️背离/震荡"
-    # rr 清洗：模型常把模板占位词("如2.1")混进来 → 只抽 "数字:数字"
-    _rr = str(ai.get("rr", "") or "")
-    _m = re.search(r"[\d.]+\s*[:：]\s*[\d.]+", _rr)
-    rr = _m.group(0).replace("：", ":") if _m else (_rr or "?")
-    risks = " · ".join(ai.get("risks", [])[:3]) or "无明显风险"
-    checklist = "\n".join(f"   {i+1}. {s}" for i, s in enumerate(ai.get("checklist", [])[:4])) or "   —"
-    finbert_line = _finbert_line(sentiment)
-    ctx_section = f"\n{ctx_text}\n" if ctx_text else ""
+def _brief_prompt(sym: str, d: dict, phase: str,
+                  prev_brief: Optional[str], first_hour: Optional[dict],
+                  open1h_brief: Optional[str] = None,
+                  day: Optional[dict] = None) -> str:
+    tech = d["tech"]
+    name = COMPANY_NAMES.get(sym, sym)
+    premkt = d.get("premkt")
+    premkt_line = (f"盘前 ${premkt['price']:.2f} ({premkt['change_pct']:+.2f}%)"
+                   if premkt else "盘前数据不可用")
+    spy = d.get("spy")
+    spy_line = f"SPY {spy['chg_pct']:+.2f}%" if spy else "SPY n/a"
+    vix_line = f"VIX {d['vix']:.1f}" if d.get("vix") else "VIX n/a"
+    w = d.get("weekly") or {}
+    earn = d.get("earnings")
+    earn_line = f"下次财报 {earn['date']} ({earn['days_until']}天后)" if earn else "财报日期未知"
 
-    return (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ *超短线* {t30['ticker']} {t30['company']}\n"
-        f"${t30['price']} {arrow}{chg1:+.2f}%{src_tag}  ·  {ts}\n"
-        f"\n"
-        f"{act_e} *{ai.get('action','?')}*  {_score_bar(score)}\n"
-        f"🧭 {ai.get('verdict','')}\n"
-        f"\n"
-        f"📐 趋势 {reson}: {ai.get('trend','')}\n"
-        f"   30M {_trend_label(t30)} · 5M {_trend_label(t5)}\n"
-        f"\n"
-        f"🎯 入场 ${_ai_num(ai,'entry_low'):.2f} ~ ${_ai_num(ai,'entry_high'):.2f}\n"
-        f"📍 T1 *${_ai_num(ai,'target_1'):.2f}*  ·  T2 *${_ai_num(ai,'target_2'):.2f}*\n"
-        f"🛑 止损 *${_ai_num(ai,'stop_loss'):.2f}*  ·  盈亏比 {rr}  ·  ⏱ {ai.get('hold','?')}\n"
-        f"\n"
-        f"🚨 风险: {risks}\n"
-        f"🔮 催化: {ai.get('catalyst') or '-'}\n"
-        f"✅ 操作清单:\n{checklist}\n"
-        f"\n"
-        f"📊 30M 买{t30['buy_score']}/卖{t30['sell_score']} · RSI{t30['rsi']} · MACD{t30['macd']['hist']:+.3f} · VWAP${t30['vwap']} · Vol{t30['vol']['ratio']}x\n"
-        f"   5M  RSI{t5['rsi']} · MACD{t5['macd']['hist']:+.3f} · VWAP${t5['vwap']} · Vol{t5['vol']['ratio']}x · 动能{t5['mom']:+.2f}%\n"
-        f"   日内 支撑${t30['isr']['support']} · 压力${t30['isr']['resistance']} · ATR(5M){t5['atr']}\n"
-        f"   日线区间 ${t30['sr']['support']}~${t30['sr']['resistance']}\n"
-        f"{ctx_section}"
-        f"{finbert_line}"
-        f"🤖 {ai.get('_model','?')}  ·  {conf_e}{ai.get('confidence','?')}信心\n"
-        f"⚠️ 超短线高风险，仅供参考，严格止损。"
-    )
+    if phase == "premarket":
+        role = "现在是美股盘前。请生成今日盘前简报。"
+        extra = ""
+        fmt = _BRIEF_FORMAT
+    elif phase == "open1h":
+        role = "现在是开盘约1小时后。请结合下面的【盘前简报】与开盘后实际走势，重新分析一次：确认或修正开盘预判、支撑阶梯与日内 TP。"
+        fh = first_hour or {}
+        extra = (f"\n开盘第一小时: 高 ${fh.get('high','?')} / 低 ${fh.get('low','?')}"
+                 f" / 量 {fh.get('vol','?')}\n"
+                 f"【盘前简报】:\n{prev_brief or '（盘前简报缺失）'}\n")
+        fmt = _BRIEF_FORMAT
+    else:  # close — 收盘复盘对账
+        role = ("现在已收盘。请把今天的【盘前简报】和【盘中复盘】里的预判（开盘方向/支撑阶梯/日内TP）"
+                "与下面的当日实际 OHLC 逐项对账：判定是否达标，并解释今天盘面为什么按这个趋势运行。"
+                "客观打分，错了就直说，不要为预测找借口。")
+        dd = day or {}
+        extra = (f"\n当日实际: 开 ${dd.get('open','?')} 高 ${dd.get('high','?')}"
+                 f" 低 ${dd.get('low','?')} 收 ${dd.get('close','?')}"
+                 f" ({dd.get('chg_pct','?')}%) 量 {dd.get('vol','?')}\n"
+                 f"【盘前简报】:\n{prev_brief or '（缺失）'}\n"
+                 f"【盘中复盘(10:30)】:\n{open1h_brief or '（缺失）'}\n")
+        fmt = _CLOSE_FORMAT
+
+    return f"""你是美股日内技术与新闻首席分析师。{role}
+如可用，请用搜索工具查最新的今日宏观新闻（CPI/PPI/美联储/地缘）与 {sym} 个股新闻。
+
+【{sym} {name}】实时数据（券商源）:
+- 现价 ${tech['price']} 当日 {tech['chg1']:+.2f}% | {premkt_line}
+- {vix_line} | {spy_line} | {earn_line}
+- 15M: RSI(7)={tech['rsi']} MACD={tech['macd']['hist']:+.4f} VWAP=${tech['vwap']} 量比{tech['vol']['ratio']}x ATR={tech['atr']}
+- 日内S/R: ${tech['isr']['support']} / ${tech['isr']['resistance']}
+- 日线30日区间: ${tech['sr']['support']} ~ ${tech['sr']['resistance']}
+- 周线: 52周 ${w.get('low_52w','?')}~${w.get('high_52w','?')} | 近10周低点 ${w.get('low_10w','?')}
+{extra}
+支撑阶梯与 TP 必须有技术依据（前高低点/VWAP/整数关口/ATR），点位贴合上面真实数据。
+{fmt}"""
 
 
-def analyze_ultrashort(symbol: str, send: bool = False, min_net: int = 0) -> Optional[str]:
-    """单只股票的超短线 30-min 决策卡。返回卡片文本（None=数据不足/信心不足）。
-    send=True 时同时推送到 notifier。
-    min_net>0 时做 *确定性技术信心* 预筛：|30M 买-卖| < min_net 直接跳过(不调 AI、
-    不推送)。回测显示弱信号≈噪音，net≥5(强烈买/卖)才值得推 → 自动扫描传 min_net=5。"""
-    symbol = symbol.strip().upper()
+def _brief_file(sym: str) -> Path:
+    import pytz
+    from datetime import datetime
+    today = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    return _DAILY_DIR / f"{today}_{sym}.json"
+
+
+_BRIEF_TITLES = {
+    "premarket": "🌅 *盘前简报*",
+    "open1h":    "🔄 *开盘1小时复盘*",
+    "close":     "🏁 *收盘对账*",
+}
+
+
+def run_daily_brief(phase: str = "premarket") -> None:
+    """当日简报。phase='premarket'（08:30）/ 'open1h'（10:30 复盘）/
+    'close'（16:10 收盘对账：预测 vs 实际 + 走势归因）。"""
+    watchlist = load_watchlist()
+    if not watchlist:
+        log.info("daily brief: watchlist empty")
+        return
     import pytz
     from datetime import datetime
     ts = datetime.now(pytz.timezone("America/New_York")).strftime("%m-%d %H:%M ET")
+    title = _BRIEF_TITLES.get(phase, phase)
+    _DAILY_DIR.mkdir(parents=True, exist_ok=True)
 
-    df_d_cache: dict = {}
     with _moomoo_client() as c:
-        t30 = _fetch_tech(c, symbol, KLType.K_30M, 120, df_d_cache)
-        t5 = _fetch_tech(c, symbol, KLType.K_5M, 120, df_d_cache)
-        if not t30 or not t5:
-            log.warning("scalp %s: data insufficient (30M=%s 5M=%s)",
-                        symbol, bool(t30), bool(t5))
-            return None
-        # 强信号预筛 — 在花 AI 调用前用便宜的技术信心过滤掉弱/观望信号。
-        net = t30["buy_score"] - t30["sell_score"]
-        if min_net > 0 and abs(net) < min_net:
-            log.info("scalp %s: 跳过（技术信心不足 net=%+d, 需 ≥%d）", symbol, net, min_net)
-            return None
-        # 市场背景（与盘前卡共用同一套 context helpers）
-        try:
-            vix_value = c.get_vix()
-        except Exception:
-            vix_value = 15.0
-        spy_snap = _snap_chg(c, "SPY")
-        sector_data = _sector_snap(c, symbol)
-        earnings_data = _earnings_info(symbol)
-        spread_pct = None
-        try:
-            spread_pct = c.get_spread_pct(symbol)
-        except Exception:
-            pass
-        ctx_text = _build_context_block(
-            ticker_chg_pct=t30.get("chg1", 0) or 0, vix=vix_value, spy=spy_snap,
-            sector=sector_data, earnings=earnings_data, premkt=None,
-            insider=None, spread_pct=spread_pct)
-
-    ticker_news = news_fetcher.fetch_ticker_news(symbol)
-    macro_news = news_fetcher.fetch_macro_news()
-    sentiment = None
-    if finbert_sentiment.is_available() and ticker_news:
-        sentiment = finbert_sentiment.score_headlines(
-            [n.get("title", "") for n in ticker_news[:8]])
-
-    ai = _scalp_ai(t30, t5, ticker_news, macro_news, ctx_text)
-    card = _build_scalp_card(t30, t5, ai, ctx_text, sentiment, ts)
-    if send:
-        notifier.send(card)
-    return card
-
-
-def run_scalp(symbols: Optional[list[str]] = None, min_net: int = 5) -> None:
-    """超短线扫描：对 watchlist（或指定 symbols）逐只产决策卡并推送，按评分排序。
-    默认 min_net=5 → 只推「强烈买入/强烈卖出」级别的强信号（回测显示弱信号≈噪音）。
-    本轮无强信号时静默跳过，不推空消息（启动时已确认在运行）。"""
-    wl = symbols or load_watchlist()
-    if not wl:
-        log.info("scalp: watchlist empty")
-        return
-    cards = []
-    for sym in wl:
-        try:
-            card = analyze_ultrashort(sym, send=False, min_net=min_net)
-            if card:
-                # 提取评分用于排序（卡片里嵌的 _score_bar 含 *N/10*）
-                m = re.search(r"\*(\d+)/10\*", card)
-                cards.append((int(m.group(1)) if m else 5, card))
-        except Exception as e:
-            log.exception("scalp %s failed: %s", sym, e)
-        time.sleep(0.3)
-    if not cards:
-        log.info("scalp: 本轮无强信号（%d 只全部技术信心 <%d 或数据不足）— 静默跳过",
-                 len(wl), min_net)
-        return
-    cards.sort(key=lambda x: -x[0])
-    for _, card in cards:
-        notifier.send(card)
-    log.info("scalp done — %d 张强信号卡", len(cards))
+        for sym in watchlist:
+            try:
+                d = _daily_brief_data(c, sym)
+                if not d:
+                    log.warning("daily brief: skip %s (data insufficient)", sym)
+                    continue
+                # 读回今天已存的简报（盘前/盘中），供后续 phase 对比。
+                saved: dict = {}
+                f = _brief_file(sym)
+                if f.exists():
+                    try:
+                        saved = json.loads(f.read_text())
+                    except Exception:
+                        saved = {}
+                prev_brief = saved.get("brief")
+                first_hour = _first_hour_stats(c, sym) if phase == "open1h" else None
+                day = _day_stats(c, sym) if phase == "close" else None
+                prompt = _brief_prompt(sym, d, phase, prev_brief, first_hour,
+                                       open1h_brief=saved.get("open1h_brief"),
+                                       day=day)
+                brief = _call_gemini_text(prompt)
+                if not brief:
+                    log.warning("daily brief: AI unavailable for %s", sym)
+                    notifier.send(f"⚠️ {sym} 简报生成失败（AI 不可用）")
+                    continue
+                card = f"{title} {sym} | {ts}\n━━━━━━━━━━━━━━━━━━━━━━\n{brief}"
+                notifier.send(card)
+                # 存盘：premarket 覆盖新建当日文件；open1h/close 追加到同一文件。
+                if phase == "premarket":
+                    saved = {"ts": ts, "price": d["tech"]["price"], "brief": brief}
+                elif phase == "open1h":
+                    saved["open1h_brief"] = brief
+                else:
+                    saved["close_brief"] = brief
+                    saved["day"] = day
+                f.write_text(json.dumps(saved, ensure_ascii=False, indent=2))
+                log.info("daily brief [%s] %s sent", phase, sym)
+            except Exception as e:
+                log.exception("daily brief %s failed: %s", sym, e)
+            time.sleep(0.3)
 
 
 # ─── PUBLIC API ───────────────────────────────────────────────────────────────
@@ -1283,8 +1343,6 @@ def run_loop() -> None:
     """Start the signal reporter as a standalone scheduler.
 
     Premarket full analysis:  08:30 ET (15-min + AI, once daily)
-    Ultra-short scalp scan:    every 30 min 09:30–16:00 ET (30M+5M multi-TF + AI)
-                               — replaced the old 5-min no-AI intraday quick-scan.
     """
     import pytz
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -1307,41 +1365,47 @@ def run_loop() -> None:
         if not _is_trading_day():
             return
         try:
-            run_premarket()
+            run_daily_brief("premarket")
         except Exception as e:
-            log.exception("premarket job failed: %s", e)
+            log.exception("premarket brief job failed: %s", e)
 
-    def _scalp():
+    def _open1h_review():
         if not _is_trading_day():
             return
-        now = _ny_now()
-        minutes = now.hour * 60 + now.minute
-        # only inside the regular session 09:30–16:00 ET (filters the 09:00 / 16:30
-        # cron edges); AI multi-TF scalp dashboard for the whole watchlist.
-        if not (9 * 60 + 30 <= minutes <= 16 * 60):
+        try:
+            run_daily_brief("open1h")
+        except Exception as e:
+            log.exception("open1h review job failed: %s", e)
+
+    def _close_review():
+        if not _is_trading_day():
             return
         try:
-            run_scalp()
+            run_daily_brief("close")
         except Exception as e:
-            log.exception("scalp job failed: %s", e)
+            log.exception("close review job failed: %s", e)
 
     sched.add_job(_premarket, "cron",
                   day_of_week="mon-fri", hour=8, minute=30,
                   coalesce=True, misfire_grace_time=300, max_instances=1)
 
-    # Every 30 min across the whole session. cron fires 09:00…16:30; the _scalp
-    # guard drops the 09:00 and 16:30 edges → runs 09:30,10:00,…,16:00 (14×/day).
-    sched.add_job(_scalp, "cron",
-                  day_of_week="mon-fri", hour="9-16", minute="0,30",
-                  coalesce=True, misfire_grace_time=120, max_instances=1)
+    # 开盘 1 小时后（10:30 ET）— 用盘前简报 + 开盘后实际走势再分析一次。
+    sched.add_job(_open1h_review, "cron",
+                  day_of_week="mon-fri", hour=10, minute=30,
+                  coalesce=True, misfire_grace_time=300, max_instances=1)
+
+    # 收盘对账（16:10 ET）— 盘前/盘中预测 vs 当日实际，达标判定 + 走势归因。
+    sched.add_job(_close_review, "cron",
+                  day_of_week="mon-fri", hour=16, minute=10,
+                  coalesce=True, misfire_grace_time=600, max_instances=1)
 
     wl = load_watchlist()
     log.info("signal_reporter started | watchlist: %s", wl)
-    log.info("schedule: premarket@08:30, scalp every 30min 09:30-16:00 ET")
+    log.info("schedule: brief@08:30, open1h@10:30, close@16:10 ET")
     notifier.send(
         f"📡 *Signal Reporter 已启动*\n"
         f"watchlist: {', '.join(wl)}\n"
-        f"盘前分析@08:30 · ⚡超短线@每30min(09:30-16:00 ET)"
+        f"盘前简报@08:30 · 🔄开盘1小时复盘@10:30 · 🏁收盘对账@16:10"
     )
     sched.start()
 
@@ -1354,7 +1418,10 @@ def main() -> None:
     python -m src.signal_reporter list            # 查看 watchlist
     python -m src.signal_reporter add TICKER      # 加入 watchlist
     python -m src.signal_reporter remove TICKER   # 移除
-    python -m src.signal_reporter premarket       # 手动触发盘前分析
+    python -m src.signal_reporter brief           # 手动触发盘前简报（新版）
+    python -m src.signal_reporter review          # 手动触发开盘1小时复盘
+    python -m src.signal_reporter close           # 手动触发收盘对账
+    python -m src.signal_reporter premarket       # 旧版盘前完整卡片
     python -m src.signal_reporter intraday        # 手动触发盘中快讯
     """
     import sys
@@ -1362,7 +1429,7 @@ def main() -> None:
 
     # For direct one-shot calls (premarket/intraday) the scheduler's basicConfig
     # is never called, so we set up logging here so warnings have timestamps.
-    if cmd in ("premarket", "intraday", "scalp"):
+    if cmd in ("premarket", "intraday", "brief", "review", "close"):
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s | %(message)s",
@@ -1377,18 +1444,16 @@ def main() -> None:
         print(add_ticker(sys.argv[2]))
     elif cmd == "remove" and len(sys.argv) > 2:
         print(remove_ticker(sys.argv[2]))
+    elif cmd == "brief":
+        run_daily_brief("premarket")
+    elif cmd == "review":
+        run_daily_brief("open1h")
+    elif cmd == "close":
+        run_daily_brief("close")
     elif cmd == "premarket":
         run_premarket()
     elif cmd == "intraday":
         run_intraday()
-    elif cmd == "scalp":
-        # python -m src.signal_reporter scalp MU   → 单只测试（打印，不推送）
-        # python -m src.signal_reporter scalp       → 全 watchlist 扫描并推送
-        if len(sys.argv) > 2:
-            card = analyze_ultrashort(sys.argv[2], send=False)
-            print(card or "数据不足，无法生成卡片")
-        else:
-            run_scalp()
     else:
         print(main.__doc__)
 

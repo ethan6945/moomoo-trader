@@ -203,4 +203,16 @@ def run_and_notify(days: int = 7) -> dict:
     # (_weekly_self_review_job) as an INDEPENDENT step (since 2026-06-07), so a
     # notify/review hiccup here can no longer silently skip the one auto path
     # that proposes param changes.
+    # Persist the latest result so the dashboard can display it + last-run time.
+    try:
+        import json
+        from datetime import timezone
+        out = settings.root / "data" / "self_review_last.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(
+            {"ran_at": datetime.now(timezone.utc).astimezone().isoformat(),
+             "report": report},
+            indent=2, ensure_ascii=False))
+    except Exception as e:
+        log.warning("self-review persist failed: %s", e)
     return report

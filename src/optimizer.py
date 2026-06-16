@@ -124,10 +124,17 @@ def _make_objective(base_cfg: BacktestConfig, n_folds: int, min_trades: int, cac
             # for the best signals instead of starving slots 3-5. Let Optuna reach
             # a higher threshold if the cash-constrained optimum lives there.
             "threshold":       trial.suggest_int("threshold", 55, 80, step=1),
-            "tp_atr_mult":     trial.suggest_float("tp_atr_mult", 3.5, 8.0, step=0.5),
+            # 2026-06-11: upper bound 8.0 → 11.0. The live value IS 8.0 — with
+            # the range capped at it, the tuner could never test the upward
+            # neighbourhood needed to confirm (or move) the plateau.
+            "tp_atr_mult":     trial.suggest_float("tp_atr_mult", 3.5, 11.0, step=0.5),
             "sl_atr_mult":     trial.suggest_float("sl_atr_mult", 2.5, 4.0, step=0.25),
             "max_gap_pct":     trial.suggest_float("max_gap_pct", 2.0, 5.0, step=0.5),
-            "base_slip_bp":    trial.suggest_float("base_slip_bp", 1.0, 3.0, step=0.5),
+            # 2026-06-11: base_slip_bp REMOVED from the search space. It is a
+            # friction ASSUMPTION, not a strategy parameter — trials paired
+            # with optimistic slippage scored higher, so "best params" came
+            # systematically attached to slip≈1.0 and overstated expectancy.
+            # All trials now pay the same fixed friction (cfg default 2.0).
         }
         try:
             stats = _evaluate_params(base_cfg, params, n_folds, cache)
@@ -180,15 +187,17 @@ def run_study(
     """
     ml_on = (not fast_mode) if apply_ml_gate is None else apply_ml_gate
     mr_on = (not fast_mode) if apply_mr_strategy is None else apply_mr_strategy
-    base_cfg = BacktestConfig(
-        days=days,
-        timeframe=timeframe or settings.timeframe,
-        threshold=settings.entry_threshold,
-        tickers=tickers or [],
-        account_usd=settings.account_usd,
-        risk_per_trade=settings.risk_per_trade,
-        max_position_pct=settings.max_position_pct,
-        max_hold_days=settings.max_hold_days,
+    # 2026-06-11: base config comes from optimizer_ai._base_cfg — the single
+    # source of "the strategy the bot actually runs" (runtime-effective params,
+    # dynamic universe walk-forward when enabled). Tuning on the live watchlist
+    # file would optimize against a hindsight-selected list.
+    from dataclasses import replace as _replace
+    from .optimizer_ai import _base_cfg
+    base_cfg = _base_cfg(days=days)
+    base_cfg = _replace(
+        base_cfg,
+        timeframe=timeframe or base_cfg.timeframe,
+        tickers=tickers or base_cfg.tickers,
         apply_ml_gate=ml_on,
         apply_mr_strategy=mr_on,
     )

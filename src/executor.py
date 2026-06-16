@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -20,7 +21,7 @@ _ET = pytz.timezone("America/New_York")
 from moomoo import TrdSide
 
 from .config import settings as _settings  # noqa: F401 (used in caller too)
-from . import db, portfolio, risk_manager
+from . import db, portfolio, risk_manager, runtime_config
 
 from .config import settings
 from .indicators import Signal
@@ -33,6 +34,28 @@ ORDER_TIMEOUT_MIN = 5    # cancel unfilled BUY orders after this many minutes
 # straight through it and the position is left unprotected. 3% gives fill
 # headroom while bounding worst-case slippage. (Bug fix 2026-06-03.)
 PROTECTIVE_EXIT_SLIP = 0.03
+
+# Phase 0 (2026-06-10): entry limits are priced off the live quote, not the
+# (possibly session-stale) signal bar close. If the market already ran more
+# than this fraction past the signal price, skip — the backtest's open-only
+# fill model wouldn't have filled there either.
+ENTRY_CHASE_TOL = 0.002
+
+# Serializes every load→mutate→save cycle on the open-trades store. The scan
+# job and the 5-min manage tick run on different scheduler threads; without
+# this, one writer can clobber the other's whole-dict save (a freshly opened
+# position vanishes from the record → reconcile later "adopts" it back as an
+# orphan with a fabricated stop).
+_TRADES_LOCK = threading.RLock()
+
+
+def has_open_trades() -> bool:
+    """Cheap pre-check so the 5-min manage tick can skip opening a broker
+    connection when the book is flat."""
+    try:
+        return bool(_load_open_trades())
+    except Exception:
+        return True   # unsure → let the tick run and find out properly
 
 
 def _business_days_between(start: datetime, end: datetime) -> int:
@@ -126,8 +149,11 @@ def _save_open_trades(trades: dict) -> None:
 
 
 def open_position(client: MoomooClient, signal: Signal, qty: int,
-                  ml_proba: float | None = None) -> dict:
+                  ml_proba: float | None = None) -> dict | None:
     """Buy at limit. REAL → attach OCO bracket (STOP + TP); SIMULATE → soft-track.
+
+    Returns None when the entry is SKIPPED (market ran past the signal price —
+    the backtest's open-only fill model wouldn't have filled there either).
 
     If a trade record for this symbol already exists, this is a STACK entry
     (pyramid add-on): merge into the existing position with a weighted-avg
@@ -136,19 +162,41 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
 
     Captures `ml_proba` and `strategy` at entry so they can be matched against
     actual outcome (R-multiple, MFE/MAE) at close-time → enables calibration."""
+    with _TRADES_LOCK:
+        return _open_position_locked(client, signal, qty, ml_proba)
+
+
+def _open_position_locked(client: MoomooClient, signal: Signal, qty: int,
+                          ml_proba: float | None = None) -> dict | None:
     trades = _load_open_trades()
     existing = trades.get(signal.symbol)
     is_stack = existing is not None and int(existing.get("qty", 0)) > 0
 
+    # Phase 0 (2026-06-10): price the limit off the CURRENT quote, not the
+    # signal bar close. At the 09:45/10:15 scans the last CLOSED hourly bar is
+    # the prior session's, so a signal-price limit could sit ~18h stale and
+    # fill only by adverse selection (price dropping through it). Skip when
+    # the market already ran > ENTRY_CHASE_TOL past the signal; otherwise
+    # place a marketable limit at the live quote (capped at signal + tol).
+    limit_px = round(float(signal.price), 2)
+    last = _last_price(client, signal.symbol)
+    if last is not None:
+        if last > signal.price * (1 + ENTRY_CHASE_TOL):
+            log.info("%s: market ran past signal ($%.2f > $%.2f +%.1f bps) — entry skipped",
+                     signal.symbol, last, signal.price, ENTRY_CHASE_TOL * 1e4)
+            return None
+        limit_px = round(min(last * 1.001,
+                             signal.price * (1 + ENTRY_CHASE_TOL)), 2)
+
     buy_order_id = client.place_limit_order(
-        signal.symbol, qty, signal.price, TrdSide.BUY
+        signal.symbol, qty, limit_px, TrdSide.BUY
     )
 
     if is_stack:
         old_qty = int(existing["qty"])
         old_entry = float(existing["entry_price"])
         new_total_qty = old_qty + qty
-        new_avg_entry = (old_qty * old_entry + qty * signal.price) / new_total_qty
+        new_avg_entry = (old_qty * old_entry + qty * limit_px) / new_total_qty
         # Stop/TP trail UP only — never weaken protection on the original lot.
         new_stop = max(float(existing.get("stop_loss", 0)), signal.stop_loss)
         new_tp = max(float(existing.get("take_profit", 0)), signal.take_profit)
@@ -190,12 +238,12 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
             "stacks": stacks,
             "last_stack_at": datetime.utcnow().isoformat(),
             "last_stack_qty": qty,
-            "last_stack_price": signal.price,
+            "last_stack_price": limit_px,
         })
         # Refresh water-marks to current price for the new combined lot.
-        trade["high_water"] = max(float(trade.get("high_water") or signal.price), signal.price)
+        trade["high_water"] = max(float(trade.get("high_water") or limit_px), limit_px)
         log.info("STACK #%d on %s: +%d @ $%.2f → total %d, avg $%.2f, stop $%.2f, tp $%.2f",
-                 stacks, signal.symbol, qty, signal.price,
+                 stacks, signal.symbol, qty, limit_px,
                  new_total_qty, new_avg_entry, new_stop, new_tp)
     else:
         stop_order_id, tp_order_id = None, None
@@ -217,7 +265,7 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
         trade = {
             "symbol": signal.symbol,
             "qty": qty,
-            "entry_price": signal.price,
+            "entry_price": limit_px,
             "stop_loss": signal.stop_loss,
             "take_profit": signal.take_profit,
             "atr": signal.atr,
@@ -226,7 +274,7 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
             # anchors the 1/3 tranche size to the ORIGINAL lot; init_risk_per_share
             # is the R unit (entry − initial stop) for the +TP1_R / +TP2_R levels.
             "qty_initial": qty,
-            "init_risk_per_share": max(float(signal.price) - float(signal.stop_loss), 0.0),
+            "init_risk_per_share": max(float(limit_px) - float(signal.stop_loss), 0.0),
             "tp1_done": False,
             "tp2_done": False,
             "buy_order_id": buy_order_id,
@@ -234,8 +282,8 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
             "tp_order_id": tp_order_id,
             "opened_at": datetime.utcnow().isoformat(),
             # Water-marks start at the entry price — updated each manage tick.
-            "high_water": signal.price,
-            "low_water": signal.price,
+            "high_water": limit_px,
+            "low_water": limit_px,
             "ml_proba_entry": ml_proba,
             "strategy": getattr(signal, "strategy", "trend"),
             "stacks": 1,
@@ -304,15 +352,31 @@ def cancel_stale_orders(client: MoomooClient) -> list[dict]:
                 log.info("Canceled stale buy %s (id=%s, age=%.1fm)", sym, order_id, age_min)
                 # Clean up our `open_trades` record too — we wrote it speculatively
                 # the moment we placed the order. If the order never filled, our
-                # entry was never real. Without this cleanup we'd carry a "ghost"
-                # forever and reconcile would keep complaining.
-                tracked = _load_open_trades()
-                tracked_trade = tracked.get(sym)
-                if tracked_trade and str(tracked_trade.get("buy_order_id")) == order_id:
-                    tracked.pop(sym)
-                    _save_open_trades(tracked)
-                    log.info("Removed ghost open_trades entry for %s (order %s never filled)",
-                             sym, order_id)
+                # entry was never real. BUT a PARTIAL fill before the cancel means
+                # the broker really holds shares: dropping the record then would
+                # manufacture an orphan that reconcile re-adopts with fabricated
+                # levels (the path behind the first 8 orphan trades). Keep the
+                # record at the dealt qty instead.
+                dealt = 0
+                try:
+                    dealt = int(float(row.get("dealt_qty") or 0))
+                except (TypeError, ValueError):
+                    pass
+                with _TRADES_LOCK:
+                    tracked = _load_open_trades()
+                    tracked_trade = tracked.get(sym)
+                    if tracked_trade and str(tracked_trade.get("buy_order_id")) == order_id:
+                        if dealt > 0:
+                            tracked_trade["qty"] = dealt
+                            tracked_trade["qty_initial"] = dealt
+                            _save_open_trades(tracked)
+                            log.info("Stale buy %s partially filled (%d) — record kept at dealt qty",
+                                     sym, dealt)
+                        else:
+                            tracked.pop(sym)
+                            _save_open_trades(tracked)
+                            log.info("Removed ghost open_trades entry for %s (order %s never filled)",
+                                     sym, order_id)
     return canceled
 
 
@@ -385,6 +449,13 @@ def _is_stalled(trade: dict, last_price: float, atr_ref: float) -> bool:
     going nowhere. Set STALL_MIN_DAYS=3 — gives one weekend + a couple of
     sessions for a thesis to play out before pulling the plug.
     """
+    # 2026-06-11 exit parity: OFF by default. The validated engine has no
+    # stall-out, its MAX_HOLD bucket is net POSITIVE (+$833/140d), and the only
+    # live stall-out closes on record were both losers (−$33.7). Re-enable via
+    # STALL_OUT_ENABLED only after the engine models it and the dual-window
+    # gate passes.
+    if not _settings.stall_out_enabled:
+        return False
     STALL_MIN_DAYS = 3
     STALL_HW_THRESHOLD_R = 0.3   # high-water < entry + 0.3×ATR = "barely moved"
     try:
@@ -467,7 +538,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
             log.info("Stall-out close (bracket): %s @ $%.2f (pnl=%.2f)", symbol, last, pnl)
             return
 
-        if age_days >= _settings.max_hold_days:
+        if age_days >= runtime_config.max_hold_days():
             # Pull bracket legs first, then market-sell remaining qty.
             for oid in (trade["stop_order_id"], trade["tp_order_id"]):
                 if oid:
@@ -489,10 +560,29 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
     trade["high_water"] = max(float(trade.get("high_water") or trade["entry_price"]), last)
     trade["low_water"] = min(float(trade.get("low_water") or trade["entry_price"]), last)
 
+    # Breakeven ratchet (2026-06-11): once the trade has been +trigger_r×R in
+    # profit, the stop may never sit below entry again. Mirrors the engine's
+    # use_breakeven_stop; the trigger reads the high-water mark so a spike
+    # between manage ticks still arms it (parity with the engine's intrabar
+    # high check). Ratchet only — never lowers an already-higher stop.
+    if _settings.use_breakeven_stop and not trade.get("breakeven_set"):
+        be_entry = float(trade["entry_price"])
+        be_risk = float(trade.get("init_risk_per_share") or 0.0)
+        be_hw = float(trade.get("high_water") or be_entry)
+        if be_risk > 0 and be_hw >= be_entry + runtime_config.breakeven_trigger_r() * be_risk:
+            trade["breakeven_set"] = True
+            if be_entry > float(trade["stop_loss"]):
+                trade["stop_loss"] = round(be_entry, 2)
+                actions.append({"type": "breakeven", "symbol": symbol,
+                                "new_stop": trade["stop_loss"]})
+
     # Soft stop-loss check (SIMULATE, or REAL when bracket attach failed).
     if last <= trade["stop_loss"]:
+        reason = ("BREAKEVEN" if trade.get("breakeven_set")
+                  and float(trade["stop_loss"]) >= float(trade["entry_price"])
+                  else "SL")
         client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
-        pnl = _close_and_log(symbol, trade, trade["qty"], last, "SL")
+        pnl = _close_and_log(symbol, trade, trade["qty"], last, reason)
         actions.append({"type": "stop_hit", "symbol": symbol, "price": last,
                         "qty": trade["qty"], "stop": trade["stop_loss"], "pnl": pnl})
         trades.pop(symbol)
@@ -513,7 +603,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
     # Max-hold force close.
     opened = datetime.fromisoformat(trade["opened_at"])
     age_days = _business_days_between(opened, datetime.utcnow())
-    if age_days >= _settings.max_hold_days:
+    if age_days >= runtime_config.max_hold_days():
         client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
         pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
         actions.append({"type": "max_hold", "symbol": symbol, "price": last,
@@ -565,44 +655,32 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
             return
         return   # scale-out path done — skip the legacy half-close + trail below
 
-    # Take-profit half close (legacy single-tranche default; USE_SCALE_OUT off).
-    if not trade["half_closed"] and last >= trade["take_profit"]:
-        half = trade["qty"] // 2
-        if half > 0:
-            client.place_limit_order(symbol, half, last, TrdSide.SELL)
-            pnl = _close_and_log(symbol, trade, half, last, "TP_HALF")
-            trade["qty"] -= half
-            trade["half_closed"] = True
-            actions.append({"type": "tp_half", "symbol": symbol, "price": last,
-                            "qty": half, "pnl": pnl})
-
-    # Trailing stop after first TP.
-    # Bug fix 2026-05-28: bound the new stop strictly BELOW current price
-    # by 0.5×ATR. Without this the EMA20 can sit right at (or above) `last`,
-    # which causes an immediate stop-out on the very next scan (we just
-    # raised the stop above price). The ATR buffer also avoids stopping out
-    # on routine intra-bar noise.
-    # 2026-05-29: also guard against NaN ema20/atr14 — happens when df has
-    # < 20 bars (new IPO, halt resumption, etc.). Skip silently instead of
-    # crashing the manage loop.
-    if trade["half_closed"]:
-        df = client.get_kline(symbol, bars=30)
-        import pandas_ta_classic as ta
-        ema20 = float(ta.ema(df["close"], length=20).iloc[-1])
-        atr14 = float(ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1])
-        if math.isnan(ema20) or math.isnan(atr14):
-            log.debug("trailing stop: %s has NaN ema/atr — skip this cycle", symbol)
-        else:
-            buffer = 0.5 * atr14 if atr14 > 0 else 0.0
-            ceiling = last - buffer    # never park the stop within 0.5 ATR of price
-            candidate = round(min(ema20, ceiling), 2)
-            new_stop = max(trade["stop_loss"], candidate)
-            if new_stop > trade["stop_loss"]:
-                trade["stop_loss"] = new_stop
-                actions.append({"type": "trail", "symbol": symbol, "new_stop": new_stop})
+    # Take-profit: FULL close at the TP touch — exit parity with the validated
+    # honest engine (2026-06-11). The engine that produced every validated
+    # $/day number books the entire position at take_profit; the legacy
+    # TP_HALF + EMA20-trail path that used to live here was never measured
+    # under that lens, and the TP bucket carries essentially all of the net
+    # PnL (+$2,840/140d) — running an unvalidated exit on it was the largest
+    # remaining live↔backtest divergence. (Positions opened before this change
+    # with half_closed=True simply ride their remainder to this same full TP.)
+    if last >= trade["take_profit"]:
+        client.place_limit_order(symbol, trade["qty"], last, TrdSide.SELL)
+        pnl = _close_and_log(symbol, trade, trade["qty"], last, "TP")
+        actions.append({"type": "tp_full", "symbol": symbol, "price": last,
+                        "qty": trade["qty"], "pnl": pnl})
+        trades.pop(symbol)
+        return
 
 
 def manage_open_trades(client: MoomooClient) -> list[dict]:
+    """Thread-safe wrapper — the scan job and the 5-min manage tick both call
+    this from different scheduler threads; the lock keeps their load→mutate→
+    save cycles on the open-trades store from clobbering each other."""
+    with _TRADES_LOCK:
+        return _manage_open_trades_locked(client)
+
+
+def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
     """Per-scan housekeeping: stale order cancel → OCO bracket check → soft fallback.
 
     2026-05-30 additions to keep capital flowing:

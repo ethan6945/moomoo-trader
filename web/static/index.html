@@ -9,86 +9,116 @@
     --bg:#0a0d14; --card:#161b26; --card2:#1a2030; --border:#262d3a;
     --primary:#4d9dff; --primary-d:#1f6feb; --green:#3fb950; --red:#f85149;
     --amber:#d29922; --purple:#a371f7; --muted:#8b949e; --text:#cdd5e0; --strong:#f0f6fc;
+    --shadow:0 1px 2px rgba(0,0,0,.25),0 6px 18px -8px rgba(0,0,0,.45);
   }
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%;max-width:100vw;overflow-x:hidden}
   body{background:radial-gradient(1200px 600px at 80% -10%, #15233a 0%, var(--bg) 55%);
-    color:var(--text);font:13px/1.4 "Inter",-apple-system,"SF Pro Display","Helvetica Neue",sans-serif;
+    color:var(--text);font:13px/1.45 "Inter",-apple-system,"SF Pro Display","PingFang SC","Helvetica Neue",sans-serif;
     padding:12px 14px;display:flex;flex-direction:column;min-height:100vh}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:5px}
+  ::-webkit-scrollbar-thumb:hover{background:#3a4456}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  /* ── top bar ── */
   .topbar{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;flex:0 0 auto}
-  .logo{font-size:18px;font-weight:700;color:var(--strong);letter-spacing:.5px}
+  .logo{font-size:18px;font-weight:700;color:var(--strong);letter-spacing:.5px;margin-right:4px}
   .logo .b{color:var(--primary)}
   .spacer{flex:1}
-  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px}
-  .pill{background:var(--card);border:1px solid var(--border);border-radius:999px;padding:5px 11px;font-size:11.5px;color:var(--muted);display:inline-flex;align-items:center;white-space:nowrap}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;flex:0 0 auto}
+  .dot.live{box-shadow:0 0 0 0 currentColor;animation:pulse 2.2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}70%{box-shadow:0 0 0 6px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  .pill{background:var(--card);border:1px solid var(--border);border-radius:999px;padding:5px 11px;font-size:11.5px;color:var(--muted);display:inline-flex;align-items:center;white-space:nowrap;transition:border-color .2s}
   button{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 16px;font-size:13px;cursor:pointer;transition:.15s}
   button:hover{border-color:var(--primary);color:var(--strong)}
+  button:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
   button.primary{background:var(--primary);border-color:var(--primary);color:#fff;font-weight:600}
   button.primary:hover{background:var(--primary-d)}
   button.danger{color:var(--red);border-color:var(--red)}
   button.danger:hover{background:var(--red);color:#fff}
   button.sm{padding:5px 12px;font-size:12px;border-radius:8px}
   button:disabled{opacity:.55;cursor:default}
+
+  /* ── tabs ── */
   .tabs{display:flex;gap:6px;margin-bottom:10px;flex:0 0 auto}
   .tab{background:transparent;border:none;color:var(--muted);padding:6px 14px;border-radius:9px}
-  .tab.active{background:var(--card);color:var(--strong);font-weight:600}
-  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:10px;flex:0 0 auto}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:13px 17px;min-width:0;position:relative;overflow:hidden}
+  .tab.active{background:var(--card);color:var(--strong);font-weight:600;box-shadow:var(--shadow)}
+
+  /* ── KPI cards ── */
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:10px;flex:0 0 auto}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:13px 17px;min-width:0;position:relative;overflow:hidden;box-shadow:var(--shadow)}
   .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,var(--primary))}
   .card .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
-  .card .val{color:var(--strong);font-size:27px;font-weight:700;margin-top:4px;white-space:nowrap}
+  .card .val{color:var(--strong);font-size:25px;font-weight:700;margin-top:4px;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .card .sub{color:var(--muted);font-size:11px;margin-top:3px}
   .card.c-blue{--accent:var(--primary);background:linear-gradient(135deg,#1f6feb1f,var(--card))}
   .card.c-green{--accent:var(--green);background:linear-gradient(135deg,#3fb9501a,var(--card))}
   .card.c-red{--accent:var(--red);background:linear-gradient(135deg,#f851491a,var(--card))}
   .card.c-purple{--accent:var(--purple);background:linear-gradient(135deg,#a371f71a,var(--card))}
-  .statbar{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:8px 14px;margin-bottom:10px;flex:0 0 auto}
+  .card.c-grey{--accent:var(--muted)}
+  .statbar{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:8px 14px;margin-bottom:10px;flex:0 0 auto;box-shadow:var(--shadow)}
   .statline{display:flex;flex-wrap:wrap;gap:8px}
-  /* 2x2 aligned lower grid that fills the rest of the viewport */
+
+  /* ── 2x2 lower grid that fills the rest of the viewport ── */
   .dash-lower{display:grid;grid-template-columns:1.5fr 1fr;grid-template-rows:minmax(0,1.12fr) minmax(0,0.88fr);
     gap:12px;flex:1 1 auto;min-height:0}
   .cell{display:flex;flex-direction:column;min-width:0;min-height:0;gap:12px}
-  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:11px 15px;overflow:hidden;min-width:0;display:flex;flex-direction:column}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:11px 15px;overflow:hidden;min-width:0;display:flex;flex-direction:column;box-shadow:var(--shadow)}
   .panel.grow{flex:1 1 auto;min-height:0}
   .panel h3{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;margin-bottom:9px;font-weight:600;flex:0 0 auto;display:flex;align-items:center;gap:7px}
   .panel h3::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--accent,var(--primary))}
   .p-pos{--accent:var(--primary)} .p-eq{--accent:var(--purple)} .p-act{--accent:var(--amber)}
   .p-rec{--accent:var(--green)} .p-appr{--accent:var(--primary)}
+
+  /* ── tables ── */
   table{width:100%;border-collapse:collapse;font-size:12.5px;table-layout:fixed}
   th,td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   th{text-align:left;color:var(--muted);font-size:10.5px;text-transform:uppercase;padding:5px 7px;border-bottom:1px solid var(--border)}
-  td{padding:6px 7px;border-bottom:1px solid var(--border)}
+  td{padding:6px 7px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
   tr:last-child td{border-bottom:none}
+  tbody tr{transition:background .12s}
+  tbody tr:hover td{background:rgba(77,157,255,.05)}
+  .scroll thead th{position:sticky;top:0;background:var(--card);z-index:1}
   .pos{color:var(--green)} .neg{color:var(--red)} .mut{color:var(--muted)} .strong{color:var(--strong)}
   .scroll{flex:1 1 auto;min-height:0;overflow:auto}
+  .tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:10.5px;background:var(--card2);border:1px solid var(--border);color:var(--muted)}
+
   .log{background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:10px;padding:8px 11px;
-    font:11.5px/1.5 Menlo,monospace;color:var(--muted);flex:1 1 auto;min-height:0;overflow:auto;white-space:normal;word-break:break-word}
+    font:11.5px/1.55 Menlo,monospace;color:var(--muted);flex:1 1 auto;min-height:0;overflow:auto;white-space:normal;word-break:break-word}
   .log div{margin-bottom:2px}
   .qbar{height:8px;background:var(--border);border-radius:5px;margin-top:10px;overflow:hidden;flex:0 0 auto}
   .qfill{height:100%;width:0;border-radius:5px;transition:width .3s,background .3s}
   .appr{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)}
   .appr:last-child{border-bottom:none}
   .appr .txt{flex:1;font-size:13px}
-  .appr .act{font-size:11px;color:var(--muted)}
-  .empty{color:var(--muted);font-size:13px;padding:8px 0}
+  .appr .act{font-size:11px;color:var(--muted);margin-top:2px}
+  .empty{color:var(--muted);font-size:12.5px;padding:14px 0;text-align:center}
   .recgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;flex:0 0 auto}
-  .recbox{background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:11px 14px}
-  .recbox .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-  .recbox .v{font-size:23px;font-weight:700;margin-top:3px}
+  .recbox{background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:10px 14px}
+  .recbox .k{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+  .recbox .v{font-size:21px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}
   #recentTbl td{padding:5px 6px;font-size:12px}
-  /* equity chart */
+  #posTbl th:nth-child(2){width:7%}
+  #posTbl th:nth-child(8){width:20%}
+
+  /* ── equity chart ── */
   .eqwrap{position:relative;flex:1 1 auto;min-height:70px}
   #eqDash{position:absolute;inset:0;width:100%;height:100%}
   .eqtip{position:absolute;pointer-events:none;background:var(--card2);border:1px solid var(--primary);
     border-radius:8px;padding:5px 9px;font-size:11.5px;color:var(--strong);transform:translate(-50%,-130%);white-space:nowrap;z-index:5}
   .hidden{display:none!important}
-  #eq{width:100%;height:120px}
-  /* light theme */
+
+  /* ── light theme ── */
   body.light{--bg:#f6f8fa;--card:#ffffff;--card2:#eef1f5;--border:#d0d7de;--primary:#0969da;
     --primary-d:#0860ca;--green:#1a7f37;--red:#cf222e;--amber:#9a6700;--purple:#8250df;--muted:#57606a;--text:#1f2328;--strong:#0d1117;
+    --shadow:0 1px 2px rgba(31,35,40,.06),0 6px 18px -10px rgba(31,35,40,.18);
     background:radial-gradient(1200px 600px at 80% -10%, #dfe9ff 0%, #f6f8fa 55%)}
-  /* settings modal */
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:38px 16px;z-index:50;overflow:auto}
-  .modal-box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px 22px;width:min(640px,94vw)}
+  body.light .log{background:var(--card2);color:#404a56}
+
+  /* ── settings modal ── */
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;padding:38px 16px;z-index:50;overflow:auto;backdrop-filter:blur(2px)}
+  .modal-box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px 22px;width:min(640px,94vw);box-shadow:0 24px 80px rgba(0,0,0,.5)}
   .modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
   .modal-head h2{font-size:17px;color:var(--strong)}
   .set-sec{border-top:1px solid var(--border);padding:13px 0}
@@ -97,6 +127,16 @@
   .set-row b{color:var(--strong);font-size:13px}
   .setdesc{color:var(--muted);font-size:11.5px;margin-top:2px;max-width:360px}
   .set-row input,.set-row select{background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 10px;min-width:150px}
+  .cfgchips{display:flex;flex-wrap:wrap;gap:8px}
+  .cfgchips .pill b{color:var(--strong);margin-left:5px;font-weight:600}
+
+  /* ── responsive (phone / narrow window) ── */
+  @media (max-width:980px){
+    .grid{grid-template-columns:repeat(2,1fr)}
+    .dash-lower{display:flex;flex-direction:column}
+    .panel.grow{min-height:170px}
+    .eqwrap{min-height:130px}
+  }
 </style>
 </head>
 <body>
@@ -105,9 +145,10 @@
     <span class="pill" id="sched"><span class="dot" style="background:#8b949e"></span>scheduler …</span>
     <span class="pill" id="opend"><span class="dot" style="background:#8b949e"></span>OpenD …</span>
     <span class="pill" id="env">—</span>
-    <span class="pill" id="regime">—</span>
-    <span class="pill" id="vix">VIX —</span>
-    <span class="pill" id="streak">—</span>
+    <span class="pill" id="regime" title="">—</span>
+    <span class="pill hidden" id="streak"></span>
+    <span class="pill" id="retrain" style="cursor:pointer" title="每周自省/重训 — 点击立即运行一次">🧠 —</span>
+    <span class="pill" id="awake" style="cursor:pointer" title="防止电脑睡眠（屏幕仍可熄灭）">☕ —</span>
     <div class="spacer"></div>
     <button class="primary sm" id="btnStart">▶ Start</button>
     <button class="danger sm" id="btnStop">■ Stop</button>
@@ -125,19 +166,21 @@
   <!-- DASHBOARD -->
   <div id="tab-dash" style="display:flex;flex-direction:column;flex:1 1 auto;min-height:0">
     <div class="grid">
-      <div class="card c-blue"><div class="lbl" data-i18n="deployed">已部署 / 预算占用</div><div class="val" id="c-deployed">—</div>
+      <div class="card c-blue"><div class="lbl" data-i18n="deployed">已部署 / 预算</div><div class="val" id="c-deployed">—</div>
         <div class="qbar"><div class="qfill" id="qfill"></div></div></div>
-      <div class="card c-green" id="card-today"><div class="lbl" data-i18n="today">今日盈亏</div><div class="val" id="c-today">—</div></div>
-      <div class="card c-purple" id="card-total"><div class="lbl" data-i18n="total">总盈亏（累计）</div><div class="val" id="c-total">—</div></div>
+      <div class="card c-green" id="card-today"><div class="lbl" data-i18n="today">今日盈亏 · 已实现</div><div class="val" id="c-today">—</div></div>
+      <div class="card c-purple" id="card-total"><div class="lbl" data-i18n="total">总盈亏 · 累计已实现</div><div class="val" id="c-total">—</div></div>
+      <div class="card c-grey" id="card-unreal"><div class="lbl" data-i18n="unreal">浮动盈亏 · 持仓</div><div class="val" id="c-unreal">—</div>
+        <div class="sub" id="c-unreal-sub"></div></div>
     </div>
     <div class="statbar"><div class="statline" id="statline"></div></div>
 
     <div class="dash-lower">
       <!-- A: positions + equity (top-left) -->
       <div class="cell">
-        <div class="panel p-pos"><h3 data-i18n="positions">持仓</h3><div id="posWrap" class="scroll" style="max-height:120px"><table id="posTbl"><thead><tr>
-          <th data-i18n="c_sym">代码</th><th data-i18n="c_qty">数量</th><th data-i18n="c_last">现价</th><th>P&amp;L</th><th>P&amp;L %</th></tr></thead><tbody></tbody></table></div>
-          <div class="empty hidden" id="posEmpty" data-i18n="no_pos">无持仓。</div></div>
+        <div class="panel p-pos"><h3 data-i18n="positions">持仓</h3><div id="posWrap" class="scroll" style="max-height:168px"><table id="posTbl"><thead><tr>
+          <th data-i18n="c_sym">代码</th><th data-i18n="c_qty">数量</th><th data-i18n="c_entry">入场</th><th data-i18n="c_last">现价</th><th data-i18n="c_stop">止损</th><th data-i18n="c_tp">止盈</th><th data-i18n="c_strat">策略</th><th>P&amp;L</th></tr></thead><tbody></tbody></table></div>
+          <div class="empty hidden" id="posEmpty" data-i18n="no_pos">🌙 当前无持仓</div></div>
         <div class="panel p-eq grow"><h3 data-i18n="equity">净值曲线 · 累计已实现</h3>
           <div class="eqwrap"><canvas id="eqDash"></canvas><div id="eqTip" class="eqtip hidden"></div></div></div>
       </div>
@@ -166,7 +209,7 @@
         <select id="histMonth" style="background:var(--card2);border:1px solid var(--border);color:var(--text);padding:4px 9px;border-radius:8px;font-size:12px"></select></h3>
       <div class="eqwrap" style="height:160px;flex:none"><canvas id="eqHist"></canvas><div id="eqHistTip" class="eqtip hidden"></div></div>
     </div>
-    <div class="panel p-rec grow" style="flex:1 1 auto;min-height:0"><h3>历史平仓</h3>
+    <div class="panel p-rec grow" style="flex:1 1 auto;min-height:0;margin-top:12px"><h3>历史平仓</h3>
       <div class="scroll"><table id="closedTbl"><thead><tr>
         <th>时间</th><th>代码</th><th>策略</th><th>出场</th><th>PnL</th><th>R</th></tr></thead><tbody></tbody></table></div>
     </div>
@@ -175,13 +218,36 @@
   <!-- SIGNAL -->
   <div id="tab-sig" class="hidden">
     <div class="panel"><h3>Signal Reporter</h3>
-      <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap">
-        <button class="primary" id="btnPre">▶ Premarket 盘前卡</button>
-        <button class="primary" id="btnIntra">⚡ 超短线 30min 扫描</button>
-        <button id="btnSigReload">🔄 刷新日志</button>
+      <div class="mut" style="margin-bottom:10px;font-size:12px" data-i18n="sig_desc">独立信号 watchlist — 高峰时段每 30 分钟推 Telegram 信号卡。</div>
+      <!-- scheduler controls + run-once -->
+      <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+        <span id="sigStatus" class="pill">⚪ <span data-i18n="sig_stopped">已停止</span></span>
+        <button class="primary sm" id="btnSigStart">▶ Start</button>
+        <button class="danger sm" id="btnSigStop">■ Stop</button>
+        <span style="flex:1 1 auto"></span>
+        <button class="sm" id="btnBrief">🌅 <span data-i18n="sig_brief">盘前简报</span></button>
+        <button class="sm" id="btnReview">🔄 <span data-i18n="sig_review">盘中复盘</span></button>
+        <button class="sm" id="btnClose">🏁 <span data-i18n="sig_close">收盘对账</span></button>
       </div>
-      <div class="mut" style="margin-bottom:8px;font-size:12px">盘前卡 / 盘中卡（每30分）推到 Telegram。手动触发后约 30s 点「刷新日志」看结果。</div>
-      <div class="log" id="sigLog" style="height:auto;max-height:380px;overflow:auto;white-space:pre-wrap"></div></div>
+      <!-- watchlist editor -->
+      <div style="margin-bottom:12px">
+        <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
+          <strong data-i18n="sig_wl">信号 Watchlist</strong>
+          <input id="sigWlInput" placeholder="MU" maxlength="8"
+            style="background:var(--card2);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:8px;width:90px;text-transform:uppercase">
+          <button class="sm" id="btnSigWlAdd">➕ <span data-i18n="sig_add">添加</span></button>
+          <span style="flex:1 1 auto"></span>
+          <button class="primary sm" id="btnSigWlSave">💾 <span data-i18n="sig_save">保存</span></button>
+        </div>
+        <div id="sigWlChips" style="display:flex;gap:6px;flex-wrap:wrap;min-height:24px"></div>
+        <div class="mut" id="sigWlMsg" style="font-size:11px;margin-top:6px"></div>
+      </div>
+      <!-- log -->
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <strong>Log</strong><span style="flex:1 1 auto"></span>
+        <button class="sm" id="btnSigReload">🔄 <span data-i18n="sig_reload">刷新日志</span></button>
+      </div>
+      <div class="log" id="sigLog" style="height:auto;max-height:340px;overflow:auto;white-space:pre-wrap"></div></div>
   </div>
 
   <!-- BACKTEST -->
@@ -202,6 +268,10 @@
       <div class="set-sec"><h3>资金 Capital</h3>
         <div class="set-row"><div style="flex:1"><b>预算 Budget</b><div class="setdesc">分配给交易的本金。改了下次扫描生效（免重启）；仓位/风控按它派生，并自动不超过实盘 equity。</div></div>
           <span style="display:flex;gap:6px"><input id="setBudget" type="number" step="100" placeholder="$"/><button class="sm" id="btnSetBudget">保存</button></span></div>
+      </div>
+
+      <div class="set-sec"><h3>运行配置 Run Config <span style="text-transform:none;font-weight:400">（只读）</span></h3>
+        <div class="cfgchips" id="runCfg"><span class="mut" style="font-size:12px">—</span></div>
       </div>
 
       <div class="set-sec"><h3>API Keys</h3>
@@ -234,9 +304,22 @@
 <script>
 const $=s=>document.querySelector(s);
 const fmt=n=>(n==null||isNaN(n))?'—':'$'+Number(n).toLocaleString(undefined,{maximumFractionDigits:0});
-const sign=n=>{const v=Number(n)||0;return (v>=0?'+':'')+'$'+Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:0});};
+const sign=n=>{const v=Number(n)||0;return (v>=0?'+':'-')+'$'+Math.abs(v).toLocaleString(undefined,{maximumFractionDigits:0});};
 const cls=n=>(Number(n)||0)>=0?'pos':'neg';
-async function api(p,opts){const r=await fetch(p,opts);return r.json();}
+async function api(p,opts){
+  const r=await fetch(p,opts);
+  const txt=await r.text();
+  let data; try{data=txt?JSON.parse(txt):{};}
+  catch(e){
+    // Non-JSON response (404/500 HTML page, or login redirect) — usually means the
+    // server is running stale code and needs a restart, or the session expired.
+    if(r.status===404) throw new Error('接口不存在 (404) — 网页服务器可能在跑旧代码，需重启 web server');
+    if(r.status===401||r.status===403) throw new Error('未登录或会话过期，请刷新页面重新登录');
+    throw new Error(`服务器返回非 JSON (HTTP ${r.status})`);
+  }
+  if(!r.ok) throw new Error(data.error||`HTTP ${r.status}`);
+  return data;
+}
 
 function setTab(t){
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
@@ -245,57 +328,80 @@ function setTab(t){
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
 
+let LAST_STATUS=null;
 async function refresh(){
   let a; try{a=await api('/api/status');}catch(e){return;}
+  LAST_STATUS=a;
   const run=a.scheduler_running;
-  $('#sched').innerHTML=`<span class="dot" style="background:${run?'#3fb950':'#f85149'}"></span>scheduler ${run?'running':'stopped'}`;
+  $('#sched').innerHTML=`<span class="dot ${run?'live':''}" style="background:${run?'#3fb950':'#f85149'};color:${run?'#3fb950':'#f85149'}"></span>scheduler ${run?'running':'stopped'}`;
   $('#sched').style.borderColor=(run?'#3fb950':'#f85149')+'66';
   // Start button reflects ACTUAL background state (survives web restart — reads live status)
   const bs=$('#btnStart');
   bs.innerHTML=run?'● Running':'▶ Start';
   bs.disabled=run; bs.style.background=run?'#2ea043':''; bs.style.borderColor=run?'#2ea043':'';
-  $('#btnStop').disabled=!run;
+  const st=$('#btnStop'); st.disabled=!run; st.innerHTML='■ Stop';
   const oc={red:'#f85149',yellow:'#d29922',green:'#3fb950'}[a.opend_status]||'#8b949e';
   $('#opend').innerHTML=`<span class="dot" style="background:${oc}"></span>${a.opend_label||'OpenD'}`;
   $('#opend').style.borderColor=oc+'66';
-  const env=a.trade_env||'—';
-  $('#env').textContent=env; $('#env').style.color=env==='REAL'?'#d29922':'#8b949e';
-  const rg=a.regime||'—';
-  $('#regime').textContent=rg;
+  const env=a.trade_env||'—', real=env==='REAL';
+  $('#env').innerHTML=(real?'💵 ':'🧪 ')+env;
+  $('#env').style.color=real?'#d29922':'#8b949e';
+  $('#env').style.borderColor=real?'#d2992266':'var(--border)';
+  // regime + VIX combined: "🐂 BULL · VIX 19.8", tooltip = why
+  const rg=a.regime||'—', vx=a.vix;
+  const rgIco=rg==='BULL'?'🐂':(rg==='BEAR'?'🐻':'〰️');
+  $('#regime').textContent=`${rgIco} ${rg} · VIX ${vx??'—'}`;
   $('#regime').style.color=rg==='BULL'?'#3fb950':(rg==='BEAR'?'#f85149':'#d29922');
-  const vx=a.vix;
-  $('#vix').textContent='VIX '+(vx??'—');
-  $('#vix').style.color=vx==null?'#8b949e':(vx<20?'#3fb950':(vx<28?'#d29922':'#f85149'));
+  $('#regime').title=(a.regime_note||'')+(vx!=null?`\nVIX ${vx} — ${vx<20?'低波动':(vx<28?'中等波动':'高波动')}`:'');
+  // streak pill only when there IS a streak (hide the noise otherwise)
   const sm=a.summary||{}, stk=sm.streak||0, kind=sm.streak_kind;
-  if(stk>0&&kind&&kind!=='none'){const win=kind==='win';
-    $('#streak').innerHTML=`${win?'🔥':'❄️'} ${stk}${win?(LANG==='en'?' win':'连赚'):(LANG==='en'?' loss':'连亏')}`;
-    $('#streak').style.color=win?'#3fb950':'#f85149'; $('#streak').style.borderColor=(win?'#3fb950':'#f85149')+'66';
-  } else {$('#streak').textContent='streak —';$('#streak').style.color='#8b949e';}
+  const stEl=$('#streak');
+  if(stk>1&&kind&&kind!=='none'){const win=kind==='win';
+    stEl.classList.remove('hidden');
+    stEl.innerHTML=`${win?'🔥':'❄️'} ${stk}${win?(LANG==='en'?' win':'连赚'):(LANG==='en'?' loss':'连亏')}`;
+    stEl.style.color=win?'#3fb950':'#f85149'; stEl.style.borderColor=(win?'#3fb950':'#f85149')+'66';
+  } else stEl.classList.add('hidden');
+  refreshRetrain(); refreshAwake();
   renderTradeRec(sm); refreshClosed();
-  // cards
-  $('#c-deployed').textContent=fmt(a.invested)+(a.budget_used_pct!=null?` (${a.budget_used_pct}%)`:'');
+  // KPI cards
+  $('#c-deployed').textContent=fmt(a.invested)+(a.budget!=null?` / ${fmt(a.budget)}`:'');
   const pct=Math.max(0,Math.min(100,a.budget_used_pct||0));
   const qf=$('#qfill'); if(qf){qf.style.width=pct+'%';qf.style.background=pct<70?'#3fb950':(pct<90?'#d29922':'#f85149');}
-  const today=a.realized_pnl_today||0, tot=a.realized_pnl_total||0;
-  $('#c-today').innerHTML=`<span class="${cls(today)}">${(today<0?'-':'+')}$${Math.abs(today).toLocaleString(undefined,{maximumFractionDigits:0})}</span>`;
-  $('#c-total').innerHTML=`<span class="${cls(tot)}">${(tot<0?'-':'+')}$${Math.abs(tot).toLocaleString(undefined,{maximumFractionDigits:0})}</span>`;
+  const today=a.realized_pnl_today||0, tot=a.realized_pnl_total||0, unr=a.unrealized_pnl||0;
+  $('#c-today').innerHTML=`<span class="${cls(today)}">${sign(today)}</span>`;
+  $('#c-total').innerHTML=`<span class="${cls(tot)}">${sign(tot)}</span>`;
+  $('#c-unreal').innerHTML=`<span class="${cls(unr)}">${sign(unr)}</span>`;
   $('#card-today').className='card '+(today>=0?'c-green':'c-red');
   $('#card-total').className='card '+(tot>=0?'c-green':'c-red');
-  $('#updated').textContent='updated '+new Date().toLocaleTimeString();
-  // status line
+  $('#card-unreal').className='card '+((a.positions_count||0)===0?'c-grey':(unr>=0?'c-green':'c-red'));
   const L=I18N[LANG];
-  const sl=[[L.cash,fmt(a.cash)],[L.positions,a.positions_count??'—'],[L.openrisk,fmt(a.open_risk)],
-            [L.threshold,a.entry_threshold??'—'],[L.scan,(a.scan_interval_min??'—')+'m'],['TF',a.timeframe||'—'],['AI',a.ai_model||'—']];
-  $('#statline').innerHTML=sl.map(([k,v])=>`<span class="pill">${k}: <span class="strong" style="margin-left:4px">${v}</span></span>`).join('');
+  $('#c-unreal-sub').textContent=(a.positions_count||0)+' '+L.pos_unit;
+  $('#updated').textContent='updated '+new Date().toLocaleTimeString();
+  // status line: only LIVE numbers (cash / risk vs cap / last scan) — static
+  // config (threshold, scan interval, TF, AI model) lives in Settings → 运行配置.
+  const riskHot=(a.heat_cap||0)>0&&(a.open_risk||0)/a.heat_cap>0.8;
+  const scanT=a.last_scan_utc?new Date(a.last_scan_utc).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'—';
+  $('#statline').innerHTML=
+    `<span class="pill">${L.cash}: <span class="strong" style="margin-left:4px">${fmt(a.cash)}</span></span>`+
+    `<span class="pill">${L.openrisk}: <span class="${riskHot?'neg':'strong'}" style="margin-left:4px">${fmt(a.open_risk)} / ${fmt(a.heat_cap)}</span></span>`+
+    `<span class="pill" title="${a.phase||''}">${L.lastscan}: <span class="strong" style="margin-left:4px">${scanT}</span></span>`;
   // positions
   const pp=a.per_position||{}; const syms=Object.keys(pp);
   $('#posEmpty').classList.toggle('hidden',syms.length>0);
-  $('#posTbl tbody').innerHTML=syms.map(s=>{const p=pp[s];return `<tr><td class="strong">${s}</td><td>${p.qty??''}</td><td>${(typeof p.last==='number')?p.last.toFixed(2):(p.last??'')}</td><td class="${cls(p.pl_val)}">${sign(p.pl_val)}</td><td class="${cls(p.pl_ratio)}">${(p.pl_ratio||0).toFixed(1)}%</td></tr>`;}).join('');
+  $('#posWrap').classList.toggle('hidden',syms.length===0);
+  const px=v=>(typeof v==='number')?'$'+v.toFixed(2):'—';
+  const pnlCell=p=>{const v=Number(p.pl_val);if(typeof p.last!=='number'||!isFinite(v))return '<td>—</td>';
+    return `<td class="${cls(v)}">${(v>=0?'+':'-')}$${Math.abs(v).toFixed(2)} (${(p.pl_ratio>=0?'+':'')}${(p.pl_ratio||0).toFixed(1)}%)</td>`;};
+  $('#posTbl tbody').innerHTML=syms.map(s=>{const p=pp[s];return `<tr><td class="strong">${s}</td><td>${p.qty??''}</td><td>${px(p.entry_price)}</td><td>${px(p.last)}</td><td class="neg">${px(p.stop_loss)}</td><td class="pos">${px(p.take_profit)}</td><td><span class="tag">${p.strategy||'—'}</span></td>${pnlCell(p)}</tr>`;}).join('');
   refreshApprovals(); refreshLog();
 }
 function renderTradeRec(sm){
-  const wr=sm.win_rate??0, L=I18N[LANG];
-  const boxes=[[L.trades,sm.count??0,'strong'],[L.winrate,wr+'%',(wr>=50?'pos':'neg')]];
+  const wr=sm.win_rate??0, n=sm.count??0, L=I18N[LANG];
+  const won=sm.gross_won||0, lost=Math.abs(sm.gross_lost||0), net=sm.net||0;
+  const pf=lost>0?(won/lost):(won>0?Infinity:0);
+  const pfTxt=n===0?'—':(pf===Infinity?'∞':pf.toFixed(2));
+  const boxes=[[L.trades,n,'strong'],[L.winrate,n?wr+'%':'—',(wr>=50?'pos':'neg')],
+               [L.pf,pfTxt,(pf>=1?'pos':'neg')],[L.net,n?sign(net):'—',cls(net)]];
   $('#tradeRec').innerHTML=boxes.map(([k,v,c])=>`<div class="recbox"><div class="k">${k}</div><div class="v ${c}">${v}</div></div>`).join('');
 }
 let EQ=[];
@@ -303,45 +409,59 @@ async function refreshClosed(){
   let rows; try{rows=await api('/api/closed?n=400');}catch(e){return;}
   let eq=0; EQ=rows.map(r=>{eq+=(r.pnl||0);return {d:(r.ts||'').slice(0,10),y:eq};}); drawEqDash();
   $('#recentTbl tbody').innerHTML=rows.slice(-6).reverse().map(r=>
-    `<tr><td class="strong">${r.symbol}</td><td class="mut">${r.exit_reason||''}</td>
+    `<tr><td class="mut" style="width:46px">${(r.ts||'').slice(5,10)}</td><td class="strong">${r.symbol}</td><td class="mut">${r.exit_reason||''}</td>
      <td class="${cls(r.pnl)}" style="text-align:right">${sign(r.pnl)}</td></tr>`).join('')
     || `<tr><td class="mut">${I18N[LANG].notrades}</td></tr>`;
 }
 async function refreshLog(){
-  const l=await api('/api/log?n=5');
-  $('#log').innerHTML=l.map(line=>{
+  const l=await api('/api/log?n=8');
+  const box=$('#log');
+  // 跟随最新输出：刷新前若已贴在底部就刷新后自动滚到底，这样新内容会一直更新到最新；
+  // 但若用户主动往上拉看历史，则保持其位置不打扰
+  const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<24;
+  box.innerHTML=l.map(line=>{
     let c='var(--muted)';
     if(/buy|BUY|开仓|TP|profit/.test(line))c='var(--green)';
     else if(/SL|stop|error|fail|blacklist|⚠/.test(line))c='var(--red)';
     return `<div style="color:${c}">${line.replace(/</g,'&lt;')}</div>`;
   }).join('');
+  if(atBottom)box.scrollTop=box.scrollHeight;
 }
 async function refreshApprovals(){
   const items=(await api('/api/approvals')).filter(x=>x.status==='pending');
   const el=$('#apprList');
-  if(!items.length){el.innerHTML=`<div class="empty">${I18N[LANG].noappr}</div>`;return;}
+  if(!items.length){el.innerHTML=`<div class="empty">✓ ${I18N[LANG].noappr}</div>`;return;}
   el.innerHTML=items.map(a=>`<div class="appr"><div class="txt">${a.detail||a.kind}<div class="act">→ ${a.action||''}</div></div>
      <button class="primary sm" onclick="resolve('${a.id}','approve')">✓</button>
      <button class="danger sm" onclick="resolve('${a.id}','reject')">✗</button></div>`).join('');
 }
 async function resolve(id,act){await api(`/api/approvals/${id}/${act}`,{method:'POST'});refreshApprovals();}
 
-// ── reusable interactive equity chart (markers + date + hover tooltip) ──
+// ── reusable interactive equity chart (gradient fill + hover tooltip) ──
 function eqChart(canvasSel, tipSel, pts){
   const c=$(canvasSel); if(!c)return; const wrap=c.parentElement;
   const w=c.width=wrap.clientWidth||300, h=c.height=wrap.clientHeight||90, ctx=c.getContext('2d');
   ctx.clearRect(0,0,w,h);
-  if(!pts||pts.length<1){c._g=null;return;}
+  if(!pts||pts.length<1){c._g=null;
+    ctx.fillStyle='rgba(139,148,158,.5)';ctx.font='12px Inter,sans-serif';ctx.textAlign='center';
+    ctx.fillText(I18N[LANG].notrades,w/2,h/2);return;}
   const ys=pts.map(p=>p.y), mn=Math.min(0,...ys), mx=Math.max(0,...ys), rng=(mx-mn)||1;
   const X=i=>6+(pts.length<2?0.5:i/(pts.length-1))*(w-12), Y=v=>h-8-((v-mn)/rng)*(h-26);
   ctx.beginPath();ctx.moveTo(0,Y(0));ctx.lineTo(w,Y(0));ctx.strokeStyle='rgba(139,148,158,.3)';ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);
   const up=pts[pts.length-1].y>=0, col=up?'#3fb950':'#f85149';
+  const grad=ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,up?'rgba(63,185,80,.28)':'rgba(248,81,73,.28)');
+  grad.addColorStop(1,'rgba(0,0,0,0)');
   ctx.beginPath();ctx.moveTo(X(0),Y(pts[0].y));pts.forEach((p,i)=>ctx.lineTo(X(i),Y(p.y)));
   ctx.lineTo(X(pts.length-1),Y(0));ctx.lineTo(X(0),Y(0));ctx.closePath();
-  ctx.fillStyle=up?'rgba(63,185,80,.12)':'rgba(248,81,73,.12)';ctx.fill();
+  ctx.fillStyle=grad;ctx.fill();
   ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(X(i),Y(p.y)):ctx.moveTo(X(i),Y(p.y)));
-  ctx.strokeStyle=col;ctx.lineWidth=2;ctx.stroke();
-  ctx.fillStyle=col;pts.forEach((p,i)=>{ctx.beginPath();ctx.arc(X(i),Y(p.y),2.2,0,7);ctx.fill();});
+  ctx.strokeStyle=col;ctx.lineWidth=2;ctx.lineJoin='round';ctx.stroke();
+  if(pts.length<=80){ctx.fillStyle=col;pts.forEach((p,i)=>{ctx.beginPath();ctx.arc(X(i),Y(p.y),2.2,0,7);ctx.fill();});}
+  // emphasize the latest point
+  const li=pts.length-1;
+  ctx.beginPath();ctx.arc(X(li),Y(pts[li].y),3.6,0,7);ctx.fillStyle=col;ctx.fill();
+  ctx.beginPath();ctx.arc(X(li),Y(pts[li].y),6,0,7);ctx.strokeStyle=col+'55';ctx.stroke();
   c._g={X,Y,pts,w,h,tip:tipSel};
   if(!c._hooked){c._hooked=1;
     c.onmousemove=e=>{const g=c._g;if(!g)return;const r=c.getBoundingClientRect();
@@ -356,24 +476,117 @@ function eqChart(canvasSel, tipSel, pts){
 function drawEqDash(){eqChart('#eqDash','#eqTip',EQ);}
 window.addEventListener('resize',()=>{drawEqDash();if(!$('#tab-hist').classList.contains('hidden'))renderHist();});
 
-$('#btnStart').onclick=async()=>{await api('/api/scheduler/start',{method:'POST'});setTimeout(refresh,800);};
-$('#btnStop').onclick=async()=>{if(confirm('Stop the trading bot?')){await api('/api/scheduler/stop',{method:'POST'});setTimeout(refresh,800);}};
+// ── weekly self-review / "retrain" pill ──
+let RETRAIN_BUSY=false, RETRAIN_LAST=null;
+async function refreshRetrain(){
+  if(RETRAIN_BUSY) return;
+  let d; try{d=await api('/api/self-review');}catch(e){return;}
+  const el=$('#retrain'); const r=d.report;
+  RETRAIN_LAST=d.ran_at||null;
+  // "建议" count = LIVE pending approvals (drops to 0 once you approve/reject),
+  // NOT the frozen snapshot count from when the review last ran.
+  let pend=0; try{pend=(await api('/api/approvals')).filter(x=>x.status==='pending').length;}catch(e){pend=null;}
+  const ns = pend==null ? (r&&(r.suggestions||[]).length) : pend;
+  if(!r){el.innerHTML='🧠 '+(LANG==='en'?'never run':'未运行');el.style.color='#8b949e';el.title=(LANG==='en'?'Weekly self-review — click to run now':'每周自省/重训 — 点击立即运行一次');return;}
+  const when=d.ran_at?new Date(d.ran_at).toLocaleString():'—';
+  if(!r.n_trades){el.innerHTML='🧠 '+(LANG==='en'?'no fills':'无成交');el.style.color='#8b949e';}
+  else{
+    const pd=r.per_day||0;
+    el.innerHTML=`🧠 $${pd.toFixed(0)}/d · ${Math.round(r.win_rate||0)}% · ${ns}${LANG==='en'?' pend':'待批'}`;
+    el.style.color = pd>=0 ? '#3fb950' : '#f85149';
+    el.style.borderColor=(pd>=0?'#3fb950':'#f85149')+'66';
+  }
+  el.title=`${LANG==='en'?'Last self-review':'上次自省'}: ${when}\n${r.target_note||''}\n${(LANG==='en'?'Pending approvals: ':'待批准: ')+ns}\n${LANG==='en'?'Click to run now':'点击立即运行一次'}`;
+}
+$('#retrain').onclick=async()=>{
+  if(RETRAIN_BUSY)return;
+  if(!confirm(LANG==='en'?'Run weekly self-review / retrain now?':'立即运行一次每周自省/重训？')) return;
+  RETRAIN_BUSY=true;
+  const el=$('#retrain'); el.innerHTML='🧠 '+(LANG==='en'?'running…':'训练中…'); el.style.color='#d29922';
+  const before=RETRAIN_LAST;
+  try{await api('/api/self-review/run',{method:'POST'});}catch(e){RETRAIN_BUSY=false;el.innerHTML='🧠 '+(LANG==='en'?'error':'出错');return;}
+  // Poll up to ~2min for a fresh result (ran_at changes when the job finishes).
+  let n=0; const t=setInterval(async()=>{
+    n++; let d; try{d=await api('/api/self-review');}catch(e){d=null;}
+    if(d&&d.ran_at&&d.ran_at!==before){clearInterval(t);RETRAIN_BUSY=false;refreshRetrain();}
+    else if(n>=40){clearInterval(t);RETRAIN_BUSY=false;refreshRetrain();}
+  },3000);
+};
 
-// ── settings ──
+// ── keep-awake toggle (☕) — prevents idle sleep; screen can still turn off ──
+// AWAKE_ON = caffeinate held (no idle/system sleep). AWAKE_LID = lid-closed sleep
+// also blocked via `sudo pmset disablesleep` (needs the one-time setup script).
+let AWAKE_ON=false, AWAKE_LID=false, AWAKE_BUSY=false;
+function paintAwake(){
+  const el=$('#awake');
+  if(AWAKE_ON){
+    const lid = AWAKE_LID ? (LANG==='en'?' +lid':'+合盖') : '';
+    el.innerHTML='☕ '+(LANG==='en'?'awake':'防睡眠')+lid;
+    el.style.color='#d29922'; el.style.borderColor='#d2992266';
+    el.title=(LANG==='en'
+      ?'Keep-awake ON — Mac won\'t idle-sleep (screen can still turn off). Click to turn off.\n'
+        +(AWAKE_LID?'Lid-closed sleep is ALSO blocked (pmset). Watch heat in a bag.'
+                   :'Lid-closed still sleeps — run scripts/setup_lid_nosleep.command once to also block it.')
+      :'防睡眠已开 — 电脑不会自动睡眠（屏幕仍可熄灭）。点击关闭。\n'
+        +(AWAKE_LID?'合盖也不会睡眠（pmset）。装包里注意散热。'
+                   :'合盖仍会睡眠 — 运行一次 scripts/setup_lid_nosleep.command 即可连合盖也阻止。'));
+  }else{
+    el.innerHTML='☕ '+(LANG==='en'?'off':'已关');
+    el.style.color='#8b949e'; el.style.borderColor='';
+    el.title=(LANG==='en'?'Keep-awake OFF — click to prevent sleep (screen can still turn off).'
+                         :'防睡眠已关 — 点击开启，电脑不会睡眠（屏幕仍可熄灭）。');
+  }
+}
+async function refreshAwake(){
+  if(AWAKE_BUSY) return;
+  try{const d=await api('/api/caffeinate'); AWAKE_ON=!!d.on; AWAKE_LID=!!d.lid;}catch(e){return;}
+  paintAwake();
+}
+$('#awake').onclick=async()=>{
+  if(AWAKE_BUSY) return;
+  AWAKE_BUSY=true;
+  const want=!AWAKE_ON;
+  const el=$('#awake'); el.innerHTML='☕ …';
+  try{
+    const d=await api('/api/caffeinate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:want})});
+    AWAKE_ON=!!d.on; AWAKE_LID=!!d.lid;
+  }catch(e){
+    // Don't silently lie — surface that the request failed (usually: web server
+    // running old code without /api/caffeinate → relaunch start-web.command).
+    el.innerHTML='☕ '+(LANG==='en'?'err':'出错'); el.style.color='#f85149';
+    AWAKE_BUSY=false; return;
+  }
+  AWAKE_BUSY=false; paintAwake();
+};
+
+// Poll status a few times so the UI catches up with the real scheduler state
+// (stop is a graceful shutdown that can take a second or two).
+function pollStatus(times=6,gap=600){let i=0;const t=setInterval(()=>{refresh();if(++i>=times)clearInterval(t);},gap);refresh();}
+$('#btnStart').onclick=async()=>{const b=$('#btnStart');b.disabled=true;b.innerHTML='▶ Starting…';try{await api('/api/scheduler/start',{method:'POST'});}catch(e){}pollStatus();};
+$('#btnStop').onclick=async()=>{if(!confirm('Stop the trading bot?'))return;const b=$('#btnStop');b.disabled=true;b.innerHTML='■ Stopping…';try{await api('/api/scheduler/stop',{method:'POST'});}catch(e){}pollStatus();};
+
+// ── i18n ──
 const I18N={
   zh:{t_dash:'仪表盘',t_hist:'历史',t_sig:'信号',t_bt:'回测',positions:'持仓',equity:'净值曲线 · 累计已实现',
-      activity:'近期动态',record:'交易统计',approvals:'待批准建议',deployed:'已部署 / 预算占用',today:'今日盈亏',total:'总盈亏（累计）',
-      trades:'总交易笔数',winrate:'胜率',cash:'现金',positions2:'持仓数',openrisk:'敞口风险',threshold:'阈值',scan:'扫描',
-      c_sym:'代码',c_qty:'数量',c_last:'现价',no_pos:'无持仓。',notrades:'暂无平仓记录',noappr:'暂无待批准建议'},
+      activity:'近期动态',record:'交易统计',approvals:'待批准建议',deployed:'已部署 / 预算',today:'今日盈亏 · 已实现',total:'总盈亏 · 累计已实现',
+      unreal:'浮动盈亏 · 持仓',pos_unit:'笔持仓',
+      trades:'总交易笔数',winrate:'胜率',pf:'盈利因子',net:'净盈亏',cash:'现金',openrisk:'敞口风险 / 上限',lastscan:'上次扫描',
+      c_sym:'代码',c_qty:'数量',c_entry:'入场',c_last:'现价',c_stop:'止损',c_tp:'止盈',c_strat:'策略',
+      no_pos:'🌙 当前无持仓',notrades:'暂无平仓记录',noappr:'暂无待批准建议',
+      sig_desc:'独立信号 watchlist — 🌅盘前简报@08:30 · 🔄开盘1小时复盘@10:30 · 🏁收盘对账@16:10 (ET)。',sig_stopped:'已停止',sig_brief:'盘前简报',sig_review:'盘中复盘',sig_close:'收盘对账',sig_wl:'信号 Watchlist',sig_add:'添加',sig_save:'保存',sig_reload:'刷新日志'},
   en:{t_dash:'Dashboard',t_hist:'History',t_sig:'Signal',t_bt:'Backtest',positions:'Open Positions',equity:'Equity · cumulative realized',
-      activity:'Recent Activity',record:'Trade Record',approvals:'Pending Approvals',deployed:'Deployed / Budget used',today:"Today P&L",total:'Total P&L (cum.)',
-      trades:'Total Trades',winrate:'Win rate',cash:'Cash',positions2:'Positions',openrisk:'Open risk',threshold:'Threshold',scan:'Scan',
-      c_sym:'Symbol',c_qty:'Qty',c_last:'Last',no_pos:'No open positions.',notrades:'No closed trades',noappr:'No pending suggestions.'}
+      activity:'Recent Activity',record:'Trade Record',approvals:'Pending Approvals',deployed:'Deployed / Budget',today:"Today P&L · realized",total:'Total P&L · cum. realized',
+      unreal:'Unrealized P&L · open',pos_unit:'position(s)',
+      trades:'Total Trades',winrate:'Win rate',pf:'Profit factor',net:'Net P&L',cash:'Cash',openrisk:'Open risk / cap',lastscan:'Last scan',
+      c_sym:'Symbol',c_qty:'Qty',c_entry:'Entry',c_last:'Last',c_stop:'Stop',c_tp:'TP',c_strat:'Strategy',
+      no_pos:'🌙 No open positions',notrades:'No closed trades',noappr:'No pending suggestions',
+      sig_desc:'Independent signal watchlist — 🌅Premarket brief@08:30 · 🔄Open+1h review@10:30 · 🏁Close recap@16:10 (ET).',sig_stopped:'Stopped',sig_brief:'Premarket brief',sig_review:'Open+1h review',sig_close:'Close recap',sig_wl:'Signal Watchlist',sig_add:'Add',sig_save:'Save',sig_reload:'Reload log'}
 };
-I18N.zh.positions=I18N.zh.positions; // (positions label reused for panel; statline uses positions2)
 let LANG=localStorage.getItem('lang')||'zh';
 function applyLang(l){LANG=l;document.querySelectorAll('[data-i18n]').forEach(e=>{const m=I18N[l]&&I18N[l][e.dataset.i18n];if(m)e.textContent=m;});localStorage.setItem('lang',l);refresh();}
 function applyTheme(t){document.body.classList.toggle('light',t==='light');localStorage.setItem('theme',t);drawEqDash();}
+
+// ── settings ──
 async function loadSettings(){
   try{const s=await api('/api/settings');
     $('#keyList').innerHTML=s.keys.map(k=>`<div class="set-row"><div style="flex:1"><b>${k.key}</b>
@@ -381,7 +594,14 @@ async function loadSettings(){
        <span style="display:flex;gap:6px"><input id="k_${k.key}" type="password" placeholder="新值(留空不改)"/>
        <button class="sm" onclick="saveKey('${k.key}')">保存</button></span></div>`).join('');
   }catch(e){}
-  try{const a=await api('/api/status'); $('#setBudget').value=Math.round(a.budget||0);}catch(e){}
+  try{const a=LAST_STATUS||await api('/api/status');
+    $('#setBudget').value=Math.round(a.budget||0);
+    // read-only run config — kept here (off the dashboard) so the main view stays clean
+    $('#runCfg').innerHTML=[
+      ['入场阈值',a.entry_threshold],['扫描间隔',(a.scan_interval_min??'—')+' min'],
+      ['K线周期',a.timeframe],['最长持仓',(a.max_hold_days??'—')+' 天'],['AI 模型',a.ai_model],
+    ].map(([k,v])=>`<span class="pill">${k}<b>${v??'—'}</b></span>`).join('');
+  }catch(e){}
   loadWebAccess();
 }
 let WACC=null;
@@ -468,10 +688,41 @@ function renderHist(){
   let eq=0; const pts=rows.map(r=>{eq+=(r.pnl||0);return {d:(r.ts||'').slice(0,10),y:eq};});
   eqChart('#eqHist','#eqHistTip',pts);
 }
-async function loadSignal(){$('#sigLog').textContent=(await api('/api/signal-log?n=200')).join('\n')||'暂无信号日志。点 ▶Premarket 或 ▶Intraday 触发。';}
-$('#btnPre').onclick=async()=>{await api('/api/signal-run/premarket',{method:'POST'});$('#sigLog').textContent='Premarket 盘前卡触发中… ~30s 后点「🔄 刷新日志」看结果。';};
-$('#btnIntra').onclick=async()=>{await api('/api/signal-run/scalp',{method:'POST'});$('#sigLog').textContent='⚡ 超短线 30min 扫描触发中… 每只约 30-40s（含 AI），稍后点「🔄 刷新日志」看结果。';};
+async function loadSignal(){
+  $('#sigLog').textContent=(await api('/api/signal-log?n=200')).join('\n')||(LANG==='zh'?'暂无信号日志。点 🌅盘前简报 / 🔄盘中复盘 / 🏁收盘对账 触发。':'No signal log yet. Trigger 🌅Brief / 🔄Review / 🏁Close.');
+  refreshSigStatus(); loadSigWatchlist();
+}
+async function refreshSigStatus(){
+  let s; try{s=await api('/api/signal-status');}catch(e){return;}
+  const el=$('#sigStatus');
+  el.innerHTML = s.running ? `🟢 ${LANG==='zh'?'运行中':'Running'} (PID ${s.pid})` : `⚪ ${LANG==='zh'?'已停止':'Stopped'}`;
+  el.style.color = s.running ? '#3fb950' : 'var(--muted)';
+  $('#btnSigStart').disabled=s.running; $('#btnSigStop').disabled=!s.running;
+}
+function pollSig(times=6,gap=600){let i=0;const t=setInterval(()=>{refreshSigStatus();if(++i>=times)clearInterval(t);},gap);refreshSigStatus();}
+$('#btnSigStart').onclick=async()=>{const b=$('#btnSigStart');b.disabled=true;b.textContent='▶ Starting…';try{await api('/api/signal-scheduler/start',{method:'POST'});}catch(e){}pollSig();setTimeout(()=>{b.textContent='▶ Start';},2000);};
+$('#btnSigStop').onclick=async()=>{if(!confirm('Stop the signal reporter scheduler?'))return;const b=$('#btnSigStop');b.disabled=true;b.textContent='■ Stopping…';try{await api('/api/signal-scheduler/stop',{method:'POST'});}catch(e){}pollSig();setTimeout(()=>{b.textContent='■ Stop';},2000);};
+const sigRun=(mode,note)=>async()=>{await api('/api/signal-run/'+mode,{method:'POST'});$('#sigLog').textContent=note;};
+$('#btnBrief').onclick=sigRun('brief',   LANG==='zh'?'🌅 盘前简报生成中（含 AI+搜索）… 每只约 30-60s，稍后点「🔄 刷新日志」看结果。':'🌅 Premarket brief running (AI+search)… ~30-60s per symbol, reload the log shortly.');
+$('#btnReview').onclick=sigRun('review', LANG==='zh'?'🔄 开盘1小时复盘生成中（需当天已有盘前简报）… ~30-60s/只，稍后刷新日志。':'🔄 Open+1h review running (needs today\'s brief)… ~30-60s per symbol, reload the log shortly.');
+$('#btnClose').onclick=sigRun('close',   LANG==='zh'?'🏁 收盘对账生成中（对比盘前/盘中预测 vs 实际）… ~30-60s/只，稍后刷新日志。':'🏁 Close recap running (predictions vs actual)… ~30-60s per symbol, reload the log shortly.');
 $('#btnSigReload').onclick=loadSignal;
+
+// ── signal watchlist editor ──
+let SIG_WL=[];
+function renderSigWl(){
+  $('#sigWlChips').innerHTML = SIG_WL.length ? SIG_WL.map(s=>
+    `<span class="pill" style="gap:6px">${s}<span style="cursor:pointer;color:var(--red);font-weight:700" data-rm="${s}">×</span></span>`
+  ).join('') : `<span class="mut" style="font-size:12px">${LANG==='zh'?'空 watchlist。':'Empty watchlist.'}</span>`;
+  $('#sigWlChips').querySelectorAll('[data-rm]').forEach(x=>x.onclick=()=>{SIG_WL=SIG_WL.filter(t=>t!==x.dataset.rm);renderSigWl();$('#sigWlMsg').textContent=(LANG==='zh'?'已移除 — 点保存生效':'Removed — click Save to persist');});
+}
+async function loadSigWatchlist(){try{SIG_WL=(await api('/api/signal-watchlist')).tickers||[];}catch(e){SIG_WL=[];}renderSigWl();}
+function sigWlAdd(){const i=$('#sigWlInput');const s=(i.value||'').trim().toUpperCase();if(!s)return;
+  if(SIG_WL.includes(s)){$('#sigWlMsg').textContent=s+(LANG==='zh'?' 已在列表':' already in list');return;}
+  SIG_WL.push(s);i.value='';renderSigWl();$('#sigWlMsg').textContent=(LANG==='zh'?'已添加 '+s+' — 点保存生效':'Added '+s+' — click Save to persist');}
+$('#btnSigWlAdd').onclick=sigWlAdd;
+$('#sigWlInput').addEventListener('keydown',e=>{if(e.key==='Enter')sigWlAdd();});
+$('#btnSigWlSave').onclick=async()=>{try{const r=await api('/api/signal-watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tickers:SIG_WL})});SIG_WL=r.tickers||SIG_WL;renderSigWl();$('#sigWlMsg').textContent='✓ '+(LANG==='zh'?'已保存 ':'Saved ')+SIG_WL.length+(LANG==='zh'?' 支':' tickers');}catch(e){$('#sigWlMsg').textContent='✗ '+e;}};
 
 async function loadBt(){const b=await api('/api/backtest');renderBt(b);}
 function renderBt(b){

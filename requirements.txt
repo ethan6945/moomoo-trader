@@ -11,6 +11,6 @@ requests>=2.31.0
 yfinance>=0.2.40
 lxml>=5.0.0
 matplotlib>=3.8.0
-PyQt6>=6.6.0
 flask>=3.0.0
+rumps>=0.4.0          # macOS menu-bar status icon (pulls in pyobjc)
 # (xgboost / scikit-learn / joblib removed 2026-06-03 with the inert ML subsystem)

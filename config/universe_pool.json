@@ -1,0 +1,14 @@
+{
+  "_comment": "Phase 1 base pool (2026-06-11). Membership criterion is OBJECTIVE LIQUIDITY ONLY: US-listed common stocks among the largest/most-traded names (mega/large-cap, deep options/volume, tight spreads), sector-diverse. The trading universe is the top UNIVERSE_TOP_N of this pool by 6-1 momentum, recomputed weekly by rule (src/universe.py). NEVER add/remove names here based on how they performed in a backtest — that is exactly the survivorship bias this pool exists to kill.",
+  "tickers": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO",
+    "AMD", "MU", "INTC", "QCOM", "TXN", "LRCX", "AMAT", "KLAC",
+    "ADI", "MRVL", "ON", "SWKS", "MCHP", "SNDK", "WDC", "STX",
+    "CRM", "ORCL", "ADBE", "NOW", "PANW", "FTNT", "CRWD", "DDOG",
+    "NET", "SNOW", "UBER", "ABNB", "SHOP", "NFLX", "DELL", "HPQ",
+    "HPE", "SMCI", "ANET", "CSCO", "IBM", "JPM", "BAC", "GS",
+    "MS", "V", "MA", "AXP", "LLY", "UNH", "JNJ", "ABBV",
+    "MRK", "PFE", "DXCM", "ISRG", "WMT", "COST", "HD", "NKE",
+    "MCD", "DIS", "XOM", "CVX", "CAT", "BA", "GE", "HON"
+  ]
+}

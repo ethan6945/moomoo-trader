@@ -39,6 +39,8 @@ KNOWN_JOBS: tuple[str, ...] = (
     "weekly_backtest",
     "monthly_optuna",
     "daily_blacklist",
+    "self_review",        # weekly self-improvement — catch up if laptop was off
+    "universe_refresh",   # Phase 1 weekly rule-based watchlist rebuild
 )
 
 
@@ -157,9 +159,13 @@ def needs_catchup(job_name: str, expected_fire: datetime) -> bool:
     """True iff the job's last_run is BEFORE the most recent expected fire."""
     lr = last_run(job_name)
     if lr is None:
-        # Unknown job → never run before; conservative: do NOT catchup
-        # (initialize_if_empty() should have seeded all KNOWN_JOBS).
-        return False
+        # No record. A genuine first boot is handled earlier by
+        # initialize_if_empty() (which seeds every KNOWN_JOBS and short-circuits
+        # catchup), so reaching here with no record means this KNOWN job was
+        # added to an EXISTING install (e.g. self_review) or never succeeded —
+        # in both cases it's overdue and should catch up once. An unknown job
+        # name stays conservative (no catchup).
+        return job_name in KNOWN_JOBS
     # Strip tz info for naive comparison if datetimes differ in tz handling.
     if lr.tzinfo is None and expected_fire.tzinfo is not None:
         expected_fire = expected_fire.replace(tzinfo=None)

@@ -21,14 +21,22 @@ from .config import settings, gemini_cascade
 log = logging.getLogger(__name__)
 
 _SYSTEM = (
-    "You are a quantitative trading risk optimizer for a $5k CASH day-trading "
-    "bot (no leverage, max 5 positions, US semis). You tune ONLY these params: "
-    "entry_threshold (55-85), tp_atr_mult (2-12), sl_atr_mult (2-6). The owner "
-    "wants higher $/day toward a $50/day target WITHOUT reckless risk, and "
-    "dislikes over-conservative gatekeeping. Propose 0-3 SMALL, justified "
-    "changes based on the real-fill review. Reply ONLY with a JSON array of "
-    '{"key","value","rationale"} objects — rationale ONE short sentence, no prose '
-    "outside the array. Empty array [] if no change is warranted."
+    "You are a quantitative trading risk optimizer for a $5k CASH swing bot "
+    "(no leverage, max 5 positions, US large caps, weekly momentum-rotated "
+    "universe). You tune ONLY these params: entry_threshold (55-85), "
+    "tp_atr_mult (2-12), sl_atr_mult (2-6), breakeven_trigger_r (0.75-1.5), "
+    "max_hold_days (5-10), universe_top_n (10-20), max_position_pct "
+    "(0.20-0.55; ceiling is a hard tail-risk guard, never argue above it). "
+    "KNOWN from the 2026-06-11/12 exhaustive sweeps: entry_threshold=70, "
+    "tp_atr_mult=8 and max_hold_days=7 are at measured plateau peaks, and "
+    "max_position_pct=0.40 beat 0.30/0.50/0.70 — only propose moving these "
+    "if the review shows NEW evidence; small moves elsewhere are more likely "
+    "to validate. "
+    "The owner wants higher $/day WITHOUT reckless risk. Propose 0-3 SMALL, "
+    "justified changes based on the real-fill review. Reply ONLY with a JSON "
+    'array of {"key","value","rationale"} objects — rationale ONE short '
+    "sentence, no prose outside the array. Empty array [] if no change is "
+    "warranted."
 )
 
 
@@ -37,6 +45,10 @@ def _current_params() -> dict:
         "entry_threshold": runtime_config.entry_threshold(),
         "tp_atr_mult": runtime_config.tp_atr_mult(),
         "sl_atr_mult": runtime_config.sl_atr_mult(),
+        "breakeven_trigger_r": runtime_config.breakeven_trigger_r(),
+        "max_hold_days": runtime_config.max_hold_days(),
+        "universe_top_n": runtime_config.universe_top_n(),
+        "max_position_pct": runtime_config.max_position_pct(),
     }
 
 
@@ -85,30 +97,50 @@ _PARAM_TO_CFG = {
     "tp_atr_mult": "tp_atr_mult",
     "sl_atr_mult": "sl_atr_mult",
     "risk_per_trade": "risk_per_trade",
+    # 2026-06-11: the levers with remaining evidence-backed headroom.
+    # (breakeven validates because _run_live_engine turns use_breakeven_stop on
+    # from settings; universe_top_n only matters under apply_dynamic_universe.)
+    "breakeven_trigger_r": "breakeven_trigger_r",
+    "max_hold_days": "max_hold_days",
+    "universe_top_n": "universe_top_n",
+    "max_position_pct": "max_position_pct",
 }
+_INT_PARAMS = {"max_hold_days", "universe_top_n"}
 _VALIDATE_WINDOWS = (180, 360)
 _PINNED = ["SNDK", "MU", "INTC", "LRCX", "DDOG", "AMD", "WDC", "SWKS", "PANW", "MCHP"]
 
 
 def _base_cfg(days: int):
-    """Live-aligned honest-engine config (mirrors .env). _run_live_engine adds
-    VIX sizing + earnings gate + real commissions + momentum on top.
+    """Live-aligned honest-engine config. _run_live_engine adds VIX sizing +
+    earnings gate + real commissions + momentum + Phase 0 realism on top.
 
-    account_usd is the runtime-effective budget (budget_usd honours the db-state
-    'budget_usd' override), NOT the frozen .env value — so the backtest's slot cap
-    derive_max_positions(cfg.account_usd) and cash-sizing base track the SAME
-    capital the live engine runs at. Using settings.account_usd here would re-break
-    the live↔backtest parity that req#1 dynamic capital exists to provide."""
+    TWO parity rules, both load-bearing for an optimizer that may auto-apply:
+    1. RUNTIME-EFFECTIVE values, not frozen .env: account_usd honours the
+       db-state budget override, and threshold/tp/sl/risk honour runtime_config
+       — otherwise the first applied proposal makes every later validation
+       measure deltas against a base the live bot no longer runs.
+    2. THE UNIVERSE THE BOT ACTUALLY TRADES: with the Phase 1 dynamic universe
+       enabled, validate walk-forward over the full pool (the engine re-derives
+       each week's top-N exactly like the live Sunday refresh); only when the
+       flag is off fall back to the pinned list."""
     from src.backtest import BacktestConfig
-    from . import risk_manager   # local import avoids any import-time cycle
+    from . import risk_manager, runtime_config   # local: avoids import cycles
+    if settings.dynamic_universe_enabled:
+        from .universe import load_pool
+        tickers, dyn = load_pool(), True
+    else:
+        tickers, dyn = list(_PINNED), False
     return BacktestConfig(
-        days=days, timeframe=settings.timeframe, threshold=settings.entry_threshold,
-        tickers=list(_PINNED), account_usd=risk_manager.budget_usd(),
-        risk_per_trade=settings.risk_per_trade,
-        max_position_pct=settings.max_position_pct, max_hold_days=settings.max_hold_days,
-        tp_atr_mult=settings.tp_atr_mult, sl_atr_mult=settings.sl_atr_mult,
+        days=days, timeframe=settings.timeframe,
+        threshold=runtime_config.entry_threshold(),
+        tickers=tickers, account_usd=risk_manager.budget_usd(),
+        risk_per_trade=runtime_config.risk_per_trade(),
+        max_position_pct=runtime_config.max_position_pct(),
+        max_hold_days=runtime_config.max_hold_days(),
+        tp_atr_mult=runtime_config.tp_atr_mult(), sl_atr_mult=runtime_config.sl_atr_mult(),
         max_gap_pct=settings.max_gap_pct, apply_ml_gate=False, apply_mr_strategy=False,
-        use_scale_out=settings.use_scale_out, tp1_r=settings.tp1_r, tp2_r=settings.tp2_r)
+        use_scale_out=settings.use_scale_out, tp1_r=settings.tp1_r, tp2_r=settings.tp2_r,
+        apply_dynamic_universe=dyn, universe_top_n=runtime_config.universe_top_n())
 
 
 # A proposal may not worsen MTM drawdown by more than this (percentage points)
@@ -133,13 +165,15 @@ def _prep_cache():
     base = {d: _base_cfg(d) for d in _VALIDATE_WINDOWS}
     cache = {d: prefetch_data(base[d]) for d in _VALIDATE_WINDOWS}
     # Guard against a degenerate prefetch (OpenD hiccup → too few tickers), which
-    # would make every Δ ≈ 0 and the validation meaningless.
-    need = max(6, len(_PINNED) - 2)
+    # would make every Δ ≈ 0 and the validation meaningless. Scales with the
+    # universe actually being validated (72-name pool vs 10-name pinned list).
+    expected = len(base[_VALIDATE_WINDOWS[0]].tickers)
+    need = max(6, int(expected * 0.8))
     for d in _VALIDATE_WINDOWS:
         got = len(cache[d].get("per_ticker", {}))
         if got < need:
             log.warning("optimizer: %dd prefetch degenerate (%d/%d tickers) — skipping",
-                        d, got, len(_PINNED))
+                        d, got, expected)
             return None
     return base, cache
 
@@ -177,10 +211,17 @@ def validate_proposals(proposals: list[dict]) -> list[dict]:
         field = _PARAM_TO_CFG.get(key)
         if not field or not runtime_config.is_valid(key, value):
             continue
+        if key == "universe_top_n" and not settings.dynamic_universe_enabled:
+            continue   # meaningless (and unvalidatable) without the dynamic universe
+        from . import autopilot
+        if autopilot.in_cooldown(key):
+            log.info("optimizer: %s in post-rollback cooldown — skipped", key)
+            continue
+        cast = int if key in _INT_PARAMS else float
         try:
             pd_d, dd_d = {}, {}
             for d in _VALIDATE_WINDOWS:
-                cfg = replace(base[d], **{field: float(value)})
+                cfg = replace(base[d], **{field: cast(float(value))})
                 pd_d[d], dd_d[d] = _metrics(cfg, cache[d], d)
         except Exception as e:
             log.warning("optimizer: backtest of %s=%s failed: %s", key, value, e)
@@ -257,6 +298,25 @@ def propose_from_review(review: dict) -> int:
         dd = p.get("_dd", {})
         gain = (f"backtested +${d.get(180, 0):.1f}/day(180d,DD{dd.get(180, 0):.1f}%), "
                 f"+${d.get(360, 0):.1f}/day(360d,DD{dd.get(360, 0):.1f}%)")
+        # Bounded autonomy (2026-06-11, owner mandate): with AUTO_APPLY_PARAMS
+        # on, a proposal that PASSED the dual-window gate and sits inside the
+        # pre-approved ALLOWED_PARAMS bounds is applied immediately — with a
+        # Telegram notification (铁律: never silent) and an auto-rollback
+        # watcher (autopilot.check_and_rollback reverts it if live results
+        # degrade). Anything outside bounds still queues for approval.
+        if settings.auto_apply_params:
+            try:
+                runtime_config.set_param(key, float(value), source="auto-optimizer")
+                from . import notifier
+                notifier.send(
+                    f"🤖 *自动调参已应用* (预批边界内): {key} {cur} → {value}\n"
+                    f"  依据: {gain}\n  {p.get('rationale', '')}\n"
+                    f"  若后续实盘表现恶化将自动回滚并通知。回复可随时手动改回。")
+                log.info("optimizer: AUTO-APPLIED %s=%s (%s)", key, value, gain)
+                n += 1
+                continue
+            except ValueError as e:
+                log.warning("optimizer: auto-apply rejected (%s) — queuing for approval", e)
         approvals.enqueue(
             kind="param_change",
             detail=f"Gemini (验证过): {key} {cur} → {value} — {gain}. {p.get('rationale', '')}",
@@ -264,6 +324,7 @@ def propose_from_review(review: dict) -> int:
             payload={"key": key, "value": float(value)},
         )
         n += 1
-    log.info("optimizer: %d/%d proposals passed backtest → enqueued",
-             n, len(proposals))
+    log.info("optimizer: %d/%d proposals passed backtest → %s",
+             n, len(proposals),
+             "auto-applied/enqueued" if settings.auto_apply_params else "enqueued")
     return n

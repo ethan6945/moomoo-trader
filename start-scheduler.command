@@ -38,6 +38,15 @@ PID=$!
 disown
 echo "$PID" > logs/scheduler.pid
 
+# Menu-bar status icon: launch it alongside the scheduler (guarded against dupes).
+# It shows "scheduler running" + keep-awake state and quits itself when the
+# scheduler stops. Best-effort — never block the scheduler if it fails.
+if ! { [ -f logs/menubar.pid ] && kill -0 "$(cat logs/menubar.pid)" 2>/dev/null; }; then
+    nohup .venv/bin/python -m src.menubar_app > logs/menubar.log 2>&1 &
+    echo $! > logs/menubar.pid
+    disown
+fi
+
 echo "✓ Scheduler launched (PID $PID, wrapped in caffeinate)"
 echo "  Log:        logs/scheduler.log"
 echo "  Stop:       open the GUI and click ■ Stop, or:"
