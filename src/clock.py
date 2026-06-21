@@ -201,3 +201,86 @@ def force_refresh() -> dict:
         _last_check = None
     _maybe_refresh()
     return status()
+
+
+# ---------- NYSE market session ----------
+# Single source of truth for "is the US market open?" — used by the scheduler
+# (drift-corrected via ny_now()) AND the web dashboard (plain system NY time, no
+# network). Regular trading hours only: 09:30–16:00 ET, weekdays, non-holidays.
+# Half-day early closes are intentionally NOT modelled (matches scan behaviour).
+
+def nyse_holidays(year: int) -> set:
+    """Return the set of NYSE full-day holiday dates for `year`."""
+    from datetime import date, timedelta
+
+    def observed(d: date) -> date:
+        if d.weekday() == 5:   # Saturday → Friday
+            return d - timedelta(days=1)
+        if d.weekday() == 6:   # Sunday → Monday
+            return d + timedelta(days=1)
+        return d
+
+    def nth_weekday(y: int, m: int, wd: int, n: int) -> date:
+        """nth occurrence (1-based) of weekday wd (0=Mon) in month m."""
+        d = date(y, m, 1)
+        d += timedelta(days=(wd - d.weekday()) % 7)
+        return d + timedelta(weeks=n - 1)
+
+    def last_monday(y: int, m: int) -> date:
+        import calendar
+        last = date(y, m, calendar.monthrange(y, m)[1])
+        return last - timedelta(days=last.weekday())   # weekday 0 = Mon
+
+    def easter(y: int) -> date:
+        a = y % 19
+        b, c = divmod(y, 100)
+        d, e = divmod(b, 4)
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i, k = divmod(c, 4)
+        ll = (32 + 2 * e + 2 * i - h - k) % 7
+        m2 = (a + 11 * h + 22 * ll) // 451
+        mo, dy = divmod(114 + h + ll - 7 * m2, 31)
+        return date(y, mo, dy + 1)
+
+    return {
+        observed(date(year, 1, 1)),            # New Year's Day
+        nth_weekday(year, 1, 0, 3),            # MLK Day (3rd Mon Jan)
+        nth_weekday(year, 2, 0, 3),            # Presidents Day (3rd Mon Feb)
+        easter(year) - timedelta(days=2),      # Good Friday
+        last_monday(year, 5),                  # Memorial Day (last Mon May)
+        observed(date(year, 6, 19)),           # Juneteenth
+        observed(date(year, 7, 4)),            # Independence Day
+        nth_weekday(year, 9, 0, 1),            # Labor Day (1st Mon Sep)
+        nth_weekday(year, 11, 3, 4),           # Thanksgiving (4th Thu Nov)
+        observed(date(year, 12, 25)),          # Christmas
+    }
+
+
+def market_session(now: Optional[datetime] = None) -> str:
+    """Coarse NYSE session label for `now`.
+
+    `now` defaults to plain system NY time (instant, no drift check / network) —
+    callers that need drift correction pass `ny_now()` explicitly.
+
+    Returns one of: 'open' | 'premarket' | 'afterhours' | 'weekend' | 'holiday'.
+    'open' == inside 09:30–16:00 ET regular trading hours.
+    """
+    if now is None:
+        now = datetime.now(NY_TZ)
+    if now.weekday() >= 5:
+        return "weekend"
+    if now.date() in nyse_holidays(now.year):
+        return "holiday"
+    minutes = now.hour * 60 + now.minute
+    if minutes < 9 * 60 + 30:
+        return "premarket"
+    if minutes > 16 * 60:
+        return "afterhours"
+    return "open"
+
+
+def market_open(now: Optional[datetime] = None) -> bool:
+    """True iff inside NYSE regular trading hours (weekday, non-holiday, 09:30–16:00 ET)."""
+    return market_session(now) == "open"

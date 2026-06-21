@@ -674,65 +674,17 @@ def scan_once() -> None:
     log.info("=== scan end ===")
 
 
-def _nyse_holidays(year: int) -> set:
-    """Return the set of NYSE full-day holiday dates for `year`."""
-    from datetime import date, timedelta
-
-    def observed(d: date) -> date:
-        if d.weekday() == 5:   # Saturday → Friday
-            return d - timedelta(days=1)
-        if d.weekday() == 6:   # Sunday → Monday
-            return d + timedelta(days=1)
-        return d
-
-    def nth_weekday(y: int, m: int, wd: int, n: int) -> date:
-        """nth occurrence (1-based) of weekday wd (0=Mon) in month m."""
-        d = date(y, m, 1)
-        d += timedelta(days=(wd - d.weekday()) % 7)
-        return d + timedelta(weeks=n - 1)
-
-    def last_monday(y: int, m: int) -> date:
-        import calendar
-        last = date(y, m, calendar.monthrange(y, m)[1])
-        return last - timedelta(days=last.weekday())   # weekday 0 = Mon
-
-    def easter(y: int) -> date:
-        a = y % 19
-        b, c = divmod(y, 100)
-        d, e = divmod(b, 4)
-        f = (b + 8) // 25
-        g = (b - f + 1) // 3
-        h = (19 * a + b - d - g + 15) % 30
-        i, k = divmod(c, 4)
-        ll = (32 + 2 * e + 2 * i - h - k) % 7
-        m2 = (a + 11 * h + 22 * ll) // 451
-        mo, dy = divmod(114 + h + ll - 7 * m2, 31)
-        return date(y, mo, dy + 1)
-
-    hols = {
-        observed(date(year, 1, 1)),            # New Year's Day
-        nth_weekday(year, 1, 0, 3),            # MLK Day (3rd Mon Jan)
-        nth_weekday(year, 2, 0, 3),            # Presidents Day (3rd Mon Feb)
-        easter(year) - timedelta(days=2),      # Good Friday
-        last_monday(year, 5),                  # Memorial Day (last Mon May)
-        observed(date(year, 6, 19)),           # Juneteenth
-        observed(date(year, 7, 4)),            # Independence Day
-        nth_weekday(year, 9, 0, 1),            # Labor Day (1st Mon Sep)
-        nth_weekday(year, 11, 3, 4),           # Thanksgiving (4th Thu Nov)
-        observed(date(year, 12, 25)),          # Christmas
-    }
-    return hols
+# Canonical NYSE calendar now lives in clock.py (shared with the web dashboard).
+# Kept as an alias because executor.py imports it via `from .main import _nyse_holidays`.
+_nyse_holidays = clock.nyse_holidays
 
 
 def in_market_hours() -> bool:
-    now = clock.ny_now()
-    if now.weekday() >= 5:
-        return False
-    if now.date() in _nyse_holidays(now.year):
+    now = clock.ny_now()   # drift-corrected
+    session = clock.market_session(now)
+    if session == "holiday":
         log.info("NYSE holiday today (%s) — skipping scan", now.date())
-        return False
-    minutes = now.hour * 60 + now.minute
-    return 9 * 60 + 30 <= minutes <= 16 * 60
+    return session == "open"
 
 
 def _universe_refresh_job() -> None:
@@ -1196,18 +1148,22 @@ def run_loop() -> None:
     sched.add_job(_monthly_optuna_job, "cron", day=1, hour=3, minute=0,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)
 
-    # Telegram approval sync: every 60s, any time of day. Posts pending
+    # Telegram approval sync: every 5 min, any time of day. Posts pending
     # suggestion cards with Approve/Reject buttons, processes your taps into the
     # shared approval queue, and applies anything you approved (same queue the
     # GUI reads, so both stay in sync). Cheap HTTP; no-op if Telegram unset.
+    # NOTE: this is also what applies owner-approved suggestions off-hours, so an
+    # approval can take up to ~5 min to take effect (during market hours the main
+    # scan also calls apply_approved every scan_interval_min). The GUI popup tells
+    # the owner about this latency.
     def _tg_sync():
         try:
             tg_approvals.sync()
             approvals.apply_approved()   # apply off-hours approvals promptly
         except Exception as e:
             log.debug("tg approval sync failed: %s", e)
-    sched.add_job(_tg_sync, "interval", seconds=60,
-                  coalesce=True, misfire_grace_time=30, max_instances=1)
+    sched.add_job(_tg_sync, "interval", minutes=5,
+                  coalesce=True, misfire_grace_time=120, max_instances=1)
 
     # Autopilot health watchdog: 17:30 ET weekdays (after the close) — detects
     # silent scan stalls, garbage backtest results, overdue jobs, reconcile

@@ -40,7 +40,7 @@ from flask import Flask, jsonify, make_response, redirect, request, send_from_di
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import approvals, db, keepawake, risk_manager  # noqa: E402
+from src import approvals, clock, db, keepawake, risk_manager  # noqa: E402
 from src.config import settings  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -284,25 +284,57 @@ def _stop_pid(pid_file: Path) -> bool:
 
 
 def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
-    """3-state OpenD light: red=not started, yellow=connected-but-not-unlocked,
-    green=unlocked & trading. Inferred WITHOUT opening a second broker connection
-    (which wouldn't share the scheduler's unlock). Green = OpenD socket up AND the
-    scheduler recently wrote a fresh snapshot with cash (a successful accinfo query
-    requires an unlocked trade context)."""
+    """OpenD light, inferred WITHOUT opening a second broker connection (a fresh
+    connection has its own unlock state and wouldn't reflect the scheduler's).
+    Evidence that OpenD is unlocked = the scheduler has written an account
+    snapshot with a real cash figure, since the writer only persists after a
+    successful accinfo query and that requires an unlocked trade context.
+
+      red    — OpenD socket unreachable (not started)
+      green  — unlocked + market open + snapshot fresh → live & trading
+      blue   — unlocked but market closed → the scheduler stops scanning off-hours
+               so the snapshot ages out BY DESIGN; this is normal rest, not a lock
+               problem (this is the state that used to mislead as 未解锁/未确认)
+      yellow — reachable but no proof of unlock, OR snapshot stale during regular
+               hours (scheduler stalled / OpenD got re-locked → needs attention)
+    """
     try:
         with socket.create_connection((settings.moomoo_host, settings.moomoo_port), timeout=0.6):
-            reachable = True
+            pass
     except Exception:
-        reachable = False
-    if not reachable:
         return "red", "OpenD 未启动"
+
+    # A written snapshot always reflects a SUCCESSFUL accinfo query (the writer
+    # bails before writing if the query raises), so a present cash figure — even
+    # 0.0 on a fully-invested account — proves the context was unlocked.
+    unlocked_ever = acct.get("cash") is not None
     interval = (acct.get("scan_interval_min") or 30) * 60
     try:
-        fresh = (time.time() - ACCOUNT_FILE.stat().st_mtime) < (interval * 2 + 300)
+        age = time.time() - ACCOUNT_FILE.stat().st_mtime
     except Exception:
-        fresh = False
-    if sched_running and fresh and acct.get("cash"):
+        age = float("inf")
+    fresh = age < (interval * 2 + 300)
+
+    session = clock.market_session()   # plain system NY time — no network/drift cost
+    market_open = session == "open"
+
+    if sched_running and unlocked_ever and market_open and fresh:
         return "green", "已解锁 · 可交易"
+
+    # Off-hours: scanning intentionally pauses, so a stale snapshot is expected.
+    # As long as the last session proved unlock and the snapshot isn't ancient
+    # (tolerate a Fri-close→Mon-open weekend plus an adjacent holiday), report
+    # unlocked-but-resting instead of the alarming 未解锁.
+    OFF_HOURS_GRACE = 4 * 24 * 3600   # 4 days
+    if sched_running and unlocked_ever and not market_open and age < OFF_HOURS_GRACE:
+        label = {
+            "premarket":  "已解锁 · 待开盘",
+            "afterhours": "已解锁 · 已收盘",
+            "weekend":    "已解锁 · 周末休市",
+            "holiday":    "已解锁 · 假期休市",
+        }.get(session, "已解锁 · 休市")
+        return "blue", label
+
     return "yellow", "已连接 · 未解锁/未确认"
 
 

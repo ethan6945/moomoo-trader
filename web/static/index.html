@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+<meta name="theme-color" content="#0a0d14"/>
+<meta name="color-scheme" content="dark"/>
 <title>MooMoo Trader</title>
 <style>
   :root{
@@ -176,13 +178,11 @@
     <div class="statbar"><div class="statline" id="statline"></div></div>
 
     <div class="dash-lower">
-      <!-- A: positions + equity (top-left) -->
+      <!-- A: positions (top-left, enlarged — fills the cell now that equity moved out) -->
       <div class="cell">
-        <div class="panel p-pos"><h3 data-i18n="positions">持仓</h3><div id="posWrap" class="scroll" style="max-height:168px"><table id="posTbl"><thead><tr>
+        <div class="panel p-pos grow"><h3 data-i18n="positions">持仓</h3><div id="posWrap" class="scroll"><table id="posTbl"><thead><tr>
           <th data-i18n="c_sym">代码</th><th data-i18n="c_qty">数量</th><th data-i18n="c_entry">入场</th><th data-i18n="c_last">现价</th><th data-i18n="c_stop">止损</th><th data-i18n="c_tp">止盈</th><th data-i18n="c_strat">策略</th><th>P&amp;L</th></tr></thead><tbody></tbody></table></div>
           <div class="empty hidden" id="posEmpty" data-i18n="no_pos">🌙 当前无持仓</div></div>
-        <div class="panel p-eq grow"><h3 data-i18n="equity">净值曲线 · 累计已实现</h3>
-          <div class="eqwrap"><canvas id="eqDash"></canvas><div id="eqTip" class="eqtip hidden"></div></div></div>
       </div>
       <!-- B: trade record (top-right) -->
       <div class="cell">
@@ -195,9 +195,10 @@
       <div class="cell">
         <div class="panel p-act grow"><h3 data-i18n="activity">近期动态</h3><div class="log" id="log"></div></div>
       </div>
-      <!-- D: approvals (bottom-right) -->
+      <!-- D: equity curve (bottom-right, moved here from A) -->
       <div class="cell">
-        <div class="panel p-appr grow"><h3 data-i18n="approvals">待批准建议</h3><div class="scroll" id="apprList"></div></div>
+        <div class="panel p-eq grow"><h3 data-i18n="equity">净值曲线 · 累计已实现</h3>
+          <div class="eqwrap"><canvas id="eqDash"></canvas><div id="eqTip" class="eqtip hidden"></div></div></div>
       </div>
     </div>
   </div>
@@ -258,6 +259,15 @@
       <button class="primary sm" id="btnBt">Run backtest</button>
       <span id="btStatus" class="mut" style="margin-left:10px"></span>
       <div id="btResult" style="margin-top:14px"></div></div>
+  </div>
+
+  <!-- PENDING-APPROVALS POPUP (checked once each time you open the web UI) -->
+  <div id="apprModal" class="modal hidden">
+    <div class="modal-box" style="width:min(520px,94vw)">
+      <div class="modal-head"><h2>🔔 <span data-i18n="approvals">待批准建议</span></h2><button class="sm" id="btnCloseAppr">✕</button></div>
+      <div data-i18n="appr_note" style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.5">✅ 批准后约 5 分钟内自动执行(后台每 5 分钟同步一次;盘中扫描也会触发)</div>
+      <div id="apprList"></div>
+    </div>
   </div>
 
   <!-- SETTINGS MODAL -->
@@ -321,7 +331,9 @@ async function api(p,opts){
   return data;
 }
 
+let CURTAB='dash';
 function setTab(t){
+  CURTAB=t;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
   ['dash','hist','sig','bt'].forEach(x=>$('#tab-'+x).classList.toggle('hidden',x!==t));
   if(t==='hist')loadHistory(); if(t==='sig')loadSignal(); if(t==='bt')loadBt();
@@ -340,7 +352,7 @@ async function refresh(){
   bs.innerHTML=run?'● Running':'▶ Start';
   bs.disabled=run; bs.style.background=run?'#2ea043':''; bs.style.borderColor=run?'#2ea043':'';
   const st=$('#btnStop'); st.disabled=!run; st.innerHTML='■ Stop';
-  const oc={red:'#f85149',yellow:'#d29922',green:'#3fb950'}[a.opend_status]||'#8b949e';
+  const oc={red:'#f85149',yellow:'#d29922',green:'#3fb950',blue:'#388bfd'}[a.opend_status]||'#8b949e';
   $('#opend').innerHTML=`<span class="dot" style="background:${oc}"></span>${a.opend_label||'OpenD'}`;
   $('#opend').style.borderColor=oc+'66';
   const env=a.trade_env||'—', real=env==='REAL';
@@ -393,7 +405,7 @@ async function refresh(){
   const pnlCell=p=>{const v=Number(p.pl_val);if(typeof p.last!=='number'||!isFinite(v))return '<td>—</td>';
     return `<td class="${cls(v)}">${(v>=0?'+':'-')}$${Math.abs(v).toFixed(2)} (${(p.pl_ratio>=0?'+':'')}${(p.pl_ratio||0).toFixed(1)}%)</td>`;};
   $('#posTbl tbody').innerHTML=syms.map(s=>{const p=pp[s];return `<tr><td class="strong">${s}</td><td>${p.qty??''}</td><td>${px(p.entry_price)}</td><td>${px(p.last)}</td><td class="neg">${px(p.stop_loss)}</td><td class="pos">${px(p.take_profit)}</td><td><span class="tag">${p.strategy||'—'}</span></td>${pnlCell(p)}</tr>`;}).join('');
-  refreshApprovals(); refreshLog();
+  refreshLog();
 }
 function renderTradeRec(sm){
   const wr=sm.win_rate??0, n=sm.count??0, L=I18N[LANG];
@@ -409,7 +421,7 @@ async function refreshClosed(){
   let rows; try{rows=await api('/api/closed?n=400');}catch(e){return;}
   let eq=0; EQ=rows.map(r=>{eq+=(r.pnl||0);return {d:(r.ts||'').slice(0,10),y:eq};}); drawEqDash();
   $('#recentTbl tbody').innerHTML=rows.slice(-6).reverse().map(r=>
-    `<tr><td class="mut" style="width:46px">${(r.ts||'').slice(5,10)}</td><td class="strong">${r.symbol}</td><td class="mut">${r.exit_reason||''}</td>
+    `<tr><td class="mut" style="width:60px">${(r.ts||'').slice(5,10)}</td><td class="strong">${r.symbol}</td><td class="mut">${r.exit_reason||''}</td>
      <td class="${cls(r.pnl)}" style="text-align:right">${sign(r.pnl)}</td></tr>`).join('')
     || `<tr><td class="mut">${I18N[LANG].notrades}</td></tr>`;
 }
@@ -427,15 +439,37 @@ async function refreshLog(){
   }).join('');
   if(atBottom)box.scrollTop=box.scrollHeight;
 }
-async function refreshApprovals(){
-  const items=(await api('/api/approvals')).filter(x=>x.status==='pending');
+// Pending approvals are no longer a permanent panel — checked once when you open
+// the web UI; if anything is waiting, it pops up in a modal. Approving/rejecting
+// re-renders the list and auto-closes when nothing is left.
+// PENDING_APPR caches the pending count so the 🧠 pill can show "N 待批" WITHOUT
+// polling /api/approvals every 4s — it's set on page open (checkApprovals) and
+// updated when you approve/reject (resolve). New approvals that arrive while the
+// page is open show up after a refresh, in line with "only check on open".
+let PENDING_APPR=0;
+function renderApprList(items){
   const el=$('#apprList');
-  if(!items.length){el.innerHTML=`<div class="empty">✓ ${I18N[LANG].noappr}</div>`;return;}
+  if(!items.length){$('#apprModal').classList.add('hidden');return;}
   el.innerHTML=items.map(a=>`<div class="appr"><div class="txt">${a.detail||a.kind}<div class="act">→ ${a.action||''}</div></div>
      <button class="primary sm" onclick="resolve('${a.id}','approve')">✓</button>
      <button class="danger sm" onclick="resolve('${a.id}','reject')">✗</button></div>`).join('');
 }
-async function resolve(id,act){await api(`/api/approvals/${id}/${act}`,{method:'POST'});refreshApprovals();}
+async function checkApprovals(){
+  let items; try{items=(await api('/api/approvals')).filter(x=>x.status==='pending');}catch(e){return;}
+  PENDING_APPR=items.length;               // cache for the 🧠 pill
+  if(!items.length)return;                 // nothing waiting → stay quiet
+  renderApprList(items);
+  $('#apprModal').classList.remove('hidden');
+}
+async function resolve(id,act){
+  await api(`/api/approvals/${id}/${act}`,{method:'POST'});
+  let items=[]; try{items=(await api('/api/approvals')).filter(x=>x.status==='pending');}catch(e){}
+  PENDING_APPR=items.length;               // keep the cached count in sync
+  renderApprList(items);                    // auto-closes when the last one is handled
+  refreshRetrain();                         // update the 🧠 pill count right away
+}
+$('#btnCloseAppr').onclick=()=>$('#apprModal').classList.add('hidden');
+$('#apprModal').onclick=e=>{if(e.target.id==='apprModal')$('#apprModal').classList.add('hidden');};
 
 // ── reusable interactive equity chart (gradient fill + hover tooltip) ──
 function eqChart(canvasSel, tipSel, pts){
@@ -483,10 +517,9 @@ async function refreshRetrain(){
   let d; try{d=await api('/api/self-review');}catch(e){return;}
   const el=$('#retrain'); const r=d.report;
   RETRAIN_LAST=d.ran_at||null;
-  // "建议" count = LIVE pending approvals (drops to 0 once you approve/reject),
-  // NOT the frozen snapshot count from when the review last ran.
-  let pend=0; try{pend=(await api('/api/approvals')).filter(x=>x.status==='pending').length;}catch(e){pend=null;}
-  const ns = pend==null ? (r&&(r.suggestions||[]).length) : pend;
+  // "建议" count = cached pending approvals (PENDING_APPR), updated on page open
+  // and whenever you approve/reject — no 4s polling of /api/approvals.
+  const ns = PENDING_APPR;
   if(!r){el.innerHTML='🧠 '+(LANG==='en'?'never run':'未运行');el.style.color='#8b949e';el.title=(LANG==='en'?'Weekly self-review — click to run now':'每周自省/重训 — 点击立即运行一次');return;}
   const when=d.ran_at?new Date(d.ran_at).toLocaleString():'—';
   if(!r.n_trades){el.innerHTML='🧠 '+(LANG==='en'?'no fills':'无成交');el.style.color='#8b949e';}
@@ -572,14 +605,14 @@ const I18N={
       unreal:'浮动盈亏 · 持仓',pos_unit:'笔持仓',
       trades:'总交易笔数',winrate:'胜率',pf:'盈利因子',net:'净盈亏',cash:'现金',openrisk:'敞口风险 / 上限',lastscan:'上次扫描',
       c_sym:'代码',c_qty:'数量',c_entry:'入场',c_last:'现价',c_stop:'止损',c_tp:'止盈',c_strat:'策略',
-      no_pos:'🌙 当前无持仓',notrades:'暂无平仓记录',noappr:'暂无待批准建议',
+      no_pos:'🌙 当前无持仓',notrades:'暂无平仓记录',noappr:'暂无待批准建议',appr_note:'✅ 批准后约 5 分钟内自动执行(后台每 5 分钟同步一次;盘中扫描也会触发)',
       sig_desc:'独立信号 watchlist — 🌅盘前简报@08:30 · 🔄开盘1小时复盘@10:30 · 🏁收盘对账@16:10 (ET)。',sig_stopped:'已停止',sig_brief:'盘前简报',sig_review:'盘中复盘',sig_close:'收盘对账',sig_wl:'信号 Watchlist',sig_add:'添加',sig_save:'保存',sig_reload:'刷新日志'},
   en:{t_dash:'Dashboard',t_hist:'History',t_sig:'Signal',t_bt:'Backtest',positions:'Open Positions',equity:'Equity · cumulative realized',
       activity:'Recent Activity',record:'Trade Record',approvals:'Pending Approvals',deployed:'Deployed / Budget',today:"Today P&L · realized",total:'Total P&L · cum. realized',
       unreal:'Unrealized P&L · open',pos_unit:'position(s)',
       trades:'Total Trades',winrate:'Win rate',pf:'Profit factor',net:'Net P&L',cash:'Cash',openrisk:'Open risk / cap',lastscan:'Last scan',
       c_sym:'Symbol',c_qty:'Qty',c_entry:'Entry',c_last:'Last',c_stop:'Stop',c_tp:'TP',c_strat:'Strategy',
-      no_pos:'🌙 No open positions',notrades:'No closed trades',noappr:'No pending suggestions',
+      no_pos:'🌙 No open positions',notrades:'No closed trades',noappr:'No pending suggestions',appr_note:'✅ Approved items run within ~5 min (backend syncs every 5 min; market scans also apply them)',
       sig_desc:'Independent signal watchlist — 🌅Premarket brief@08:30 · 🔄Open+1h review@10:30 · 🏁Close recap@16:10 (ET).',sig_stopped:'Stopped',sig_brief:'Premarket brief',sig_review:'Open+1h review',sig_close:'Close recap',sig_wl:'Signal Watchlist',sig_add:'Add',sig_save:'Save',sig_reload:'Reload log'}
 };
 let LANG=localStorage.getItem('lang')||'zh';
@@ -688,8 +721,21 @@ function renderHist(){
   let eq=0; const pts=rows.map(r=>{eq+=(r.pnl||0);return {d:(r.ts||'').slice(0,10),y:eq};});
   eqChart('#eqHist','#eqHistTip',pts);
 }
+let SIG_LOG_CACHE=null;
+// 跟随最新输出（像终端 tail -f）：贴在底部就自动滚到底，新内容一直顶到最新；
+// 若用户主动往上拉看历史则保持其位置不打扰。forceBottom=用户主动开标签/点刷新时强制看最新。
+async function refreshSigLog(forceBottom){
+  const box=$('#sigLog'); if(!box)return;
+  let lines; try{lines=await api('/api/signal-log?n=200');}catch(e){return;}
+  const txt=lines.join('\n')||(LANG==='zh'?'暂无信号日志。点 🌅盘前简报 / 🔄盘中复盘 / 🏁收盘对账 触发。':'No signal log yet. Trigger 🌅Brief / 🔄Review / 🏁Close.');
+  if(txt===SIG_LOG_CACHE&&!forceBottom)return;   // 没有新内容就别动滚动条
+  const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<24;
+  const prevTop=box.scrollTop;
+  box.textContent=txt; SIG_LOG_CACHE=txt;
+  box.scrollTop=(forceBottom||atBottom)?box.scrollHeight:prevTop;
+}
 async function loadSignal(){
-  $('#sigLog').textContent=(await api('/api/signal-log?n=200')).join('\n')||(LANG==='zh'?'暂无信号日志。点 🌅盘前简报 / 🔄盘中复盘 / 🏁收盘对账 触发。':'No signal log yet. Trigger 🌅Brief / 🔄Review / 🏁Close.');
+  await refreshSigLog(true);   // 主动打开/刷新 → 直接跳到最新
   refreshSigStatus(); loadSigWatchlist();
 }
 async function refreshSigStatus(){
@@ -742,6 +788,9 @@ $('#btnBt').onclick=async()=>{await api('/api/backtest',{method:'POST',headers:{
   document.body.classList.toggle('light',t==='light');
   document.querySelectorAll('[data-i18n]').forEach(e=>{const m=I18N[LANG]&&I18N[LANG][e.dataset.i18n];if(m)e.textContent=m;});})();
 refresh();setInterval(refresh,4000);
+checkApprovals();   // one-time pending-approvals popup on page open
+// 信号日志在 Signal 标签打开时每 4s 自动 tail 跟随最新（终端 tail -f 体验）
+setInterval(()=>{if(CURTAB==='sig')refreshSigLog(false);},4000);
 {const t=(location.hash||'').slice(1); if(['dash','hist','sig','bt'].includes(t))setTab(t);
  if(t==='settings'||t==='access'){loadSettings().then(()=>{$('#settingsModal').classList.remove('hidden');
    if(t==='access')setTimeout(()=>$('#secAccess').scrollIntoView({block:'start'}),150);});}}
