@@ -286,6 +286,9 @@ def _open_position_locked(client: MoomooClient, signal: Signal, qty: int,
             "low_water": limit_px,
             "ml_proba_entry": ml_proba,
             "strategy": getattr(signal, "strategy", "trend"),
+            # Pattern strategy: remember which chart pattern triggered the entry
+            # so the dashboard/GUI can badge it (None for the other strategies).
+            "pattern": (getattr(signal, "meta", {}) or {}).get("pattern_type"),
             "stacks": 1,
         }
 
@@ -493,13 +496,22 @@ def _force_close(client: MoomooClient, symbol: str, trade: dict,
 
 
 def _manage_one(client: MoomooClient, symbol: str, trade: dict,
-                trades: dict, actions: list[dict]) -> None:
+                trades: dict, actions: list[dict], stops_only: bool = False) -> None:
     """Manage ONE open position for a single scan cycle.
 
     Mutates `trades` (pops on close) and `actions` (appends every action) in
     place. Factored out of manage_open_trades so the caller can wrap each symbol
     in try/except — that way one halted/anomalous name can never abort the
-    management of the others (each `continue` here is just a `return`)."""
+    management of the others (each `continue` here is just a `return`).
+
+    stops_only=True (the fast-stop loop, src/main.py) runs ONLY the time-critical
+    protective exits — breakeven ratchet + soft stop-loss for soft positions, and
+    the broker bracket fill-check for REAL — then returns. Stall-out / max-hold /
+    partials / take-profit are day-granularity and stay on the 5-min tick + scan."""
+    # Owner-held manual position (a pending-review orphan, or a HIGH-risk manual
+    # adoption whose takeover you haven't approved) — OFF-LIMITS to every auto-exit.
+    if trade.get("user_managed"):
+        return
     has_bracket = bool(trade.get("stop_order_id") and trade.get("tp_order_id"))
 
     # --- REAL bracket path: OCO check + stall-out + max-hold (broker owns SL/TP) ---
@@ -508,6 +520,10 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
         if bracket_action is not None:
             actions.append(bracket_action)
             trades.pop(symbol)
+            return
+        # Fast-stop loop: the broker owns SL/TP, so the cheap fill-check above is
+        # all the protective work needed — skip the housekeeping exits below.
+        if stops_only:
             return
         # Bracket still alive. The bot owns two housekeeping exits on top of it:
         # stall-out (free idle capital) and the max-hold timeout.
@@ -586,6 +602,12 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
         actions.append({"type": "stop_hit", "symbol": symbol, "price": last,
                         "qty": trade["qty"], "stop": trade["stop_loss"], "pnl": pnl})
         trades.pop(symbol)
+        return
+
+    # Fast-stop loop: protective checks (breakeven ratchet + soft stop) are done.
+    # The exits below (stall-out / max-hold / partials / TP) are day-granularity
+    # and stay on the 5-min manage tick + the scan.
+    if stops_only:
         return
 
     # Stall-out: if position has gone nowhere for 3+ business days, close.
@@ -680,6 +702,38 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
         return _manage_open_trades_locked(client)
 
 
+def manage_stops_only(client: MoomooClient) -> list[dict]:
+    """Lightweight protective-exit pass for the fast-stop loop (src/main.py).
+
+    Checks ONLY the breakeven ratchet + soft stop-loss on soft-tracked positions
+    and broker bracket fills on REAL positions — the time-critical, capital-
+    protecting exits. Deliberately SKIPS stall-out / max-hold / partials / TP /
+    blacklist / gap-sentinel / over-cap flush; those are day-granularity and stay
+    on the 5-min manage tick + the scan. Shares _TRADES_LOCK with the full manage
+    pass so the two never clobber the open-trades store.
+
+    Motivation: SIMULATE has no native STOP order, so a soft stop otherwise waits
+    for the 5-min tick (the live audit measured a ~−1.38R late-fill overshoot from
+    that lag). Running this every FAST_STOP_SECONDS shrinks the overshoot to a few
+    seconds of a bar. In REAL it doubles as a fast OCO-fill detector that frees the
+    slot (and cancels the opposite leg) promptly."""
+    with _TRADES_LOCK:
+        trades = _load_open_trades()
+        if not trades:
+            return []
+        actions: list[dict] = []
+        for symbol, trade in list(trades.items()):
+            try:
+                _manage_one(client, symbol, trade, trades, actions, stops_only=True)
+            except Exception as e:
+                # Per-symbol isolation, same as the full pass: one halted/anomalous
+                # name must never abort protective management of the rest.
+                log.exception("fast-stop manage %s failed (skip this symbol): %s",
+                              symbol, e)
+        _save_open_trades(trades)
+        return actions
+
+
 def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
     """Per-scan housekeeping: stale order cancel → OCO bracket check → soft fallback.
 
@@ -704,7 +758,12 @@ def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
         blacklisted = set()
 
     trades = _load_open_trades()
+    # Owner-held manual positions are off-limits to EVERY auto-exit below
+    # (blacklist / gap-sentinel / over-cap flush / per-symbol manage).
+    _skip = {s for s, t in trades.items() if t.get("user_managed")}
     for symbol in list(trades.keys()):
+        if symbol in _skip:
+            continue
         if symbol in blacklisted:
             last = _last_price(client, symbol)
             if last is None:
@@ -735,6 +794,8 @@ def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
     if _settings.gap_sentinel_enabled:
         from . import gap_sentinel
         for symbol in list(trades.keys()):
+            if symbol in _skip:
+                continue
             try:
                 # RTH per-scan: earnings layer always; AI only if intraday AI is on
                 # (default off → no per-scan Gemini cost; pre-market job does AI).
@@ -764,14 +825,54 @@ def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
             except Exception as e:
                 log.warning("gap-sentinel close %s failed: %s", symbol, e)
 
+    # --- Auto-flush 0.6: smart exit (AI bearish-catalyst / algo lock-profit) ---
+    # Broader than the gap sentinel: exit a held long DURING the day when the
+    # picture turns bearish — concrete bad news (AI) or a technical break-down
+    # while in profit (algo lock-profit). Reuses the same _force_close + notify.
+    # DEFAULT OFF; FAIL-SAFE (smart_exit.assess holds on any doubt/error).
+    if _settings.smart_exit_enabled:
+        from . import smart_exit
+        for symbol in list(trades.keys()):
+            if symbol in _skip:
+                continue
+            last = _last_price(client, symbol)
+            if last is None:
+                continue   # halted/anomalous — don't sell at $0, re-check next scan
+            try:
+                should_exit, reason, _conf = smart_exit.assess(
+                    symbol, trades[symbol], last, client)
+            except Exception as e:
+                log.warning("smart-exit assess %s failed: %s — holding", symbol, e)
+                continue
+            if not should_exit:
+                continue
+            try:
+                pnl, action = _force_close(client, symbol, trades[symbol],
+                                           last, "SMART_EXIT")
+                actions.append(action)
+                trades.pop(symbol)
+                log.warning("Smart-exit close: %s @ $%.2f (pnl=%.2f) — %s",
+                            symbol, last, pnl, reason)
+                try:
+                    from . import notifier
+                    notifier.send(f"🤖 智能退出: {symbol} @ ${last:.2f} "
+                                  f"(已实现 ${pnl:+.0f}) — {reason}")
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning("smart-exit close %s failed: %s", symbol, e)
+
     # --- Auto-flush 1: over-capacity flush ---
     # If we hold MORE than MAX_POSITIONS (e.g. user just tightened the cap),
     # close the worst-performing one (most negative unrealized R) to free a slot.
+    # Over-cap counts only BOT-managed names; owner-held manual positions don't
+    # consume a bot slot and can't be flushed.
+    managed = {s: t for s, t in trades.items() if s not in _skip}
     cap = risk_manager.max_positions()
-    if len(trades) > cap:
-        excess = len(trades) - cap
+    if len(managed) > cap:
+        excess = len(managed) - cap
         per_symbol_r: list[tuple[str, float]] = []
-        for symbol, trade in trades.items():
+        for symbol, trade in managed.items():
             last = _last_price(client, symbol)
             if last is None:
                 continue   # halted name can't be ranked/flushed this cycle

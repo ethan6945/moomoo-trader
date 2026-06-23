@@ -295,8 +295,12 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
       blue   — unlocked but market closed → the scheduler stops scanning off-hours
                so the snapshot ages out BY DESIGN; this is normal rest, not a lock
                problem (this is the state that used to mislead as 未解锁/未确认)
-      yellow — reachable but no proof of unlock, OR snapshot stale during regular
-               hours (scheduler stalled / OpenD got re-locked → needs attention)
+      yellow — reachable but worth a look; the label says which of three, and only
+               claims 未解锁 when we genuinely never confirmed an unlock:
+                 · 已连接 · 未解锁/未确认 — no successful accinfo ever (no cash written)
+                 · 已解锁 · 调度器已停    — was unlocked but the scheduler isn't running
+                 · 已解锁 · 连接中…       — scheduler up but snapshot stale (just
+                                            restarted / catching up / stalled)
     """
     try:
         with socket.create_connection((settings.moomoo_host, settings.moomoo_port), timeout=0.6):
@@ -335,7 +339,13 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
         }.get(session, "已解锁 · 休市")
         return "blue", label
 
-    return "yellow", "已连接 · 未解锁/未确认"
+    # 走到这里 = 既非绿(可交易)也非蓝(休市)。快照里写过 cash 就证明 OpenD 曾被
+    # 成功解锁,这类情况别再谎报 未解锁 —— 真正的问题在调度器/快照,不在锁本身。
+    if unlocked_ever:
+        if not sched_running:
+            return "yellow", "已解锁 · 调度器已停"     # OpenD 正常;调度器没跑 → 去重启调度器
+        return "yellow", "已解锁 · 连接中…"            # 调度器在跑但快照不新鲜:刚重启/追赶中/卡住
+    return "yellow", "已连接 · 未解锁/未确认"            # 从没成功取过资金 → 确实无法确认已解锁
 
 
 def _trade_summary() -> dict:
@@ -406,6 +416,12 @@ def api_status():
             cell["take_profit"] = tr.get("take_profit")
             cell["atr"]         = tr.get("atr")
             cell["strategy"]    = tr.get("strategy")
+            cell["pattern"]     = tr.get("pattern")   # chart pattern (pattern strategy only)
+            # Manual-adoption status so the web can badge YOUR own moomoo-app buys
+            # and show whether the bot has taken over or you're self-managing.
+            cell["manual_adopted"] = bool(tr.get("manual_adopted"))
+            cell["user_managed"]   = bool(tr.get("user_managed"))
+            cell["adopt_risk"]     = tr.get("adopt_risk")
         acct["per_position"] = pp
     except Exception:
         pass
@@ -561,24 +577,88 @@ def api_budget():
     return jsonify({"ok": True, "budget": val})
 
 
+def _spawn_scheduler() -> int:
+    """Launch the trading scheduler as a detached, caffeinated process and record
+    its pid. Shared by the start + restart actions so they stay byte-identical."""
+    log = (ROOT / "logs" / "scheduler.log").open("a")
+    proc = subprocess.Popen(
+        ["/usr/bin/caffeinate", "-is", str(VENV_PY), "-m", "src.main", "run"],
+        cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
+    )
+    SCHED_PID.write_text(str(proc.pid))
+    _launch_menubar()
+    return proc.pid
+
+
 @app.route("/api/scheduler/<action>", methods=["POST"])
 def api_scheduler(action):
     if action == "start":
         if _scheduler_running():
             return jsonify({"ok": True, "note": "already running"})
-        log = (ROOT / "logs" / "scheduler.log").open("a")
-        proc = subprocess.Popen(
-            ["/usr/bin/caffeinate", "-is", str(VENV_PY), "-m", "src.main", "run"],
-            cwd=str(ROOT), stdout=log, stderr=log, start_new_session=True,
-        )
-        SCHED_PID.write_text(str(proc.pid))
-        _launch_menubar()
-        return jsonify({"ok": True, "pid": proc.pid})
+        return jsonify({"ok": True, "pid": _spawn_scheduler()})
     if action == "stop":
         had = _stop_pid(SCHED_PID)
         return jsonify({"ok": True, "running": _scheduler_running(),
                         "note": "not running" if not had else "stopped"})
+    if action == "restart":
+        # _stop_pid blocks until the old process group is gone (or ~3s), so a
+        # fresh spawn afterwards can't collide with it. Picks up the latest .env
+        # (e.g. a just-flipped MOOMOO_TRADE_ENV).
+        _stop_pid(SCHED_PID)
+        return jsonify({"ok": True, "pid": _spawn_scheduler(), "note": "restarted"})
     return jsonify({"ok": False, "error": "bad action"}), 400
+
+
+@app.route("/api/trade-env", methods=["GET", "POST"])
+def api_trade_env():
+    """SIMULATE ⟷ REAL toggle. The trade env is read from .env when the scheduler
+    process starts, so a change is written to .env here and applied by restarting
+    the scheduler (the toggle UI offers the restart). GET reports the .env value
+    (what the next start uses), the live value the running scheduler last reported,
+    and the open-position count for the go-live safety check."""
+    if request.method == "GET":
+        env_file = (_read_env().get("MOOMOO_TRADE_ENV") or "SIMULATE").upper()
+        acct = _read_json(ACCOUNT_FILE, {})
+        env_live = (acct.get("trade_env") or "").upper() or None
+        try:
+            n_open = len(db.load_open_trades())
+        except Exception:
+            n_open = 0
+        return jsonify({
+            "env_file": env_file, "env_live": env_live,
+            "running": _scheduler_running(), "open_positions": n_open,
+            "pending_restart": bool(env_live and env_live != env_file),
+        })
+
+    body = request.json or {}
+    target = (body.get("env") or "").upper()
+    if target not in ("SIMULATE", "REAL"):
+        return jsonify({"ok": False, "error": "env 必须是 SIMULATE 或 REAL"}), 400
+
+    # Going REAL is real money — guard it: explicit confirm, trade password set,
+    # and a FLAT book (so the local open-trades state can't be mistaken for / act
+    # on the real account it was never opened in).
+    if target == "REAL":
+        if not body.get("confirm"):
+            return jsonify({"ok": False, "error": "切换到实盘需要二次确认"}), 400
+        if not _read_env().get("MOOMOO_TRADE_PWD"):
+            return jsonify({"ok": False,
+                            "error": "未设置 MOOMOO_TRADE_PWD（6 位交易密码）— 无法切到实盘"}), 400
+        try:
+            n_open = len(db.load_open_trades())
+        except Exception:
+            n_open = 0
+        if n_open > 0:
+            return jsonify({"ok": False,
+                            "error": f"当前还有 {n_open} 个未平仓持仓（模拟盘）。请先全部平仓再切实盘，"
+                                     f"否则本地持仓状态会和实盘账户串号。"}), 409
+
+    _write_env_key("MOOMOO_TRADE_ENV", target)
+    note = ("已切到实盘 💵 — 点「重启」后生效。首次实盘务必只放小额，先验证下单链路。"
+            if target == "REAL"
+            else "已切回模拟 🧪 — 点「重启」后生效。")
+    return jsonify({"ok": True, "env": target, "note": note,
+                    "restart_required": True, "running": _scheduler_running()})
 
 
 # ── keep-awake toggle ("caffeinate" — Amphetamine-style) ───────────────────────

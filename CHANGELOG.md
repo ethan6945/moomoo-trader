@@ -1,5 +1,69 @@
 # CHANGELOG
 
+## 2026-06-23 — Phase 2：moomoo 式 AI 智能退出 / 加权选股 / 期权流骨架
+
+复刻 moomoo 个股 AI 分析卡的能力（新闻情绪 + 技术 + 期权异动），接进现有风控。全部默认关、FAIL-SAFE、Gemini 全用 ≥3.5-flash。
+
+- **2A AI 智能退出** — `src/smart_exit.py`(新) + `ai_validator.assess_exit()`：持仓盘中遇
+  「具体坏消息/分析师下调/板块转空」(AI) 或「技术明确破位且已盈利」(算法锁盈) 时强制提前退出，
+  不等价格 TP。接在 `executor.manage_open_trades` 现有 gap-sentinel 块旁（5 分钟 tick），命中走
+  **同一个 `_force_close`**（零新增执行代码）。配置 `SMART_EXIT_*`（默认关）。`SMART_EXIT_MIN_PROFIT_R`
+  门控算法锁盈（浮盈≥N×R 才落袋，避免割没赚的单；AI 坏消息路径不受此限）。已验证：算法锁盈/盈利门控/
+  禁用/无 key FAIL-SAFE 全正确（实测一次 Gemini 撞到 Google 地区限制 400→正确 HOLD 不崩）。
+- **2B moomoo 式加权选股** — `ai_validator.assess_sentiment()`：每个买入候选用 Gemini 融合
+  新闻+分析师目标价方向+技术理由(sig.reasons)→ 0-100 看好度（50中性）。`main.py` 评分处接入，
+  **默认 advisory**（写审计 extra，不改成交集→保回测平价）；可选 `SENTIMENT_SIZING` 折进 conviction
+  仓位（仍不改选择）。配置 `SENTIMENT_*`（默认关）。
+- **2C 宽 TP 验证** — 回测网格证明用户「降 TP/SL 增收益」直觉是**反的**：降 TP/SL 不增加交易数、
+  反砍收益（把赢家提前砍掉）、收紧 SL 直接亏；**调宽** TP（2.0/2.5×ATR）才最优。受 moomoo 小时数据
+  ~150d 上限所限无法做真多窗口验证，故不自动改 `.env`，留 SIMULATE 观察后由 owner 定。
+- **2D 期权异动（已激活并接入）** — `src/options_flow.py`(新)：volume≫OI、put/call 偏斜检测。
+  owner 订阅美股期权 LV1 + 重启 OpenD 后**数据已通**（实测 MU/AAPL 返回真实 volume+未平仓）。
+  `assess()` 只取**平值附近** ±15% 行权价（不抓全 850 腿）、**自带 20s 线程超时**（shutdown
+  wait=False，绝不卡住 5 分钟 tick / 扫描循环）。已接入 **2A**（smart_exit：喂给 AI 退出 prompt +
+  「期权流看空且盈利→锁盈」硬规则）和 **2B**（assess_sentiment 第 4 因子）。默认关
+  （`OPTIONS_FLOW_ENABLED=false`），开启后才参与。修了两个 bug：option_type 列名冲突、
+  ThreadPoolExecutor `with` 的 shutdown(wait=True) 抵消超时。
+- **API/订阅健康看门狗** — `src/health_check.py`(新) + `HEALTH_CHECK_*` 配置（**默认开**，owner 要求）。
+  每 30 分钟 + 启动时探测 ① moomoo 期权数据 ② Gemini API，**边沿触发**（仅状态变化才发 Telegram，
+  带 2 次去抖防闪断刷屏）：订阅过期/无权限 → 告警续订；Gemini 配额/余额耗尽/key 失效/地区限制 → 告警
+  充值（级联已是单模型 3.5-flash 无静默降级）。瞬时错误（OpenD 离线、503）归类 skip 不误报。挂在
+  `main.py` 调度器（紧邻现有 17:30 `_watchdog_job`）。
+
+## 2026-06-22 — AI 形态识别策略（第 4 套策略）
+
+复刻 Autochartist/Trading Central 类「AI pattern signal」能力，作为与 trend /
+momentum_break / mean_revert 并列的第 4 套策略，输出同构 `Signal` 走同一风控漏斗。
+
+- **`src/pattern_detect.py`（新）** — 纯 numpy/pandas 几何 + 蜡烛检测（无新依赖）：
+  区间突破、双底、上升/对称三角、头肩底、下降楔形、牛旗，及锤子/看涨吞没/启明星。
+  每个形态返回 confidence + 关键价位（突破/颈线、目标、止损）。核心防误报闸：形态
+  垂直幅度须 ≥ max(1.2×ATR, 2%)，否则平盘噪声会被误判成形态（实测噪声分从 77→64）。
+- **`src/pattern_vision.py`（新）** — matplotlib 渲染 K 线图 → Gemini 视觉确认（复用
+  `ai_validator` 的 client/key 轮转/级联/容错）。便宜固定模型 + 每扫描预算控成本；
+  FAIL-SAFE：视觉不可用一律放行，绝不静默杀掉算法信号。
+- **`src/strategy_pattern.py`（新）** — 0-100 加权评分（形态质量 30 / 触发 25 /
+  量 20 / 趋势对齐 15；视觉占余下 10），与其他策略同 `evaluate(symbol, df)` 契约。
+- **接线** — `main.py` 评分处 + 视觉确认处各加一段（视觉默认 advisory，
+  `PATTERN_VISION_BLOCKING` 可让高置信 reject 否决进场）；`backtest_v3.py` 纳入回测
+  （仅算法，视觉 live-only）；`executor`/web 看板展示形态名徽章。
+- **默认全关**（`PATTERN_ENABLED=false`，同 MR/gap-sentinel 惯例）—— 上线真金前须先
+  `PATTERN_ENABLED=true` 跑 `backtest_v3` 过双窗口验证。`Signal` 新增 `meta` 字段携带
+  形态元数据（向后兼容，其余策略留空）。
+- **准入过滤器（2026-06-23）** — `PATTERN_MIN_CONFIDENCE` / `PATTERN_REQUIRE_TRIGGERED` /
+  `PATTERN_ALLOWED_TYPES`（config.py + strategy_pattern._admit，默认全惰性）。起因：
+  未过滤的全集在 180d/10 半导体回测上净负（$16.4→$8.7/day，maxDD 5.8%→17%，被弱突破
+  抓假顶拖累）。
+- **回测验证结论（180d/10 半导体，algo-only，未含 live-only 视觉层）**：收紧后从「明显负」
+  救回「大致中性」。最佳档 = 双底+上升三角、conf≥80、必须 triggered（$16.75 vs 基线
+  $16.37/day，仅 +2 笔），但 **maxDD 翻倍 5.8%→11.8%、PF 3.63→3.12**——回报增量在噪声内
+  且回撤变差，**未过「不恶化回撤」的 gate**。故 `PATTERN_ENABLED` 维持 false。
+- **360d 复测无效（数据限制，2026-06-23）**：moomoo OpenD 的 HOUR_1 历史封顶 ≈679 根
+  （约 150 日历天），360d 配置被截断成与 180d 同一批 bar → 交易集完全相同（同样 +2 笔、
+  同样 maxDD 11.8%）。**小时线拿不到真正独立的第二窗口**，双窗口验证对 HOUR_1 不可用。
+  结论不变：无可证 edge，`PATTERN_ENABLED` + `PATTERN_VISION_ENABLED` 均保持 false。若日后
+  想真验证，需改用 DAILY bar（历史更长）或外部数据源（如 yfinance 730d 小时线）。
+
 ## v2.0 — 2026-06-10 ~ 06-11 「测量诚实化 + 动态股池 + 全自治」大版本
 
 这次升级的起点是一个发现：**回测说 +$36/day，实盘（paper）却是 −$572（43 笔、胜率 27.9%）**。

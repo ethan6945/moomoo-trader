@@ -337,6 +337,64 @@ class MoomooClient:
             raise RuntimeError(f"position_list_query failed: {data}")
         return data
 
+    def get_last_sell_fill(self, symbol: str, lookback_days: int = 7) -> dict | None:
+        """Most recent SELL execution for `symbol` → {price, qty, time}, or None.
+
+        Used to BOOK a manual exit: when reconcile finds a tracked position the
+        broker no longer holds (GHOST = you sold it in the moomoo app), this looks
+        up the ACTUAL fill so the realised P&L is recorded at the true exit price
+        instead of a guess. Checks today's deals first (the common case —
+        reconcile runs every scan), then the history deal list over the last
+        `lookback_days` (covers a sell detected the next session). Never raises."""
+        code = self._format_code(symbol)
+        bare = symbol.split(".")[-1]
+
+        def _latest_sell(df) -> dict | None:
+            if df is None or getattr(df, "empty", True):
+                return None
+            d = df.copy()
+            if "code" in d.columns:
+                d = d[d["code"].astype(str).str.endswith(bare)]
+            if "trd_side" in d.columns:
+                d = d[d["trd_side"].astype(str).str.upper().str.contains("SELL")]
+            if d.empty:
+                return None
+            if "create_time" in d.columns:
+                d = d.sort_values("create_time")
+            row = d.iloc[-1]
+            try:
+                return {"price": float(row.get("price") or 0),
+                        "qty": int(float(row.get("qty") or 0)),
+                        "time": str(row.get("create_time") or "")}
+            except Exception:
+                return None
+
+        # 1) today's deals
+        try:
+            ret, data = self.trade.deal_list_query(code=code, trd_env=_env_enum())
+            if ret == RET_OK:
+                hit = _latest_sell(data)
+                if hit and hit["price"] > 0:
+                    return hit
+        except Exception as e:
+            log.debug("deal_list_query(%s) failed: %s", symbol, e)
+
+        # 2) history fallback
+        try:
+            from datetime import date, timedelta
+            start = (date.today() - timedelta(days=lookback_days)).isoformat()
+            end = date.today().isoformat()
+            ret, data = self.trade.history_deal_list_query(
+                code=code, start=start, end=end, trd_env=_env_enum())
+            if ret == RET_OK:
+                hit = _latest_sell(data)
+                if hit and hit["price"] > 0:
+                    return hit
+        except Exception as e:
+            log.debug("history_deal_list_query(%s) failed: %s", symbol, e)
+
+        return None
+
     def get_pending_buy_value(self) -> float:
         """Sum of (price × qty) for BUY orders awaiting fill — counted as
         committed capital so we don't double-spend the budget."""

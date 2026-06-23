@@ -56,7 +56,11 @@ class Signal:
     score: float
     breakdown: dict = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
-    strategy: str = "trend"   # "trend" | "mean_revert"
+    strategy: str = "trend"   # "trend" | "mean_revert" | "momentum_break" | "pattern"
+    # Free-form strategy payload (e.g. pattern type / key levels for the pattern
+    # strategy). Stays empty for the others; carried into the buy audit `extra`
+    # and used by pattern_vision so we don't overload the numeric `breakdown`.
+    meta: dict = field(default_factory=dict)
 
     @property
     def stop_loss(self) -> float:

@@ -80,6 +80,20 @@ class Settings:
 
     entry_threshold: float = _float("ENTRY_SCORE_THRESHOLD", 70)
     scan_interval_min: int = _int("SCAN_INTERVAL_MIN", 15)
+
+    # Fast protective-stop loop (2026-06-21): seconds between lightweight, stop-ONLY
+    # checks (src/executor.manage_stops_only). SIMULATE has no native STOP order, so
+    # a soft stop otherwise waits for the 5-min manage tick — the live audit measured
+    # a ~−1.38R late-fill overshoot from that lag. This independent loop checks ONLY
+    # the breakeven ratchet + soft stop-loss (soft positions) and broker bracket
+    # fills (REAL), so it's cheap enough to run every minute. It runs in BOTH
+    # SIMULATE and REAL by design — it fixes the simulate soft-stop lag NOW (so it's
+    # battle-tested before go-live) and doubles as a fast OCO-fill detector live.
+    # No-op when outside market hours or flat (no broker connection). 0 disables it
+    # (falls back to the 5-min tick). A dedicated host handles 60s comfortably; 30s
+    # is also fine. Stall-out / max-hold / partials / TP stay on the 5-min tick.
+    fast_stop_seconds: int = _int("FAST_STOP_SECONDS", 60)
+
     max_hold_days: int = _int("MAX_HOLD_DAYS", 10)
     timeframe: str = _timeframe()   # DAILY trading mode removed 2026-06-07 (coerced → HOUR_1)
 
@@ -116,8 +130,61 @@ class Settings:
     # runs at PRE-MARKET only by default (gap_sentinel_ai_intraday=False skips the
     # ~11 per-scan AI calls/day — the deterministic earnings layer still runs every
     # scan for free), and skips the Gemini call entirely when there's no fresh news.
-    gap_sentinel_model: str = os.getenv("GAP_SENTINEL_MODEL", "gemini-2.5-flash-lite")
+    # Owner wants Gemini ≥ 3.5-flash everywhere (no lite tiers) — default bumped
+    # from gemini-2.5-flash-lite (2026-06-22). Gap sentinel is OFF by default, so
+    # this only costs anything once GAP_SENTINEL_ENABLED is armed.
+    gap_sentinel_model: str = os.getenv("GAP_SENTINEL_MODEL", "gemini-3.5-flash")
     gap_sentinel_ai_intraday: bool = os.getenv("GAP_SENTINEL_AI_INTRADAY", "false").lower() in ("1", "true", "yes")
+
+    # ── Smart exit (Phase 2A, 2026-06-23): AI/algo intraday early-exit ──
+    # Broader than the gap sentinel: exit a HELD long DURING the day when the
+    # picture turns bearish — concrete bad news / analyst downgrade / sector roll
+    # (AI), OR a clear technical break-down (deterministic). Two intents:
+    #   • LOCK PROFIT: on a technical break-down while in profit ≥ min_profit_r R,
+    #     bank the gain instead of giving it back waiting for the price TP.
+    #   • DEFENSIVE: on concrete bearish news the AI exits at any P&L.
+    # Runs on the 5-min manage tick via executor.manage_open_trades (reuses the
+    # gap-sentinel _force_close path). DEFAULT OFF; FAIL-SAFE (AI down → no exit).
+    smart_exit_enabled: bool = os.getenv("SMART_EXIT_ENABLED", "false").lower() in ("1", "true", "yes")
+    # AI layer on/off. Off ⇒ only the deterministic technical-breakdown lock-profit
+    # fires (no Gemini cost), so smart exit is still useful without a key.
+    smart_exit_ai: bool = os.getenv("SMART_EXIT_AI", "true").lower() in ("1", "true", "yes")
+    smart_exit_min_conf: int = _int("SMART_EXIT_MIN_CONF", 70)
+    # The algo lock-profit path only fires once unrealized profit ≥ this many R
+    # (R = entry − initial stop), so a routine wobble in a barely-green trade
+    # doesn't cut a position that hasn't earned anything. The AI news path ignores
+    # this (concrete bad news should exit even at a loss).
+    smart_exit_min_profit_r: float = _float("SMART_EXIT_MIN_PROFIT_R", 1.0)
+    smart_exit_model: str = os.getenv("SMART_EXIT_MODEL", "gemini-3.5-flash")
+
+    # ── Sentiment scoring (Phase 2B, 2026-06-23): moomoo-style 看好/看空 ──
+    # For each buy candidate, Gemini fuses news + analyst-target direction + the
+    # technical reasons (sig.reasons) into a 0-100 bullishness score (50=neutral),
+    # like the moomoo analysis card. DEFAULT OFF, ADVISORY (recorded + shown, does
+    # NOT change which trades fire → live↔backtest parity preserved). FAIL-SAFE →
+    # neutral 50 on any error. Optional SENTIMENT_SIZING folds the score into the
+    # existing conviction → position-size channel (still never changes selection).
+    sentiment_scoring_enabled: bool = os.getenv("SENTIMENT_SCORING_ENABLED", "false").lower() in ("1", "true", "yes")
+    sentiment_sizing: bool = os.getenv("SENTIMENT_SIZING", "false").lower() in ("1", "true", "yes")
+    sentiment_model: str = os.getenv("SENTIMENT_MODEL", "gemini-3.5-flash")
+    sentiment_budget: int = _int("SENTIMENT_BUDGET", 8)
+
+    # ── Options flow (Phase 2D, 2026-06-23): unusual options activity ──
+    # moomoo-style 期权异动: volume ≫ open-interest, put/call skew, OI-concentration
+    # support/resistance (src/options_flow.py). BLOCKED until the account has US
+    # options quote permission — the API denies the chain/snapshot otherwise. The
+    # module degrades to neutral and is NOT wired into live paths yet; flip this on
+    # only after subscribing, then 2A/2B can consume it. DEFAULT OFF.
+    options_flow_enabled: bool = os.getenv("OPTIONS_FLOW_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    # ── API/subscription health watchdog (2026-06-23) ──
+    # Edge-triggered Telegram alerts when a silent dependency lapses: the moomoo
+    # options data subscription (can't fetch chains/snapshots) or the Gemini API
+    # balance/quota (AI layers go blind). Owner-requested safety net → DEFAULT ON
+    # (set HEALTH_CHECK_ENABLED=false to silence). Runs every interval minutes +
+    # once at startup; only alerts on a state CHANGE, so it never spams.
+    health_check_enabled: bool = os.getenv("HEALTH_CHECK_ENABLED", "true").lower() in ("1", "true", "yes")
+    health_check_interval_min: int = _int("HEALTH_CHECK_INTERVAL_MIN", 30)
 
     # 3-tranche scale-out (2026-05-30 cash-frontier finding: banking partials and
     # recycling the cash is the best NO-LEVERAGE lever for a real $5k account —
@@ -179,6 +246,42 @@ class Settings:
     # Disable by default. Set MR_ENABLED=true to re-enable for sideways regimes.
     mr_enabled: bool = os.getenv("MR_ENABLED", "false").lower() in ("1", "true", "yes")
 
+    # ── Pattern strategy (2026-06-22): chart-pattern recognition ──
+    # Fourth strategy (src/strategy_pattern.py) — geometric + candlestick
+    # patterns (double bottom, triangles, inverse H&S, wedges, flags, breakout)
+    # scored on the same 0-100 scale and fed through the same funnel. DEFAULT OFF
+    # (inert) — same discipline as mr_enabled / gap_sentinel: flip on ONLY after
+    # backtest_v3 validates an edge on the dual-window gate.
+    pattern_enabled: bool = os.getenv("PATTERN_ENABLED", "false").lower() in ("1", "true", "yes")
+    # Admission filters (2026-06-23): the unfiltered set was net-negative on the
+    # 180d/10-semis backtest ($16.4→$8.7/day, maxDD 5.8%→17%), dominated by weak
+    # breakouts catching false tops. These narrow WHICH detections may become
+    # entries. Defaults are inert (all types, no min, triggered-optional) so the
+    # raw behaviour is unchanged until set. PATTERN_ALLOWED_TYPES is a csv of
+    # detector type names (e.g. "double_bottom,ascending_triangle"); empty = all.
+    pattern_min_confidence: float = _float("PATTERN_MIN_CONFIDENCE", 0)
+    pattern_require_triggered: bool = os.getenv("PATTERN_REQUIRE_TRIGGERED", "false").lower() in ("1", "true", "yes")
+    pattern_allowed_types: tuple = tuple(
+        t.strip() for t in os.getenv("PATTERN_ALLOWED_TYPES", "").split(",") if t.strip()
+    )
+    # AI vision confirmation (src/pattern_vision.py) — render the candle chart and
+    # ask Gemini to confirm the algo-detected pattern. The "AI" half of the
+    # algorithm+vision design. OFF by default; live-only (skipped in backtest) and
+    # FAIL-SAFE (vision unavailable → pass), so it never silently kills a signal.
+    pattern_vision_enabled: bool = os.getenv("PATTERN_VISION_ENABLED", "false").lower() in ("1", "true", "yes")
+    # When true, a high-confidence vision 'reject' BLOCKS the entry. Default false
+    # = advisory (logged + shown in the buy card) so live ↔ backtest signal sets
+    # stay aligned (same reasoning as ai_veto_blocking below).
+    pattern_vision_blocking: bool = os.getenv("PATTERN_VISION_BLOCKING", "false").lower() in ("1", "true", "yes")
+    # A vision 'reject' only blocks if its confidence ≥ this (avoids killing
+    # entries on a low-conviction maybe). Only used when pattern_vision_blocking.
+    pattern_vision_reject_conf: int = _int("PATTERN_VISION_REJECT_CONF", 60)
+    # Vision model — owner wants Gemini ≥ 3.5-flash everywhere (no lite tiers), so
+    # this defaults to gemini-3.5-flash (multimodal; verified to read the rendered
+    # candle chart). A per-scan call budget keeps cost bounded.
+    pattern_vision_model: str = os.getenv("PATTERN_VISION_MODEL", "gemini-3.5-flash")
+    pattern_vision_budget: int = _int("PATTERN_VISION_BUDGET", 8)
+
     # Fidelity fix (2026-06-03): when REAL, use the SAME soft-managed exits as
     # SIMULATE (scale-out + trailing + soft stop) instead of a broker OCO
     # bracket. This closes the backtest↔live gap (the honest engine models
@@ -232,13 +335,13 @@ def derive_max_positions(capital: float) -> int:
     n = round(capital / slot)
     return max(settings.max_positions, min(settings.max_positions_cap, n))
 
-# Model cascade: GEMINI_MODEL is tried first; on 429/quota it continues downward
-# to a cheaper fallback so a transient quota hit doesn't blank the AI. The system
-# is unified on Gemini 3.5 Flash (2026-06-08); the lite tier is only an emergency
-# quota fallback. Override the starting model via the GEMINI_MODEL env var.
+# Model cascade: GEMINI_MODEL is tried first; on 429/quota it retries across all
+# keys. Owner preference (2026-06-22): use Gemini 3.5-flash or HIGHER everywhere —
+# NO lite-tier fallback — so the cascade floor is gemini-3.5-flash. Override the
+# starting model via the GEMINI_MODEL env var (set it to a higher tier if one
+# exists; do not point it at a *-lite model).
 GEMINI_FREE_CASCADE = [
     "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
 ]
 
 

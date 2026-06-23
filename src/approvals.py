@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 QUEUE_KEY = "pending_approvals"
 # Kinds that perform a real mutation when approved (everything else is
 # informational — approving just acknowledges/dismisses it).
-EXECUTABLE_KINDS = {"blacklist_review", "param_change"}
+EXECUTABLE_KINDS = {"blacklist_review", "param_change", "manual_takeover_sell"}
 
 
 def _now() -> str:
@@ -134,6 +134,28 @@ def _execute(item: dict) -> None:
                 log.info("approval applied: param %s = %s", key, value)
             except ValueError as e:
                 log.warning("approved param_change rejected at execution: %s", e)
+    elif kind == "manual_takeover_sell":
+        # Owner approved the bot taking over a HIGH-risk MANUAL position: market-
+        # sell it now to cut the loss. Opens its own broker client (apply_approved
+        # runs both in-scan and off-hours). close_position cancels any legs, sells
+        # at a fresh price, logs the close + removes it from open_trades. If it
+        # raises (market shut / halted price), apply_approved leaves the item
+        # un-executed and retries next cycle — i.e. it lands at the next open.
+        sym = payload.get("symbol")
+        if sym:
+            from . import executor, notifier
+            # Idempotent: if you already sold it yourself before tapping ✅, the
+            # GHOST booker has recorded it and it's no longer tracked — nothing to
+            # do (and don't let close_position raise → infinite retry).
+            if sym not in executor._load_open_trades():
+                notifier.send(f"ℹ️ {sym} 已不在持仓（可能你已手动卖出），无需接管。")
+                log.info("manual takeover sell %s: already flat — skip", sym)
+                return
+            from .moomoo_client import client as _broker
+            with _broker() as c:
+                action = executor.close_position(c, sym, reason="MANUAL_TAKEOVER")
+            log.info("approval applied: manual takeover sell %s → %s", sym, action)
+            notifier.send(f"✅ 已接管并卖出手动持仓 {sym}（你已批准止损）")
     # strategy_flag / exit_balance: informational — nothing to execute.
 
 

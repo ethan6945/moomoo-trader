@@ -275,6 +275,13 @@
     <div class="modal-box">
       <div class="modal-head"><h2>⚙ 设置 Settings</h2><button class="sm" id="btnCloseSet">✕</button></div>
 
+      <div class="set-sec"><h3>交易模式 Trading Mode</h3>
+        <div class="set-row"><div style="flex:1"><b>模拟 / 实盘 Simulate / Live</b>
+          <div class="setdesc">🧪 模拟盘用虚拟资金；💵 实盘是真钱。切换写入 .env，需<b>重启交易循环</b>生效。切到实盘要求：已设交易密码 + 当前无持仓 + 二次确认。</div>
+          <div id="envState" class="setdesc" style="margin-top:6px">—</div></div>
+          <button class="sm" id="btnEnvToggle">切换</button></div>
+      </div>
+
       <div class="set-sec"><h3>资金 Capital</h3>
         <div class="set-row"><div style="flex:1"><b>预算 Budget</b><div class="setdesc">分配给交易的本金。改了下次扫描生效（免重启）；仓位/风控按它派生，并自动不超过实盘 equity。</div></div>
           <span style="display:flex;gap:6px"><input id="setBudget" type="number" step="100" placeholder="$"/><button class="sm" id="btnSetBudget">保存</button></span></div>
@@ -404,7 +411,17 @@ async function refresh(){
   const px=v=>(typeof v==='number')?'$'+v.toFixed(2):'—';
   const pnlCell=p=>{const v=Number(p.pl_val);if(typeof p.last!=='number'||!isFinite(v))return '<td>—</td>';
     return `<td class="${cls(v)}">${(v>=0?'+':'-')}$${Math.abs(v).toFixed(2)} (${(p.pl_ratio>=0?'+':'')}${(p.pl_ratio||0).toFixed(1)}%)</td>`;};
-  $('#posTbl tbody').innerHTML=syms.map(s=>{const p=pp[s];return `<tr><td class="strong">${s}</td><td>${p.qty??''}</td><td>${px(p.entry_price)}</td><td>${px(p.last)}</td><td class="neg">${px(p.stop_loss)}</td><td class="pos">${px(p.take_profit)}</td><td><span class="tag">${p.strategy||'—'}</span></td>${pnlCell(p)}</tr>`;}).join('');
+  $('#posTbl tbody').innerHTML=syms.map(s=>{const p=pp[s];
+    let strat=`<span class="tag">${p.strategy||'—'}</span>`;
+    // Pattern strategy: append the detected chart pattern (e.g. double_bottom).
+    if(p.pattern){strat+=` <span class="tag" title="AI 形态识别" style="background:#8957e533;border:1px solid #8957e5">📐 ${p.pattern}</span>`;}
+    if(p.manual_adopted){
+      // YOUR own moomoo-app buy, adopted by the bot. user_managed = HIGH-risk,
+      // awaiting your takeover approval (you're watching it); else bot took over.
+      const self=p.user_managed;
+      strat=`<span class="tag" title="${self?'你手动买入 · 高风险 · 等你确认是否接管（你自己盯盘）':'你手动买入 · 已被机器人接管止损/止盈'}" style="background:${self?'#d2992233':'#1f6feb33'};border:1px solid ${self?'#d29922':'#1f6feb'}">🖐 ${self?'手动·自管':'手动·接管'}</span>`;
+    }
+    return `<tr><td class="strong">${s}</td><td>${p.qty??''}</td><td>${px(p.entry_price)}</td><td>${px(p.last)}</td><td class="neg">${px(p.stop_loss)}</td><td class="pos">${px(p.take_profit)}</td><td>${strat}</td>${pnlCell(p)}</tr>`;}).join('');
   refreshLog();
 }
 function renderTradeRec(sm){
@@ -636,7 +653,39 @@ async function loadSettings(){
     ].map(([k,v])=>`<span class="pill">${k}<b>${v??'—'}</b></span>`).join('');
   }catch(e){}
   loadWebAccess();
+  loadTradeEnv();
 }
+let ENVST=null;
+async function loadTradeEnv(){
+  try{
+    const d=await api('/api/trade-env'); ENVST=d;
+    const real=d.env_file==='REAL';
+    const liveTxt=d.env_live?(d.env_live==='REAL'?'💵 实盘':'🧪 模拟'):'—';
+    let s=`配置(.env): <b>${real?'💵 实盘 REAL':'🧪 模拟 SIMULATE'}</b> · 运行中: ${liveTxt} · 持仓: ${d.open_positions}`;
+    if(d.pending_restart) s+=' · <b style="color:#d29922">⚠ 待重启生效</b>';
+    $('#envState').innerHTML=s;
+    const btn=$('#btnEnvToggle');
+    btn.textContent=real?'切回模拟 🧪':'切到实盘 💵';
+    btn.className=real?'sm':'danger sm';
+  }catch(e){}
+}
+$('#btnEnvToggle').onclick=async()=>{
+  if(!ENVST)return;
+  const target=ENVST.env_file==='REAL'?'SIMULATE':'REAL';
+  if(target==='REAL'){
+    if(ENVST.open_positions>0){alert('当前还有 '+ENVST.open_positions+' 个未平仓持仓，请先全部平仓再切实盘。');return;}
+    if(!confirm('⚠ 切换到【实盘 REAL】= 用真钱交易！\n\n确认前请确保:\n• 已 paper trade 足够久且指标达标\n• 已设好 6 位交易密码\n• 首次只放小额验证下单\n\n确定切到实盘?'))return;
+    if(!confirm('再次确认:真的要用真钱交易吗?'))return;
+  }
+  const r=await api('/api/trade-env',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({env:target,confirm:target==='REAL'})});
+  if(!r.ok){alert('失败: '+(r.error||''));return;}
+  await loadTradeEnv();
+  if(confirm((r.note||'已切换')+'\n\n现在重启交易循环使其生效?')){
+    try{await api('/api/scheduler/restart',{method:'POST'});}catch(e){}
+    setTimeout(()=>{pollStatus();loadTradeEnv();},1500);
+    alert('已重启交易循环。');
+  }
+};
 let WACC=null;
 async function loadWebAccess(){
   try{

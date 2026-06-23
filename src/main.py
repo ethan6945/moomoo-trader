@@ -20,8 +20,9 @@ from moomoo import KLType
 from . import (
     adaptive_sizing, ai_validator, approvals, audit, blacklist, clock,
     cron_state, db, executor, gap_sentinel, history, indicators, kill_switch, notifier,
-    portfolio, regime as regime_mod, risk_manager, runtime_config, self_improve,
-    self_review, strategy_momentum, strategy_mr, tg_approvals,
+    options_flow, pattern_vision, portfolio, regime as regime_mod, risk_manager,
+    runtime_config, self_improve, self_review, strategy_momentum, strategy_mr,
+    strategy_pattern, tg_approvals,
 )
 from .config import settings
 from .earnings import earnings_block
@@ -270,6 +271,7 @@ def scan_once() -> None:
             log.debug("apply_approved skipped: %s", e)
 
         # 2b. Reconcile broker vs internal records — catch drift before trading.
+        recon: dict = {}
         try:
             recon = reconcile(positions, client=c)
             msg = log_reconcile(recon)
@@ -296,6 +298,20 @@ def scan_once() -> None:
             log.info("Regime: %s — %s", regime.label, regime.note)
         except Exception as e:
             log.warning("regime assessment failed: %s", e)
+
+        # 2c. Supervise MANUAL positions reconcile just adopted this scan (your
+        # moomoo-app buys). Runs BEFORE the kill-switch early-return so a bear-
+        # regime adoption is still reviewed + risk-flagged. NORMAL adoptions are
+        # released to the bot's stops/TP; HIGH-risk ones stay owner-held and queue
+        # a Telegram takeover approval.
+        try:
+            adopted = [f["symbol"] for f in recon.get("fixes_applied", [])
+                       if f.get("type") == "ORPHAN_ADOPTED"]
+            if adopted:
+                from . import manual_positions
+                manual_positions.review_adopted(c, adopted, regime=regime)
+        except Exception as e:
+            log.warning("manual-position review failed: %s", e)
 
         # Daily rollover — clear stale halt / realized_pnl_today on day boundary.
         try:
@@ -391,6 +407,9 @@ def scan_once() -> None:
         # For each ticker, keep the higher-scoring signal — they're complementary
         # and rarely both fire (trend wants ADX↑, MR wants ADX↓).
         ranked: list[indicators.Signal] = []
+        # Klines kept for pattern signals so the live-only vision layer can
+        # re-render the chart in the execution loop without a second fetch.
+        pattern_dfs: dict = {}
         # Marginal-setup buffer: anything within 10 pts BELOW threshold also
         # enters the funnel, but gets half-conviction (smaller position).
         # Without this buffer the bot scores ~60 for most US large-caps and
@@ -432,6 +451,14 @@ def scan_once() -> None:
                     sig_mr = strategy_mr.evaluate(sym, df)
                     if sig_mr.score >= threshold_floor:
                         ranked.append(sig_mr)
+                # Pattern strategy (chart-pattern recognition) — gated like MR.
+                # Keep the df so pattern_vision can re-render this exact chart in
+                # the execution loop (live-only) without re-fetching klines.
+                if settings.pattern_enabled:
+                    sig_pattern = strategy_pattern.evaluate(sym, df)
+                    if sig_pattern.score >= threshold_floor:
+                        ranked.append(sig_pattern)
+                        pattern_dfs[sym] = df
             except Exception as e:
                 log.warning("scoring %s failed: %s", sym, e)
 
@@ -476,6 +503,11 @@ def scan_once() -> None:
         # scans/day (trade-phase only) × budget=5 = 60 calls/day → well under
         # quota. Previous budget=2 was leaving most candidates unchecked.
         ai_budget = 10
+        # Per-scan budget for the pattern-vision Gemini calls (cost control, same
+        # idea as ai_budget). Only pattern signals consume it.
+        vision_budget = settings.pattern_vision_budget
+        # Per-scan budget for the Phase 2B sentiment Gemini calls.
+        sentiment_budget = settings.sentiment_budget
         scan_skips: list[tuple[str, str]] = []   # (symbol, gate) — summarised at scan end
 
         for sig in ranked:
@@ -585,6 +617,57 @@ def scan_once() -> None:
                      sig.symbol, sig.score,
                      "pass" if ai_pass else "veto", conviction, ai_reason)
 
+            # --- Pattern-vision confirmation (pattern strategy only) ---
+            # The "AI" half of the algorithm+vision design. Advisory by default
+            # (logged + shown in the buy card) so the live signal set matches the
+            # algo-only backtest; set PATTERN_VISION_BLOCKING to let a confident
+            # 'reject' gate the entry. FAIL-SAFE inside pattern_vision.confirm.
+            vision_conf = vision_label = vision_reason = None
+            if (sig.strategy == "pattern" and settings.pattern_vision_enabled
+                    and not is_stack_candidate and vision_budget > 0):
+                df_v = pattern_dfs.get(sig.symbol)
+                if df_v is not None:
+                    try:
+                        v_ok, vision_conf, vision_label, vision_reason = \
+                            pattern_vision.confirm(sig, df_v)
+                    except Exception as e:
+                        v_ok, vision_reason = True, f"vision error: {e}"
+                    vision_budget -= 1
+                    log.info("%s pattern-vision=%s conf=%s (%s)", sig.symbol,
+                             "confirm" if v_ok else "reject", vision_conf, vision_reason)
+                    if (settings.pattern_vision_blocking and not v_ok
+                            and (vision_conf or 0) >= settings.pattern_vision_reject_conf):
+                        _skip("pattern_vision", vision_reason)
+                        continue
+
+            # --- moomoo-style sentiment read (Phase 2B; advisory) ---
+            # 看好/中性/看空 multi-factor score. ADVISORY — never changes which
+            # trade fires (parity). Optional SENTIMENT_SIZING folds the 0-100
+            # score into conviction (sizing only). FAIL-SAFE → neutral 50.
+            sent_verdict = sent_reason = None
+            sent_score = None
+            if (settings.sentiment_scoring_enabled and not is_stack_candidate
+                    and sentiment_budget > 0):
+                # Fold the options-flow read into the sentiment fusion (moomoo-card
+                # style) when the options subscription is active. Self-protecting.
+                opt_summary = ""
+                if settings.options_flow_enabled:
+                    try:
+                        of = options_flow.assess(sig.symbol, c)
+                        opt_summary = f"{of['signal']} ({of['detail']})"
+                    except Exception:
+                        opt_summary = ""
+                try:
+                    sent_verdict, sent_score, sent_reason = \
+                        ai_validator.assess_sentiment(sig, opt_summary)
+                except Exception as e:
+                    sent_verdict, sent_score, sent_reason = "neutral", 50, f"sentiment error: {e}"
+                sentiment_budget -= 1
+                log.info("%s sentiment=%s score=%s (%s)",
+                         sig.symbol, sent_verdict, sent_score, sent_reason)
+                if settings.sentiment_sizing and sent_score is not None:
+                    conviction *= max(0.5, min(1.25, sent_score / 50.0))
+
             # --- Risk / heat / sizing (all factor in conviction) ---
             ok, reason = risk_manager.can_open_new(
                 sig, positions, cash, pending_value, pending_symbols,
@@ -649,7 +732,20 @@ def scan_once() -> None:
                                     "ai_pass": bool(ai_pass),
                                     "setup_quality": "marginal" if marginal_setup else "full",
                                     "is_stack": is_stack_candidate,
-                                    "strategy": getattr(sig, "strategy", "trend")})
+                                    "strategy": getattr(sig, "strategy", "trend"),
+                                    # Phase 2B sentiment (advisory; None when off).
+                                    "sentiment_verdict": sent_verdict,
+                                    "sentiment_score": sent_score,
+                                    # Pattern strategy: persist what was detected +
+                                    # the vision verdict so the dashboard can show
+                                    # it and we can calibrate vision-vs-outcome.
+                                    **({"pattern_type": sig.meta.get("pattern_type"),
+                                        "pattern_confidence": sig.meta.get("pattern_confidence"),
+                                        "key_levels": sig.meta.get("key_levels"),
+                                        "vision_confidence": vision_conf,
+                                        "vision_label": vision_label,
+                                        "vision_reason": vision_reason}
+                                       if sig.strategy == "pattern" else {})})
                 notifier.send(notifier.signal_msg(sig, ai_reason, qty))
                 cash -= qty * sig.price
                 pending_value += qty * sig.price
@@ -1107,6 +1203,37 @@ def run_loop() -> None:
 
     sched.add_job(_manage_tick, "cron", minute="6,11,16,21,26,36,41,46,51,56",
                   coalesce=True, misfire_grace_time=60, max_instances=1)
+
+    # Fast protective-stop loop (2026-06-21): an INDEPENDENT, lightweight tick that
+    # runs every FAST_STOP_SECONDS and checks ONLY soft stops + breakeven (soft
+    # positions) and broker bracket fills (REAL) — see executor.manage_stops_only.
+    # SIMULATE has no native STOP order, so without this a soft stop waits for the
+    # 5-min tick above (live audit: ~−1.38R late-fill overshoot); this shrinks that
+    # to seconds. No-op (no broker connection) outside market hours or when flat, so
+    # it's cheap enough to run every minute on the dedicated host. Runs in BOTH
+    # modes by design; set FAST_STOP_SECONDS=0 to disable and fall back to 5-min.
+    if settings.fast_stop_seconds > 0:
+        def _fast_stop_tick():
+            if not in_market_hours():
+                return
+            if not executor.has_open_trades():
+                return
+            try:
+                with client() as c:
+                    actions = executor.manage_stops_only(c)
+                    for a in actions:
+                        notifier.send(notifier.trade_action_msg(a))
+                    if actions:
+                        _refresh_account_snapshot(c, full=False)
+            except Exception as e:
+                log.exception("fast-stop tick failed: %s", e)
+
+        sched.add_job(_fast_stop_tick, "interval",
+                      seconds=settings.fast_stop_seconds,
+                      coalesce=True, misfire_grace_time=30, max_instances=1)
+        log.info("fast-stop loop armed — every %ds (market hours, when holding)",
+                 settings.fast_stop_seconds)
+
     # 2026-06-03: watchlist is PINNED to 10; universe changes go through the
     # weekly self-review → approval queue (no auto-refresh, no manual button).
     # ML retrain removed entirely (subsystem deleted after proving inert).
@@ -1183,6 +1310,25 @@ def run_loop() -> None:
             log.exception("watchdog failed: %s", e)
     sched.add_job(_watchdog_job, "cron", day_of_week="mon-fri", hour=17, minute=30,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # API/subscription health watchdog: probe moomoo options data + Gemini every
+    # HEALTH_CHECK_INTERVAL_MIN min and Telegram the owner ONLY on a state change
+    # (subscription lapsed / Gemini quota out → top up). Owner-requested; edge-
+    # triggered so no spam. Also runs once at startup for an immediate status.
+    def _api_health_job():
+        try:
+            from . import health_check
+            health_check.run()
+        except Exception as e:
+            log.exception("api health check failed: %s", e)
+    if settings.health_check_enabled:
+        sched.add_job(_api_health_job, "interval",
+                      minutes=settings.health_check_interval_min,
+                      coalesce=True, misfire_grace_time=600, max_instances=1)
+        try:
+            _api_health_job()          # immediate check on boot
+        except Exception as e:
+            log.warning("startup health check failed: %s", e)
 
     # Daily blacklist review: 23:00 ET every weekday. Reads recent closed
     # trades, adds chronic losers, removes recovered names, extends watch on

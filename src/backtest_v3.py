@@ -232,6 +232,11 @@ def simulate_v3(
     # did NOT represent the live bot. Decoupled: momentum has its own flag, set
     # True by _run_live_engine, parity-suppressed so the diff-test stays exact.
     _momentum = bool(cfg.apply_momentum_strategy) and not parity_mode
+    # Pattern strategy (2026-06-22): gated on the SAME env flag as live
+    # (settings.pattern_enabled), parity-suppressed so the A-vs-B diff stays
+    # byte-exact. Algo-only here — the live vision layer is NOT modelled (it is
+    # an additive confirmation, not a signal-set change; see plan parity note).
+    _pattern = bool(_settings.pattern_enabled) and not parity_mode
     # Phase 0 realism knobs (2026-06-10) — parity-suppressed like every other
     # live-fidelity flag so the A-vs-B diff-test stays byte-exact.
     _scan_exits = bool(cfg.scan_grid_exits) and not parity_mode
@@ -244,6 +249,8 @@ def simulate_v3(
 
     if cfg.apply_mr_strategy or _momentum:
         from . import strategy_momentum, strategy_mr
+    if _pattern:
+        from . import strategy_pattern
 
     ml_pred = None   # ML subsystem removed 2026-06-03 (proven inert)
 
@@ -387,6 +394,8 @@ def simulate_v3(
                 cands.append(strategy_momentum.evaluate(sym, window))
             if cfg.apply_mr_strategy:
                 cands.append(strategy_mr.evaluate(sym, window))
+            if _pattern:
+                cands.append(strategy_pattern.evaluate(sym, window))
             if len(cands) > 1:
                 sig = max(cands, key=lambda s: s.score)
         except Exception:

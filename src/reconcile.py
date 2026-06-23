@@ -125,18 +125,78 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
                 "ml_proba_entry": None,
                 "strategy": "reconcile_orphan_recovery",
                 "stacks": 1,
+                # Manual-position hand-off (2026-06-22): an orphan is a position
+                # the bot never opened (your manual moomoo-app buy, or crash
+                # recovery). Mark it owner-held + pending so NO auto-exit (soft
+                # stop, fast-stop tick, blacklist/gap/over-cap flush) touches it
+                # until manual_positions.review_adopted() has judged its risk and
+                # either released it to the bot (NORMAL) or queued a takeover
+                # approval (HIGH). review runs in the SAME scan, right after this.
+                "manual_adopted": True,
+                "user_managed": True,
+                "pending_review": True,
             }
             fixes_applied.append({"type": "ORPHAN_ADOPTED", "symbol": sym,
                                   "qty": o["broker_qty"], "cost": cost})
             log.warning("Reconcile auto-fix: adopted orphan %s qty=%d @ $%.2f",
                         sym, o["broker_qty"], cost)
 
-        # FIX GHOST: drop stale records the broker doesn't actually hold.
+        # FIX GHOST: a tracked position the broker no longer holds = it was closed
+        # ELSEWHERE — you sold it yourself in the moomoo app (or an unrecorded
+        # close). BOOK the realised P&L at the true fill price so the trade lands
+        # in trades.jsonl / win-rate / equity, THEN drop the record. Falls back to
+        # a fresh last price (flagged approximate) so the trade is still recorded
+        # even when the fill lookup fails. Booked once: next scan it's no longer a
+        # ghost, so there's no double-count.
+        from . import executor
         for g in ghosts:
             sym = g["symbol"]
+            trade = our_trades.get(sym)
+            booked = None
+            if trade and client is not None:
+                exit_price = None
+                approx = False
+                try:
+                    fill = client.get_last_sell_fill(sym)
+                except Exception as e:
+                    log.warning("ghost %s: fill lookup failed: %s", sym, e)
+                    fill = None
+                if fill and fill.get("price", 0) > 0:
+                    exit_price = float(fill["price"])
+                else:
+                    try:
+                        lp = executor._last_price(client, sym)
+                        if lp:
+                            exit_price, approx = float(lp), True
+                    except Exception:
+                        pass
+                if exit_price:
+                    try:
+                        qty = int(trade.get("qty") or g.get("our_qty") or 0)
+                        pnl = executor._close_and_log(sym, trade, qty, exit_price,
+                                                      "MANUAL_SELL")
+                        booked = {"exit": exit_price, "qty": qty,
+                                  "pnl": round(pnl, 2), "approx": approx}
+                    except Exception as e:
+                        log.warning("ghost %s: booking close failed: %s", sym, e)
             our_trades.pop(sym, None)
-            fixes_applied.append({"type": "GHOST_DROPPED", "symbol": sym})
-            log.warning("Reconcile auto-fix: dropped ghost %s", sym)
+            fix = {"type": "GHOST_DROPPED", "symbol": sym}
+            if booked:
+                fix["booked"] = booked
+            fixes_applied.append(fix)
+            log.warning("Reconcile auto-fix: dropped ghost %s%s", sym,
+                        (f" (booked manual sell @ ${booked['exit']:.2f}, "
+                         f"pnl ${booked['pnl']:+.0f}"
+                         f"{' ~approx' if booked['approx'] else ''})") if booked else "")
+            if booked:
+                try:
+                    from . import notifier
+                    tag = "（现价近似）" if booked["approx"] else ""
+                    notifier.send(f"📝 已记录你手动平仓 {sym} {booked['qty']} 股 @ "
+                                  f"${booked['exit']:.2f}{tag} — 已实现 "
+                                  f"${booked['pnl']:+.0f}，已计入交易统计。")
+                except Exception:
+                    pass
 
         # FIX MISMATCH: adopt broker's qty (broker side is authoritative).
         for m in mismatches:
