@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import pytz
 from logging.handlers import RotatingFileHandler
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -18,11 +19,12 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from moomoo import KLType
 
 from . import (
-    adaptive_sizing, ai_validator, approvals, audit, blacklist, clock,
-    cron_state, db, executor, gap_sentinel, history, indicators, kill_switch, notifier,
-    options_flow, pattern_vision, portfolio, regime as regime_mod, risk_manager,
-    runtime_config, self_improve, self_review, strategy_momentum, strategy_mr,
-    strategy_pattern, tg_approvals,
+    adaptive_sizing, ai, ai_validator, approvals, audit, blacklist, breadth,
+    clock, cron_state, db, executor, gap_sentinel, history, indicators,
+    kill_switch, notifier, portfolio,
+    regime as regime_mod, risk_manager, runtime_config, sector, self_improve,
+    self_review, strategy_momentum, strategy_mr, strategy_pattern,
+    tg_approvals,
 )
 from .config import settings
 from .earnings import earnings_block
@@ -166,7 +168,8 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "realized_pnl_total": realized_total,
             "total_pnl": unrealized + realized_total,
             "symbols": symbols,
-            "ai_model": settings.gemini_model,
+            "ai_provider": ai.active_provider(),
+            "ai_model": ai.active_model(),
             "scan_interval_min": settings.scan_interval_min,
             "entry_threshold": settings.entry_threshold,
             "max_hold_days": settings.max_hold_days,
@@ -174,6 +177,8 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "trade_env": settings.moomoo_trade_env,
             "vix": round(vix or 0, 1),
             "regime": regime.label,
+            "regime_sub": regime.sub_label,
+            "regime_confirmed": regime.confirmed,
             "regime_note": regime.note,
             "open_risk": round(portfolio.current_open_risk(), 2),
             "heat_cap": round(risk_manager.budget_usd() * portfolio.PORTFOLIO_HEAT_PCT, 2),
@@ -290,14 +295,38 @@ def scan_once() -> None:
             log.warning("VIX fetch failed: %s", e)
             vix = 15.0
 
-        # Market regime via SPY
+        # Market regime via SPY. Pass VIX + the previous confirmed label so the
+        # smart layer can compute strength / sub_label / hysteresis (all advisory
+        # — the raw label is unchanged). effective_label is what the entry-block
+        # and the cash-yield / inverse-sleeve sweeps gate on: the hysteresis-
+        # smoothed `confirmed` label when SMART_REGIME_ENABLED, else the raw label
+        # (so default behavior + backtest parity are untouched).
         regime = regime_mod.Regime("NEUTRAL", 0, 0, 0, False, False, "not assessed")
         try:
+            prev_label = db.get_state().get("regime_last_label")
             spy_df = c.get_kline("SPY", bars=250, ktype=KLType.K_DAY)
-            regime = regime_mod.assess(spy_df)
-            log.info("Regime: %s — %s", regime.label, regime.note)
+            regime = regime_mod.assess(spy_df, vix=vix, prev_label=prev_label)
+            log.info("Regime: %s (%s) — %s", regime.label, regime.sub_label, regime.note)
+            db.update_state({"regime_last_label": regime.confirmed})
         except Exception as e:
             log.warning("regime assessment failed: %s", e)
+        effective_label = regime.confirmed if settings.smart_regime_enabled else regime.label
+
+        # P0-3 (2026-06-26): market breadth filter — prevent trading in
+        # "fake bull markets" where SPY is up but breadth is collapsing.
+        # When breadth is unhealthy, we skip new entries but still manage
+        # open positions (stops + TPs fire as normal). Gate is advisory by
+        # default (logs + notifies, doesn't block) — set BREADTH_BLOCKING=true
+        # in .env to make it a hard block.
+        breadth_ok = True
+        breadth_note = ""
+        try:
+            bv = breadth.assess(c, vix=vix)
+            breadth_ok = bv.healthy
+            breadth_note = bv.note
+            log.info("Breadth: %s", breadth_note)
+        except Exception as e:
+            log.warning("breadth assessment failed: %s — passing", e)
 
         # 2c. Supervise MANUAL positions reconcile just adopted this scan (your
         # moomoo-app buys). Runs BEFORE the kill-switch early-return so a bear-
@@ -319,12 +348,50 @@ def scan_once() -> None:
         except Exception as e:
             log.warning("reset_for_new_day failed: %s", e)
 
+        # Inverse-ETF sleeve — profit from confirmed downtrends (BEAR + inverse
+        # ETF trending up). Runs BEFORE the regime early-return and BEFORE the
+        # cash-yield sweep so it claims its small sleeve first; cash-yield then
+        # parks whatever cash remains. No-op unless INVERSE_SLEEVE_ENABLED (and
+        # it should stay OFF until scripts/inverse_sleeve_backtest.py passes).
+        try:
+            from . import inverse_sleeve
+            inverse_sleeve.manage(c, effective_label, risk_manager.budget_usd())
+        except Exception as e:
+            log.warning("inverse_sleeve failed: %s", e)
+
+        # Cash-yield sweep — runs BEFORE the regime early-return so it can park
+        # idle cash in a T-bill ETF (SGOV) DURING a BEAR regime (when strategy
+        # entries are paused), and unwind it back to cash on tradeable regimes
+        # so longs have buying power again. No-op unless CASH_YIELD_ENABLED.
+        try:
+            from . import cash_yield
+            cash_yield.manage(c, effective_label, cash, positions)
+        except Exception as e:
+            log.warning("cash_yield sweep failed: %s", e)
+
         # Unified kill switch — replaces three separate checks (trade_phase /
         # regime block / halt / drawdown). Single source of truth for "can we
         # open new positions right now?". manage_open_trades has already run
         # so existing stops/TPs still fire even when entries are blocked.
+        #
+        # P0-3: also evaluate market breadth — unhealthy breadth is a soft
+        # block (advisory unless BREADTH_BLOCKING=true). When unhealthy,
+        # existing positions are still managed; only new entries are skipped.
+        skip_reason = ""
+        if not breadth_ok:
+            skip_reason = f"breadth unhealthy: {breadth_note}"
+            if not settings.breadth_blocking:
+                log.warning("Breadth unhealthy (advisory): %s", breadth_note)
+                # advisory — let the kill switch be the final gate
+            else:
+                log.warning("Breadth unhealthy (blocking): %s — skipping new entries",
+                            breadth_note)
+                audit.record("scan_end", gate="breadth", reason=skip_reason)
+                notifier.send(f"⚠ {skip_reason}")
+                return
+
         verdict = kill_switch.evaluate(
-            regime_block_new=regime.block_new_entries,
+            regime_block_new=(effective_label == "BEAR"),
             regime_label=regime.label,
             regime_note=regime.note,
             current_cash=cash,
@@ -368,7 +435,8 @@ def scan_once() -> None:
                 "realized_pnl_total": realized_total,
                 "total_pnl": unrealized + realized_total,
                 "symbols": symbols,
-                "ai_model": settings.gemini_model,
+                "ai_provider": ai.active_provider(),
+                "ai_model": ai.active_model(),
                 "scan_interval_min": settings.scan_interval_min,
                 "entry_threshold": settings.entry_threshold,
                 "max_hold_days": settings.max_hold_days,
@@ -376,6 +444,8 @@ def scan_once() -> None:
                 "trade_env": settings.moomoo_trade_env,
                 "vix": round(vix, 1),
                 "regime": regime.label,
+                "regime_sub": regime.sub_label,
+                "regime_confirmed": regime.confirmed,
                 "regime_note": regime.note,
                 "open_risk": round(portfolio.current_open_risk(), 2),
                 "heat_cap": round(risk_manager.budget_usd() * portfolio.PORTFOLIO_HEAT_PCT, 2),
@@ -386,6 +456,8 @@ def scan_once() -> None:
                 "clock": clock.status(),
                 "per_position": per_pos,
                 "realized_pnl_today": float(state.get("realized_pnl_today", 0.0)),
+                "budget_usd": risk_manager.budget_usd(),
+                "pending_approvals": approvals.list_pending(),
             }
             (settings.root / "data" / "account.json").write_text(
                 json.dumps(snap, indent=2, default=str)
@@ -410,6 +482,10 @@ def scan_once() -> None:
         # Klines kept for pattern signals so the live-only vision layer can
         # re-render the chart in the execution loop without a second fetch.
         pattern_dfs: dict = {}
+        # P0-2 (2026-06-26): keep all kline dataframes so we can compute
+        # structural stops (swing-low-based) in the execution loop without
+        # a second fetch.
+        all_dfs: dict[str, pd.DataFrame] = {}
         # Marginal-setup buffer: anything within 10 pts BELOW threshold also
         # enters the funnel, but gets half-conviction (smaller position).
         # Without this buffer the bot scores ~60 for most US large-caps and
@@ -422,7 +498,29 @@ def scan_once() -> None:
         # ~105 trades/180d on trend+momentum, and the gate-ablation proved sub-70
         # setups destroy returns (thr 65 = −$11/day). The old −10 marginal band
         # was a trend-only-era workaround; momentum scoring clears 70 fine now.
-        threshold_floor = entry_thr
+        #
+        # P0-4 (2026-06-26): adaptive threshold — lower the bar in confirmed
+        # BULL markets (more signals, less noise) and raise it in NEUTRAL
+        # (fewer but higher-quality signals). BEAR is already blocked by the
+        # regime kill-switch, but a hard 999 here double-locks. The hysteresis
+        # layer (confirmed_label) prevents whipsaw so the threshold doesn't
+        # oscillate on a single SPY close grazing the 200-MA.
+        base_thr = entry_thr
+        if effective_label == "BULL":
+            base_thr = max(55, entry_thr - 5)
+        elif effective_label == "NEUTRAL":
+            base_thr = min(85, entry_thr + 5)
+        # BEAR: regime kill_switch already blocks — threshold is moot
+        threshold_floor = base_thr
+        # P1-2 (2026-06-26): Late-entry risk premium. Entries after 14:00 ET
+        # face shrinking liquidity, wider spreads, and immediate overnight gap
+        # exposure before the thesis has time to play out. Raise the bar by
+        # 5 points so only the highest-conviction setups fire in the last 90
+        # minutes. Stacking add-ons (already held, already survived at least
+        # one session) are exempt — the gate only applies to brand-new names.
+        _now_et = clock.ny_now()
+        _late_min = 14 * 60  # 14:00 ET
+        _late_cutoff = (_now_et.hour * 60 + _now_et.minute) >= _late_min
         # Refresh the blacklist before this scan's symbol loop. Cheap (file read).
         _bl_active = blacklist.get_blacklist()
         for sym in tickers:
@@ -435,6 +533,8 @@ def scan_once() -> None:
                 df = c.get_kline(sym, bars=120)
                 # Look-ahead audit — never score on a still-forming intraday bar.
                 df = _drop_forming_bar(df, settings.timeframe)
+                # P0-2: keep df for structural stop computation later
+                all_dfs[sym] = df
                 # Independent strategies: each can submit if its own score
                 # clears the floor. 2026-05-29: added strategy_momentum
                 # (stricter breakout setup) — sized identically to trend, just
@@ -522,6 +622,20 @@ def scan_once() -> None:
             if not is_stack_candidate and new_names_opened >= new_names_limit:
                 continue
 
+            # P1-2: Late-entry gate — new names after 14:00 ET must clear a
+            # higher bar (+5 pts). Stacking add-ons skip this (they already
+            # survived a session and the thesis was already validated).
+            if _late_cutoff and not is_stack_candidate and sig.score < min(88, threshold_floor + 8):
+                _late_reason = (
+                    f"late session ({_now_et:%H:%M} ET) — new-name entry requires score ≥ "
+                    f"{min(88, threshold_floor + 8)} (got {sig.score})"
+                )
+                log.info("Skip %s [late_entry]: %s", sig.symbol, _late_reason)
+                audit.record("skip", symbol=sig.symbol, gate="late_entry",
+                             reason=_late_reason, score=sig.score)
+                scan_skips.append((sig.symbol, "late_entry"))
+                continue
+
             # Stacking add-ons require the rule score to clear full threshold —
             # don't pyramid on a marginal setup, even if base setup was strong.
             if is_stack_candidate and sig.score < entry_thr:
@@ -560,16 +674,28 @@ def scan_once() -> None:
                     if not daily_ok:
                         _skip("mtf", daily_reason)
                         continue
-                gap_ok, gap_reason = indicators.check_gap(df_d, max_gap_pct=settings.max_gap_pct)
+                # Directional gap filter: trend/momentum strategies WANT gap-ups
+                # (they ARE the breakout signal). Only mean-reversion and pattern
+                # strategies should block positive gaps (chase risk → reversion).
+                # Gap-downs are ALWAYS blocked — catching a falling knife is never
+                # the strategy's edge regardless of direction.
+                _sig_strat = getattr(sig, 'strategy', 'trend')
+                _block_up = _sig_strat not in ('trend', 'momentum_break')
+                gap_ok, gap_reason = indicators.check_gap(
+                    df_d, max_gap_pct=settings.max_gap_pct, block_up_gaps=_block_up)
                 if not gap_ok:
                     _skip("gap", gap_reason)
                     continue
 
-            # --- Earnings / spread (cheap context veto) ---
-            # 2026-06-03: sector-exposure gate removed — structurally non-binding
-            # (MAX_PER_SECTOR=5 >= MAX_POSITIONS=5, so a sector can never exceed
-            # the total-position cap). check_sector_exposure() is kept in sector.py
-            # but no longer called here. SECTOR_MAP/get_sector still used elsewhere.
+            # --- Earnings / spread / sector (cheap context veto) ---
+            # Sector-exposure gate (2026-06-26: re-enabled with MAX_PER_SECTOR=3).
+            # Prevents >60% of capital from concentrating in one sector bucket —
+            # natural hedge against sector-wide gap risk (e.g. SOX −5%).
+            sector_ok, sector_reason = sector.check_sector_exposure(
+                sig.symbol, positions, pending_symbols)
+            if not sector_ok:
+                _skip("sector", sector_reason)
+                continue
             ern_blocked, ern_reason = earnings_block(sig.symbol)
             if ern_blocked:
                 _skip("earnings", ern_reason)
@@ -585,7 +711,38 @@ def scan_once() -> None:
 
             # Position conviction (ML removed 2026-06-03; with the hard
             # threshold, setup_conviction is 1.0 — kept for the VIX/DD sizing path).
+            #
+            # P1-2 (2026-06-26): ML scorer (XGBoost) blends with hand-written
+            # score. Starts at 30% weight, graduates to 85% after 150 trades.
+            # The blended_score replaces the raw indicator score for threshold
+            # comparison and sizing, while the original sig.score is preserved
+            # for audit. When the model isn't trained yet, ml_weight=0 →
+            # blended = hand-written (identical to old behaviour).
             conviction = setup_conviction
+            ml_proba = None
+            # Save original score before ML blend modifies it
+            _orig_score = sig.score
+            _candidate_df = all_dfs.get(sig.symbol)
+            _ml_features = None   # P1-2: persisted in audit → ML retraining
+            if not is_stack_candidate:
+                try:
+                    from . import ml_scorer
+                    ml = ml_scorer.score(
+                        sig, opendf=_candidate_df,
+                        dailydf=df_d,
+                        regime_label=effective_label,
+                        vix=vix,
+                    )
+                    _ml_features = ml.get("ml_features")
+                    if ml["weight"] > 0:
+                        ml_proba = ml["ml_proba"]
+                        sig.score = ml["blended_score"]
+                        log.info("%s ML blend: rule=%.1f ml=%.1f(w=%.0f%%) → %.1f",
+                                 sig.symbol, _orig_score,
+                                 ml["ml_score"], ml["weight"] * 100,
+                                 sig.score)
+                except Exception as e:
+                    log.debug("ML scorer skipped for %s: %s", sig.symbol, e)
 
             # --- AI verdict (Gemini + Tavily news, independent advisory) ---
             # Stacking add-ons skip AI consult — we've already done the diligence
@@ -617,28 +774,12 @@ def scan_once() -> None:
                      sig.symbol, sig.score,
                      "pass" if ai_pass else "veto", conviction, ai_reason)
 
-            # --- Pattern-vision confirmation (pattern strategy only) ---
-            # The "AI" half of the algorithm+vision design. Advisory by default
-            # (logged + shown in the buy card) so the live signal set matches the
-            # algo-only backtest; set PATTERN_VISION_BLOCKING to let a confident
-            # 'reject' gate the entry. FAIL-SAFE inside pattern_vision.confirm.
+            # P0-5 (2026-06-26): pattern_vision removed from live path.
+            # Geometric detection (pattern_detect.py) is deterministic, fast,
+            # and works in both live + backtest. AI chart-image confirmation
+            # was slow, expensive, and added latency without verified edge.
+            # The module stays for future opt-in, but the live path skips it.
             vision_conf = vision_label = vision_reason = None
-            if (sig.strategy == "pattern" and settings.pattern_vision_enabled
-                    and not is_stack_candidate and vision_budget > 0):
-                df_v = pattern_dfs.get(sig.symbol)
-                if df_v is not None:
-                    try:
-                        v_ok, vision_conf, vision_label, vision_reason = \
-                            pattern_vision.confirm(sig, df_v)
-                    except Exception as e:
-                        v_ok, vision_reason = True, f"vision error: {e}"
-                    vision_budget -= 1
-                    log.info("%s pattern-vision=%s conf=%s (%s)", sig.symbol,
-                             "confirm" if v_ok else "reject", vision_conf, vision_reason)
-                    if (settings.pattern_vision_blocking and not v_ok
-                            and (vision_conf or 0) >= settings.pattern_vision_reject_conf):
-                        _skip("pattern_vision", vision_reason)
-                        continue
 
             # --- moomoo-style sentiment read (Phase 2B; advisory) ---
             # 看好/中性/看空 multi-factor score. ADVISORY — never changes which
@@ -648,18 +789,11 @@ def scan_once() -> None:
             sent_score = None
             if (settings.sentiment_scoring_enabled and not is_stack_candidate
                     and sentiment_budget > 0):
-                # Fold the options-flow read into the sentiment fusion (moomoo-card
-                # style) when the options subscription is active. Self-protecting.
-                opt_summary = ""
-                if settings.options_flow_enabled:
-                    try:
-                        of = options_flow.assess(sig.symbol, c)
-                        opt_summary = f"{of['signal']} ({of['detail']})"
-                    except Exception:
-                        opt_summary = ""
+                # P0-5 (2026-06-26): options_flow removed — noise > signal at $5K
+                # scale. AI validator handles sentiment from news better.
                 try:
                     sent_verdict, sent_score, sent_reason = \
-                        ai_validator.assess_sentiment(sig, opt_summary)
+                        ai_validator.assess_sentiment(sig, "")
                 except Exception as e:
                     sent_verdict, sent_score, sent_reason = "neutral", 50, f"sentiment error: {e}"
                 sentiment_budget -= 1
@@ -693,8 +827,23 @@ def scan_once() -> None:
             # a % of account, so both scale together and it never fires).
             # portfolio.heat_check() is kept as the heat primitive but not called.
 
+            # P0-2 (2026-06-26): structural stop — compute a swing-low-based
+            # stop and pre-set it on the signal. executor then takes the TIGHTER
+            # of the ATR stop and this structural level. Market-makers can scan
+            # for ATR clusters; they can't see a swing low.
+            sig_df = all_dfs.get(sig.symbol)
+            if sig_df is not None:
+                try:
+                    from . import pattern_detect
+                    sig.structural_stop = pattern_detect.structural_stop(
+                        sig_df, sig.price, sig.stop_loss)
+                except Exception:
+                    pass  # structural stop is optional — never block on it
+
             try:
-                opened = executor.open_position(c, sig, qty)
+                opened = executor.open_position(c, sig, qty,
+                                                  ml_proba=ml_proba,
+                                                  ml_features=_ml_features)
                 if opened is None:
                     # Market ran past the signal price — same no-fill the
                     # backtest's open-only model books. Not an error.
@@ -745,7 +894,12 @@ def scan_once() -> None:
                                         "vision_confidence": vision_conf,
                                         "vision_label": vision_label,
                                         "vision_reason": vision_reason}
-                                       if sig.strategy == "pattern" else {})})
+                                       if sig.strategy == "pattern" else {}),
+                                    # P1-2: persist feature vector so the ML
+                                    # model can retrain on this trade when it
+                                    # closes (label = pnl>0)
+                                    **({"ml_features": _ml_features}
+                                       if _ml_features else {})})
                 notifier.send(notifier.signal_msg(sig, ai_reason, qty))
                 cash -= qty * sig.price
                 pending_value += qty * sig.price
@@ -929,6 +1083,33 @@ def _monthly_optuna_job() -> None:
         notifier.send(f"⚠ Monthly Optuna failed: {e}")
 
 
+def _monthly_lever_recheck_job() -> None:
+    """1st of each month 03:30 ET — re-validate the data-derived exit levers.
+
+    Born from the 2026-06-25 MAE/MFE → lever sweep: most single-trade heuristics
+    failed portfolio validation; only widening TP (8→10) helped. This re-runs the
+    TP/SL drift check monthly so a regime shift that moves the optimum is flagged
+    early. Telegrams a one-screen summary; like monthly Optuna it **does NOT auto-
+    edit .env** — the owner reviews. Runs after the 03:00 Optuna study.
+    """
+    log.info("monthly lever recheck: starting")
+    try:
+        from . import lever_recheck
+        res = lever_recheck.monthly_recheck(days=180)
+        notifier.send(lever_recheck.format_telegram(res))
+        enqueued = lever_recheck.apply_suggestions(res)
+        if enqueued:
+            notifier.send(
+                f"📥 已把 {len(enqueued)} 条 lever 建议放进审批队列 — 在 Telegram/GUI "
+                f"一键批准即生效（实盘热改、无需重启、带自动回滚）。")
+        log.info("monthly lever recheck done: suggestions=%d enqueued=%d",
+                 len(res["suggestions"]), len(enqueued))
+        cron_state.record_run("monthly_lever_recheck")
+    except Exception as e:
+        log.exception("monthly lever recheck failed: %s", e)
+        notifier.send(f"⚠ Monthly lever recheck failed: {e}")
+
+
 def _daily_blacklist_review_job() -> None:
     """Daily 23:00 ET — adaptive blacklist evaluation.
 
@@ -943,6 +1124,63 @@ def _daily_blacklist_review_job() -> None:
         cron_state.record_run("daily_blacklist")
     except Exception as e:
         log.exception("blacklist review failed: %s", e)
+
+
+def _daily_auto_budget_job() -> None:
+    """Daily after the close (16:45 ET) — recompute the auto-compounding budget.
+
+    No-op unless AUTO_BUDGET_ENABLED (or the web toggle) is on. When armed, it
+    grows/shrinks the deployable budget off realized profit, bounded by the
+    seed-relative floor/ceil + live account equity, and Telegram-notifies any
+    change (铁律: never silent). The DD breaker is unaffected — equity stays
+    anchored to the frozen seed (see src/auto_budget.py / equity_baseline)."""
+    try:
+        from . import auto_budget
+        res = auto_budget.recompute_and_apply()
+        if res.get("applied"):
+            log.warning("auto_budget applied: $%.0f → $%.0f",
+                        res.get("old", 0), res.get("new", 0))
+        else:
+            log.info("auto_budget: %s", res.get("reason", "no change"))
+        cron_state.record_run("auto_budget")
+    except Exception as e:
+        log.exception("auto_budget recompute failed: %s", e)
+
+
+def _weekly_autopilot_job() -> None:
+    """Monday 09:00 ET (KL 21:00) — DeepSeek autonomous portfolio manager."""
+    log.info("weekly autopilot: starting")
+    try:
+        from . import autopilot
+        result = autopilot.weekly_autopilot()
+        log.info("weekly autopilot done: %s", result.get("status", "unknown"))
+        cron_state.record_run("weekly_autopilot")
+    except Exception as e:
+        log.exception("weekly autopilot failed: %s", e)
+        notifier.send(f"⚠ Weekly autopilot failed: {e}")
+
+
+def _weekly_ml_retrain_job() -> None:
+    """Monday 09:20 ET (KL 21:20) — re-train XGBoost on all closed trades.
+    Runs AFTER autopilot+backtest so the model trains on the freshest data.
+    No-op if xgboost is not installed or <20 labeled trades exist.
+    """
+    log.info("weekly ML retrain: starting")
+    try:
+        from . import ml_scorer
+        result = ml_scorer.train(force=True)
+        status = result.get("status", "unknown")
+        if status == "trained":
+            log.info(
+                "ML retrain done: %d trades, %.1f%% train-acc, model saved",
+                result.get("n_labeled", 0),
+                result.get("train_accuracy_pct", 0),
+            )
+        else:
+            log.info("ML retrain: %s — %s", status, result.get("reason", ""))
+        cron_state.record_run("ml_retrain")
+    except Exception as e:
+        log.warning("weekly ML retrain failed: %s", e)
 
 
 def _weekly_self_review_job() -> None:
@@ -1028,22 +1266,34 @@ def _run_catchup_on_startup() -> None:
         ("daily_blacklist",
          cron_state.expected_last_fire_daily(23, 0, weekdays_only=True),
          _daily_blacklist_review_job, "Daily blacklist review"),
+        ("auto_budget",
+         cron_state.expected_last_fire_daily(16, 45, weekdays_only=True),
+         _daily_auto_budget_job, "Daily auto-compounding budget"),
         # watchlist_refresh + ml_retrain catch-up removed 2026-06-03 (see run_loop):
         # both were silent-execution violations; now manual GUI actions only.
         # universe_refresh (Phase 1) is different: it's a RULE the owner enabled
         # explicitly via DYNAMIC_UNIVERSE_ENABLED, and every change telegrams.
         ("universe_refresh",
-         cron_state.expected_last_fire_weekly(6, 22, 0),   # Sunday 22:00
+         cron_state.expected_last_fire_weekly(0, 9, 5),    # Monday 09:05 ET
          _universe_refresh_job, "Weekly universe refresh"),
         ("weekly_backtest",
-         cron_state.expected_last_fire_weekly(6, 22, 30),  # Sunday 22:30
+         cron_state.expected_last_fire_weekly(0, 9, 10),   # Monday 09:10 ET
          _weekly_backtest_validation_job, "Weekly backtest"),
+        ("weekly_autopilot",
+         cron_state.expected_last_fire_weekly(0, 9, 0),    # Monday 09:00 ET
+         _weekly_autopilot_job, "Weekly autopilot (DeepSeek)"),
         ("self_review",
-         cron_state.expected_last_fire_weekly(6, 23, 0),   # Sunday 23:00
+         cron_state.expected_last_fire_weekly(0, 9, 15),   # Monday 09:15 ET
          _weekly_self_review_job, "Weekly self-review"),
+        ("ml_retrain",
+         cron_state.expected_last_fire_weekly(0, 9, 20),   # Monday 09:20 ET
+         _weekly_ml_retrain_job, "Weekly ML retrain"),
         ("monthly_optuna",
          cron_state.expected_last_fire_monthly(1, 3, 0),
          _monthly_optuna_job, "Monthly Optuna optimization"),
+        ("monthly_lever_recheck",
+         cron_state.expected_last_fire_monthly(1, 3, 30),
+         _monthly_lever_recheck_job, "Monthly lever recheck"),
     ]
 
     missed = [(name, fn, label) for name, exp, fn, label in plan
@@ -1249,30 +1499,55 @@ def run_loop() -> None:
                   day_of_week="mon-fri", hour=9, minute=31,
                   coalesce=True, misfire_grace_time=600, max_instances=1)
 
-    # Weekly universe refresh: Sunday 22:00 ET (Phase 1) — rule-based watchlist
-    # rebuild, BEFORE the 22:30 backtest so the health check scores next week's
+    # Weekly jobs — all run Monday morning ET (= Monday 9PM KL GMT+8).
+    # Staggered by 5 min so each finishes before the next starts.
+    # Order: autopilot (no deps) → universe → backtest (needs universe) → self-review
+
+    # P2-1: Weekly autopilot — Monday 09:00 ET (KL 21:00). DeepSeek reviews
+    # the week, proposes parameter changes, backtest-validates each, auto-applies
+    # within guardrails. Runs FIRST so any auto-applied changes feed into the
+    # universe/backtest/self-review that follow.
+    sched.add_job(_weekly_autopilot_job, "cron",
+                  day_of_week="mon", hour=9, minute=0,
+                  coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # Weekly universe refresh: Monday 09:05 ET (KL 21:05) — rule-based watchlist
+    # rebuild, BEFORE the 09:10 backtest so the health check scores next week's
     # actual list. No-op unless DYNAMIC_UNIVERSE_ENABLED.
     sched.add_job(_universe_refresh_job, "cron",
-                  day_of_week="sun", hour=22, minute=0,
+                  day_of_week="mon", hour=9, minute=5,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
-    # Weekly backtest validation: Sunday 22:30 ET — health-check the strategy
-    # on a rolling 90-day window.
-    # on the fresh ticker set.
+    # Weekly backtest validation: Monday 09:10 ET (KL 21:10) — health-check the
+    # strategy on a rolling 90-day window, now on the fresh ticker set.
     sched.add_job(_weekly_backtest_validation_job, "cron",
-                  day_of_week="sun", hour=22, minute=30,
+                  day_of_week="mon", hour=9, minute=10,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
-    # Weekly SELF-REVIEW of REAL fills: Sunday 23:00 ET. Reviews what the bot
-    # actually did (not a backtest), emits suggestions for owner approval.
+    # Weekly SELF-REVIEW of REAL fills: Monday 09:15 ET (KL 21:15). Reviews what
+    # the bot actually did (not a backtest), emits suggestions for owner approval.
     sched.add_job(_weekly_self_review_job, "cron",
-                  day_of_week="sun", hour=23, minute=0,
+                  day_of_week="mon", hour=9, minute=15,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
+
+    # Weekly ML retrain: Monday 09:20 ET (KL 21:20). Re-trains the XGBoost
+    # model on all closed trades. Runs last in the Monday chain so it trains
+    # on the freshest data (autopilot may have applied param changes that
+    # affect the next week's trades).
+    sched.add_job(_weekly_ml_retrain_job, "cron",
+                  day_of_week="mon", hour=9, minute=20,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
     # Monthly Optuna re-optimization: 1st of each month at 03:00 ET. Runs
     # AFTER the ML retrain at 02:00 so the search uses the freshest model.
     # Telegrams suggested params; user reviews before editing .env.
     sched.add_job(_monthly_optuna_job, "cron", day=1, hour=3, minute=0,
+                  coalesce=True, misfire_grace_time=3600, max_instances=1)
+
+    # Monthly lever recheck: 1st of each month at 03:30 ET, AFTER Optuna. Re-runs
+    # the 2026-06-25 TP/SL drift check on the watchlist and telegrams a one-screen
+    # summary. Suggestion-only — never edits .env (owner reviews, same as Optuna).
+    sched.add_job(_monthly_lever_recheck_job, "cron", day=1, hour=3, minute=30,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)
 
     # Telegram approval sync: every 5 min, any time of day. Posts pending
@@ -1337,10 +1612,17 @@ def run_loop() -> None:
                   day_of_week="mon-fri", hour=23, minute=0,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
+    # Auto-compounding budget: 16:45 ET every weekday (after the 16:00 close so
+    # the day's realized PnL is final). No-op unless armed. Grows/shrinks the
+    # deployable budget off realized profit and Telegram-notifies any change.
+    sched.add_job(_daily_auto_budget_job, "cron",
+                  day_of_week="mon-fri", hour=16, minute=45,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
+
     log.info(
-        "scheduler started — scan=%dm, weekly backtest=Sun 22:30, "
-        "monthly Optuna=1st@03:00, daily blacklist=23:00 ET "
-        "(ML retrain + watchlist refresh disabled — manual GUI only)",
+        "scheduler started — scan=%dm, "
+        "weekly autopilot/backtest/review=Mon 09:00 ET (KL 21:00), "
+        "monthly Optuna=1st@03:00, daily blacklist=23:00 ET",
         settings.scan_interval_min,
     )
     from .i18n import t

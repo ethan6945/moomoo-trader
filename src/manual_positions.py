@@ -55,7 +55,8 @@ def review_adopted(client, symbols, regime=None) -> list[dict]:
 
 def _ai_read(sig) -> str:
     """Best-effort one-line AI read for the card. Never raises; '' if no key."""
-    if not settings.gemini_keys or sig is None:
+    from . import ai
+    if not ai.has_key() or sig is None:
         return ""
     try:
         from . import ai_validator

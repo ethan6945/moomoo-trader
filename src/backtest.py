@@ -210,6 +210,15 @@ class BacktestConfig:
     # the emitted borrowed dollar-days. Default 0 = off, parity untouched.
     conviction_lev_score: float = 0.0
     conviction_lev_mult: float = 1.5
+    # ── EXPERIMENT (2026-06-25): continuous score-based conviction sizing ──
+    # Replaces the binary "full size once score ≥ threshold" with a size that
+    # scales with how far the score clears the threshold: score_size_lo× at
+    # score==threshold → score_size_hi× at score==100. Stacks into qty_mult like
+    # the regime/VIX multipliers, so the 40% position cap still re-clamps the top
+    # end. Default off + parity-suppressed → the honest baseline is unchanged.
+    use_score_sizing: bool = False
+    score_size_lo: float = 0.6     # multiplier at score == threshold (marginal signal)
+    score_size_hi: float = 1.3     # multiplier at score == 100 (max conviction)
     use_realistic_commission: bool = False  # moomoo per-order fees instead of flat $1
     commission_pct_per_order: float = 0.0003  # moomoo MY US: 0.03% × notional / order / side
     platform_fee_per_order: float = 0.99      # moomoo MY US: $0.99 / order / side

@@ -39,8 +39,13 @@ KNOWN_JOBS: tuple[str, ...] = (
     "weekly_backtest",
     "monthly_optuna",
     "daily_blacklist",
-    "self_review",        # weekly self-improvement — catch up if laptop was off
-    "universe_refresh",   # Phase 1 weekly rule-based watchlist rebuild
+    "self_review",
+    "universe_refresh",
+    "auto_budget",
+    "weekly_autopilot",        # P2-1 DeepSeek autonomous manager (2026-06-26)
+    "monthly_lever_recheck",   # monthly TP/SL drift revalidation
+    "premarket_gap_sentinel",  # pre-open overnight gap check
+    "open_gap_exit",           # at-open gap-risk execution
 )
 
 

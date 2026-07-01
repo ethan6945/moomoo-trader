@@ -11,24 +11,14 @@ the remaining 10 points.
 """
 from __future__ import annotations
 
-import itertools
 import json
 import logging
 import re
 
-from google import genai
-
-from .config import settings, gemini_cascade
 from .indicators import Signal
-from . import news_fetcher
+from . import ai, news_fetcher
 
 log = logging.getLogger(__name__)
-
-_KEY_CYCLE = itertools.cycle(settings.gemini_keys) if settings.gemini_keys else None
-
-
-def _next_key() -> str | None:
-    return next(_KEY_CYCLE) if _KEY_CYCLE else None
 
 
 PROMPT = """You are a risk gate for an automated short-term US-stock trading bot.
@@ -58,12 +48,15 @@ If you have no concerning info, default to "pass".
 def validate(signal: Signal) -> tuple[bool, int, str]:
     """Returns (pass, ai_sub_score_0_100, reason). On error, defaults to pass.
 
-    Cascades through models from strongest to lightest (gemini_cascade()).
-    On 429 / quota exhausted, moves to the next model automatically.
+    P1-1 (2026-06-26): when AI_ENSEMBLE_ENABLED and both providers have keys,
+    uses ensemble voting (Gemini + DeepSeek in parallel). Consensus = high
+    confidence pass/veto; conflict = pass with 30% confidence (conservative).
+    Single-provider fallback when only one has keys.
     """
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return True, 50, "no Gemini key configured — neutral"
+    from .config import settings as _s
+
+    if not ai.has_key():
+        return True, 50, "no AI key configured — neutral"
 
     ticker_news = news_fetcher.format_news(
         news_fetcher.fetch_ticker_news(signal.symbol), "Ticker news"
@@ -79,40 +72,37 @@ def validate(signal: Signal) -> tuple[bool, int, str]:
         macro_news=macro_news,
     )
 
-    import time
-    for model_name in gemini_cascade():
-        for key in keys:
-            for attempt in range(2):
-                try:
-                    client = genai.Client(api_key=key)
-                    resp = client.models.generate_content(model=model_name, contents=prompt)
-                    text = resp.text.strip()
-                    match = re.search(r"\{.*\}", text, re.DOTALL)
-                    payload = json.loads(match.group(0) if match else text)
-                    verdict = payload.get("verdict", "pass")
-                    confidence = int(payload.get("confidence", 50))
-                    reason = payload.get("reason", "")
-                    is_pass = verdict == "pass"
-                    sub_score = confidence if is_pass else 0
-                    log.info("AI validator [%s] %s → %s (%d)",
-                             model_name, signal.symbol, verdict, confidence)
-                    return is_pass, sub_score, reason
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                        log.info("AI validator: %s quota hit on %s → next key",
-                                 model_name, signal.symbol)
-                        break  # quota → try next key
-                    if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
-                        time.sleep(4)
-                        continue
-                    log.warning("AI validator: %s error on %s: %s", model_name, signal.symbol, e)
-                    break
-        log.info("AI validator: all keys quota'd on %s for %s → next model",
-                 model_name, signal.symbol)
+    try:
+        # P1-1: ensemble mode when both providers have keys and flag is on
+        if _s.ai_ensemble_enabled and ai.has_key("gemini") and ai.has_key("deepseek"):
+            result = ai.generate_ensemble(prompt)
+            ens_verdict = result["verdict"]
+            if ens_verdict == "consensus":
+                text = result["text"]
+                model_name = f"ensemble({result['gemini']['model']}+{result['deepseek']['model']})"
+            elif ens_verdict in ("single", "conflict"):
+                text = result["text"]
+                src = result["gemini"] or result["deepseek"] or {}
+                model_name = f"ensemble-{ens_verdict}({src.get('model','?')})"
+            else:  # unavailable
+                return True, 50, "ensemble unavailable — neutral"
+        else:
+            text, model_name = ai.generate(prompt)
 
-    log.warning("AI validator: all models exhausted for %s — defaulting to pass", signal.symbol)
-    return True, 50, "AI quota exhausted across all models — neutral"
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        payload = json.loads(match.group(0) if match else text)
+        verdict = payload.get("verdict", "pass")
+        confidence = int(payload.get("confidence", 50))
+        reason = payload.get("reason", "")
+        is_pass = verdict == "pass"
+        sub_score = confidence if is_pass else 0
+        log.info("AI validator [%s] %s → %s (%d)",
+                 model_name, signal.symbol, verdict, confidence)
+        return is_pass, sub_score, reason
+    except Exception as e:
+        log.warning("AI validator unavailable for %s (%s) — defaulting to pass",
+                    signal.symbol, e)
+        return True, 50, "AI unavailable — neutral"
 
 
 GAP_PROMPT = """You are an EXIT risk gate for an automated US-stock trading bot.
@@ -151,11 +141,10 @@ def assess_gap_risk(symbol: str) -> tuple[bool, int, str]:
     i.e. HOLD. We never liquidate a real position on AI doubt — only on a clear,
     high-confidence 'sell' verdict citing concrete negative news.
     """
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return False, 0, "no Gemini key — sentinel AI layer inert (hold)"
+    if not ai.has_key():
+        return False, 0, "no AI key — sentinel AI layer inert (hold)"
 
-    # Cost control: skip the Gemini call entirely when there is no fresh ticker
+    # Cost control: skip the AI call entirely when there is no fresh ticker
     # news — no news ⇒ no concrete catalyst ⇒ hold, for free.
     try:
         news_items = news_fetcher.fetch_ticker_news(symbol)
@@ -171,35 +160,20 @@ def assess_gap_risk(symbol: str) -> tuple[bool, int, str]:
         return False, 0, f"news format failed ({e}) — hold"
     prompt = GAP_PROMPT.format(symbol=symbol, ticker_news=ticker_news, macro_news=macro_news)
 
-    # Cost control: ONE fixed cheap model (not the strongest-first entry cascade).
-    import time
-    model_name = settings.gap_sentinel_model
-    for key in keys:
-        for attempt in range(2):
-            try:
-                client = genai.Client(api_key=key)
-                resp = client.models.generate_content(model=model_name, contents=prompt)
-                text = resp.text.strip()
-                match = re.search(r"\{.*\}", text, re.DOTALL)
-                payload = json.loads(match.group(0) if match else text)
-                action = str(payload.get("action", "hold")).lower()
-                confidence = int(payload.get("confidence", 0))
-                reason = payload.get("reason", "")
-                should_sell = action == "sell"
-                log.info("gap sentinel [%s] %s → %s (%d)", model_name, symbol, action, confidence)
-                return should_sell, confidence, reason
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    break  # quota on this key → try next key
-                if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
-                    time.sleep(4)
-                    continue
-                log.warning("gap sentinel: %s error on %s: %s", model_name, symbol, e)
-                break
-    # Exhausted → FAIL-SAFE hold (never sell on AI unavailability).
-    log.warning("gap sentinel: AI unavailable for %s — holding (fail-safe)", symbol)
-    return False, 0, "AI unavailable — hold (fail-safe)"
+    try:
+        text, model_name = ai.generate(prompt)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        payload = json.loads(match.group(0) if match else text)
+        action = str(payload.get("action", "hold")).lower()
+        confidence = int(payload.get("confidence", 0))
+        reason = payload.get("reason", "")
+        should_sell = action == "sell"
+        log.info("gap sentinel [%s] %s → %s (%d)", model_name, symbol, action, confidence)
+        return should_sell, confidence, reason
+    except Exception as e:
+        # FAIL-SAFE hold (never sell on AI unavailability).
+        log.warning("gap sentinel: AI unavailable for %s (%s) — holding (fail-safe)", symbol, e)
+        return False, 0, "AI unavailable — hold (fail-safe)"
 
 
 EXIT_PROMPT = """You are an EXIT risk gate for an automated, LONG-ONLY US-stock
@@ -244,9 +218,8 @@ def assess_exit(symbol: str, tech_summary: str, entry: float = 0.0,
     quota / error → (False, 0, ...) i.e. HOLD. We never liquidate on AI doubt.
     Uses the dedicated smart_exit_model (≥3.5-flash), one fixed model, key-cycled.
     """
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return False, 0, "no Gemini key — smart-exit AI inert (hold)"
+    if not ai.has_key():
+        return False, 0, "no AI key — smart-exit AI inert (hold)"
 
     # Cost control: no fresh ticker news ⇒ no concrete catalyst ⇒ hold, for free.
     try:
@@ -265,33 +238,19 @@ def assess_exit(symbol: str, tech_summary: str, entry: float = 0.0,
                                 tech_summary=tech_summary,
                                 ticker_news=ticker_news, macro_news=macro_news)
 
-    import time
-    model_name = settings.smart_exit_model
-    for key in keys:
-        for attempt in range(2):
-            try:
-                client = genai.Client(api_key=key)
-                resp = client.models.generate_content(model=model_name, contents=prompt)
-                text = resp.text.strip()
-                match = re.search(r"\{.*\}", text, re.DOTALL)
-                payload = json.loads(match.group(0) if match else text)
-                action = str(payload.get("action", "hold")).lower()
-                confidence = int(payload.get("confidence", 0))
-                reason = payload.get("reason", "")
-                should_sell = action == "sell"
-                log.info("smart-exit [%s] %s → %s (%d)", model_name, symbol, action, confidence)
-                return should_sell, confidence, reason
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    break  # quota on this key → next key
-                if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
-                    time.sleep(4)
-                    continue
-                log.warning("smart-exit: %s error on %s: %s", model_name, symbol, e)
-                break
-    log.warning("smart-exit: AI unavailable for %s — holding (fail-safe)", symbol)
-    return False, 0, "AI unavailable — hold (fail-safe)"
+    try:
+        text, model_name = ai.generate(prompt)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        payload = json.loads(match.group(0) if match else text)
+        action = str(payload.get("action", "hold")).lower()
+        confidence = int(payload.get("confidence", 0))
+        reason = payload.get("reason", "")
+        should_sell = action == "sell"
+        log.info("smart-exit [%s] %s → %s (%d)", model_name, symbol, action, confidence)
+        return should_sell, confidence, reason
+    except Exception as e:
+        log.warning("smart-exit: AI unavailable for %s (%s) — holding (fail-safe)", symbol, e)
+        return False, 0, "AI unavailable — hold (fail-safe)"
 
 
 SENTIMENT_PROMPT = """You are a multi-factor analyst for a LONG-ONLY US-stock
@@ -332,9 +291,8 @@ def assess_sentiment(signal, options_summary: str = "") -> tuple[str, int, str]:
     (verdict, score_0_100, reason). ADVISORY — never vetoes. FAIL-SAFE → neutral
     ('neutral', 50, ...) on no key / quota / error. Uses sentiment_model (≥3.5).
     options_summary (optional) injects the options-flow read as a 4th factor."""
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return "neutral", 50, "no Gemini key — sentiment inert (neutral)"
+    if not ai.has_key():
+        return "neutral", 50, "no AI key — sentiment inert (neutral)"
 
     try:
         ticker_news = news_fetcher.format_news(
@@ -348,29 +306,16 @@ def assess_sentiment(signal, options_summary: str = "") -> tuple[str, int, str]:
         ticker_news=ticker_news, macro_news=macro_news,
         options_flow=options_summary or "(none)")
 
-    import time
-    model_name = settings.sentiment_model
-    for key in keys:
-        for attempt in range(2):
-            try:
-                client = genai.Client(api_key=key)
-                resp = client.models.generate_content(model=model_name, contents=prompt)
-                text = resp.text.strip()
-                match = re.search(r"\{.*\}", text, re.DOTALL)
-                payload = json.loads(match.group(0) if match else text)
-                verdict = str(payload.get("verdict", "neutral")).lower()
-                score = int(payload.get("score", 50))
-                reason = payload.get("reason", "")
-                log.info("sentiment [%s] %s → %s (%d)", model_name, signal.symbol, verdict, score)
-                return verdict, score, reason
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    break
-                if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
-                    time.sleep(4)
-                    continue
-                log.warning("sentiment: %s error on %s: %s", model_name, signal.symbol, e)
-                break
-    log.warning("sentiment: AI unavailable for %s — neutral (fail-safe)", signal.symbol)
+    try:
+        text, model_name = ai.generate(prompt)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        payload = json.loads(match.group(0) if match else text)
+        verdict = str(payload.get("verdict", "neutral")).lower()
+        score = int(payload.get("score", 50))
+        reason = payload.get("reason", "")
+        log.info("sentiment [%s] %s → %s (%d)", model_name, signal.symbol, verdict, score)
+        return verdict, score, reason
+    except Exception as e:
+        log.warning("sentiment: AI unavailable for %s (%s) — neutral (fail-safe)",
+                    signal.symbol, e)
     return "neutral", 50, "AI unavailable — neutral (fail-safe)"

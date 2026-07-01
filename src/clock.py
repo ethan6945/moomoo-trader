@@ -179,7 +179,7 @@ def utc_now_corrected() -> datetime:
     """Same correction, but returned in UTC. Used by the heartbeat timestamps
     so they're consistent with ny_now()."""
     _maybe_refresh()
-    return datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=_offset_sec)
+    return datetime.now(timezone.utc) + timedelta(seconds=_offset_sec)
 
 
 def status() -> dict:

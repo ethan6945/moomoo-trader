@@ -83,12 +83,20 @@ def record_close(
     mfe_pct: float | None = None,
     mae_pct: float | None = None,
     ml_proba_entry: float | None = None,
+    ml_features: list[float] | None = None,
     strategy: str = "trend",
+    initial_risk: float | None = None,
 ) -> dict:
-    """Append closed trade with R-multiple, MFE/MAE, ML proba, strategy tag."""
+    """Append closed trade with R-multiple, MFE/MAE, ML proba, strategy tag.
+
+    `stop` is the CURRENT stop at close time (may have been ratcheted up by
+    breakeven). `initial_risk` (entry − original stop) is used for R-multiple
+    so the R metric doesn't distort to 0 when breakeven has raised stop=entry.
+    When not provided, falls back to `entry − stop` (legacy behavior).
+    """
     pnl = (exit_price - entry) * qty
     pnl_pct = (exit_price - entry) / entry * 100 if entry > 0 else 0.0
-    r_unit = entry - stop
+    r_unit = initial_risk if (initial_risk is not None and initial_risk > 0) else (entry - stop)
     r_multiple = (exit_price - entry) / r_unit if r_unit > 0 else 0.0
     row = {
         "ts": datetime.now(NY).isoformat(),
@@ -106,10 +114,17 @@ def record_close(
         "mae_pct": round(mae_pct, 2) if mae_pct is not None else None,
         "ml_proba_entry": round(ml_proba_entry, 3) if ml_proba_entry is not None else None,
         "strategy": strategy,
+        "extra": json.dumps({"ml_features": ml_features}) if ml_features else None,
     }
     # Persist to SQLite (primary) + legacy JSONL mirror (best-effort).
+    # Write SQLite FIRST, and only mirror to JSONL on success — so the two
+    # never diverge silently. If SQLite fails, the caller still gets the
+    # returned row, but the warning is loud and the trade is re-insertable
+    # from the JSONL mirror if needed.
+    db_ok = False
     try:
         db.closed_trade_insert(row)
+        db_ok = True
     except Exception as e:
         log.warning("closed_trade SQLite insert failed: %s", e)
     try:
@@ -118,6 +133,12 @@ def record_close(
             f.write(json.dumps(row) + "\n")
     except Exception as e:
         log.warning("legacy trade log write failed: %s", e)
+    if not db_ok:
+        # The trade is only in JSONL — flag it so the operator knows.
+        log.error(
+            "DATA LOSS RISK: trade %s %s pnl=%.2f written to JSONL but NOT DB — "
+            "stats/ML/panel will miss it until manually reconciled",
+            row.get("symbol"), row.get("exit_reason"), row.get("pnl", 0))
     return row
 
 

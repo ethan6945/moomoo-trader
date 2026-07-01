@@ -27,13 +27,17 @@ def append(snapshot: dict) -> None:
         **snapshot,
     }
     # Primary: SQLite. Mirror: legacy JSONL.
+    sql_ok = True
     try:
         db.history_insert(record)
     except Exception:
-        pass
+        sql_ok = False
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_FILE, "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
+    if not sql_ok:
+        import logging
+        logging.getLogger(__name__).warning("history SQLite insert failed — record in JSONL only")
 
 
 def load_all() -> list[dict]:

@@ -40,7 +40,7 @@ from flask import Flask, jsonify, make_response, redirect, request, send_from_di
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import approvals, clock, db, keepawake, risk_manager  # noqa: E402
+from src import ai, approvals, clock, db, keepawake, risk_manager  # noqa: E402
 from src.config import settings  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -437,6 +437,12 @@ def api_status():
         acct["realized_pnl_total"] = float(st.get("realized_pnl_total") or 0)
     except Exception:
         pass
+    # Auto-compounding budget snapshot (enabled/armed/seed/target) for the panel.
+    try:
+        from src import auto_budget
+        acct["auto_budget"] = auto_budget.status()
+    except Exception:
+        pass
     return jsonify(acct)
 
 
@@ -501,8 +507,8 @@ def api_reset_stats():
 # ── settings: .env key management ─────────────────────────────────────────────
 SETTING_KEYS = {
     "WEB_PASSWORD": "网页访问密码 — 设了之后，从手机/局域网打开面板要先登录(本机也是)。空=不需要密码(仅本机可用)。这是开放手机访问的前提。",
-    "DEEPSEEK_API_KEY": "DeepSeek 优化器 Key — 填了之后每周自动产参数建议(回测验证通过才进审批队列)。空=优化器不调用 LLM。",
-    "GEMINI_API_KEYS": "Gemini AI Key(逗号分隔多个)— 盘前/盘中信号卡的新闻+宏观分析。",
+    "GEMINI_API_KEYS": "Gemini AI Key(逗号分隔多个,自动轮换)— 所有 AI 分析(信号/情绪/退出/优化)。支持图表视觉确认。",
+    "DEEPSEEK_API_KEY": "DeepSeek API Key(可逗号分隔多个)— 切到 DeepSeek 引擎时用它做全部 AI 分析(纯文本,无图表视觉)。Gemini 不可用时的备份。",
     "TAVILY_API_KEY": "Tavily 新闻搜索 Key — 给 AI 提供实时新闻上下文。",
     "TELEGRAM_TOKEN": "Telegram Bot Token — 推送交易通知 + 审批卡片。",
     "TELEGRAM_CHAT_ID": "Telegram Chat ID — 接收通知的聊天 ID。",
@@ -575,6 +581,141 @@ def api_budget():
         return jsonify({"ok": False, "error": "bad value"}), 400
     db.update_state({"budget_usd": val})
     return jsonify({"ok": True, "budget": val})
+
+
+# ── Auto-compounding budget: "money making more money" ───────────────────────
+# Runtime toggle + arm/disarm + manual recompute. While armed, a daily EOD job
+# grows/shrinks the deployable budget off realized profit (high-water + give-
+# back), bounded by seed-relative floor/ceil + live equity, Telegram-notified.
+# The DD breaker is unaffected (equity stays anchored to the frozen seed).
+@app.route("/api/auto-budget", methods=["GET", "POST"])
+def api_auto_budget():
+    from src import auto_budget
+    if request.method == "GET":
+        return jsonify({"ok": True, **auto_budget.status()})
+    body = request.json or {}
+    action = (body.get("action") or "").lower()
+    try:
+        if "enabled" in body and not action:
+            db.update_state({"auto_budget_enabled": bool(body["enabled"])})
+        elif action == "arm":
+            seed = body.get("seed")
+            auto_budget.arm(float(seed) if seed is not None else None)
+            db.update_state({"auto_budget_enabled": True})
+        elif action == "disarm":
+            auto_budget.disarm()
+        elif action == "recompute":
+            res = auto_budget.recompute_and_apply()
+            return jsonify({"ok": True, "result": res, **auto_budget.status()})
+        else:
+            return jsonify({"ok": False, "error": "unknown action"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    return jsonify({"ok": True, **auto_budget.status()})
+
+
+# ── Bear-market cash-yield sweep toggle ──────────────────────────────────────
+@app.route("/api/cash-yield", methods=["GET", "POST"])
+def api_cash_yield():
+    from src import cash_yield
+    def _snap():
+        st = db.get_state()
+        return {"enabled": cash_yield.enabled(), "symbol": cash_yield.symbol(),
+                "only_bear": settings.cash_yield_only_bear,
+                "history": (st.get("cash_yield_history", []) or [])[-10:]}
+    if request.method == "GET":
+        return jsonify({"ok": True, **_snap()})
+    body = request.json or {}
+    if "enabled" in body:
+        db.update_state({"cash_yield_enabled": bool(body["enabled"])})
+        return jsonify({"ok": True, **_snap()})
+    return jsonify({"ok": False, "error": "expected {enabled}"}), 400
+
+
+# ── Inverse-ETF sleeve toggle (NOT VALIDATED — keep off until backtest passes) ─
+@app.route("/api/inverse-sleeve", methods=["GET", "POST"])
+def api_inverse_sleeve():
+    from src import inverse_sleeve
+    def _snap():
+        st = db.get_state()
+        return {"enabled": inverse_sleeve.enabled(), "symbol": inverse_sleeve.symbol(),
+                "position": st.get("inverse_sleeve_position"),
+                "history": (st.get("inverse_sleeve_history", []) or [])[-10:]}
+    if request.method == "GET":
+        return jsonify({"ok": True, **_snap()})
+    body = request.json or {}
+    if "enabled" in body:
+        db.update_state({"inverse_sleeve_enabled": bool(body["enabled"])})
+        return jsonify({"ok": True, **_snap()})
+    return jsonify({"ok": False, "error": "expected {enabled}"}), 400
+
+
+# ── AI engine: Gemini ⟷ DeepSeek toggle + live model dropdown ─────────────────
+# The active provider + model are a RUNTIME db-state override (no restart): the
+# running scheduler reads them per AI call (see src/ai.py). The model list is
+# fetched LIVE from each provider so a newly released model is selectable without
+# a code change. Live results are cached briefly to keep the dropdown snappy.
+_AI_MODELS_CACHE: dict = {}        # provider -> (ts, [models])
+_AI_MODELS_TTL = 300               # seconds
+
+
+@app.route("/api/ai-provider", methods=["GET", "POST"])
+def api_ai_provider():
+    if request.method == "GET":
+        cur = ai.active_provider()
+        return jsonify({
+            "provider": cur,
+            "model": ai.active_model(cur),
+            "supports_vision": ai.supports_vision(cur),
+            "providers": [
+                {"id": p, "label": ai.PROVIDER_LABELS[p],
+                 "has_key": ai.has_key(p), "default_model": ai.default_model(p),
+                 "vision": p == "gemini"}
+                for p in ai.PROVIDERS
+            ],
+        })
+    body = request.json or {}
+    provider = str(body.get("provider", "")).strip().lower()
+    if provider not in ai.PROVIDERS:
+        return jsonify({"ok": False, "error": "未知 AI 引擎"}), 400
+    if not ai.has_key(provider):
+        label = ai.PROVIDER_LABELS[provider]
+        return jsonify({"ok": False,
+                        "error": f"请先在上方填入 {label} 的 API Key 再切换。"}), 400
+    model = str(body.get("model", "")).strip() or ai.default_model(provider)
+    db.update_state({"ai_provider": provider, "ai_model": model})
+    note = (f"已切换到 {ai.PROVIDER_LABELS[provider]} · {model} — "
+            f"下一次扫描即生效，无需重启。")
+    if provider == "deepseek":
+        note += " 注意：DeepSeek 无图表视觉，形态视觉确认层会自动跳过。"
+    return jsonify({"ok": True, "provider": provider, "model": model, "note": note})
+
+
+@app.route("/api/ai-models")
+def api_ai_models():
+    import time as _t
+    provider = (request.args.get("provider") or ai.active_provider()).strip().lower()
+    if provider not in ai.PROVIDERS:
+        return jsonify({"ok": False, "error": "未知 AI 引擎"}), 400
+    cached = _AI_MODELS_CACHE.get(provider)
+    if cached and (_t.time() - cached[0] < _AI_MODELS_TTL):
+        return jsonify({"ok": True, "provider": provider, "models": cached[1],
+                        "cached": True})
+    try:
+        # Hard wall-clock timeout: never let a stalled SDK/network call hang the
+        # dropdown — fall back to the static list if the live fetch is slow.
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FTimeout
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            models = ex.submit(ai.list_models, provider).result(timeout=12)
+        if models:
+            _AI_MODELS_CACHE[provider] = (_t.time(), models)
+        return jsonify({"ok": True, "provider": provider, "models": models})
+    except Exception as e:
+        # Offline / no key / slow API → static fallback so the dropdown still works.
+        msg = "实时拉取超时" if e.__class__.__name__ == "TimeoutError" else str(e)[:120]
+        return jsonify({"ok": True, "provider": provider,
+                        "models": ai.fallback_models(provider),
+                        "error": msg, "fallback": True})
 
 
 def _spawn_scheduler() -> int:

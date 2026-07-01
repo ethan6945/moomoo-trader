@@ -149,7 +149,8 @@ def _save_open_trades(trades: dict) -> None:
 
 
 def open_position(client: MoomooClient, signal: Signal, qty: int,
-                  ml_proba: float | None = None) -> dict | None:
+                  ml_proba: float | None = None,
+                  ml_features: list[float] | None = None) -> dict | None:
     """Buy at limit. REAL → attach OCO bracket (STOP + TP); SIMULATE → soft-track.
 
     Returns None when the entry is SKIPPED (market ran past the signal price —
@@ -163,11 +164,12 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
     Captures `ml_proba` and `strategy` at entry so they can be matched against
     actual outcome (R-multiple, MFE/MAE) at close-time → enables calibration."""
     with _TRADES_LOCK:
-        return _open_position_locked(client, signal, qty, ml_proba)
+        return _open_position_locked(client, signal, qty, ml_proba, ml_features)
 
 
 def _open_position_locked(client: MoomooClient, signal: Signal, qty: int,
-                          ml_proba: float | None = None) -> dict | None:
+                          ml_proba: float | None = None,
+                          ml_features: list[float] | None = None) -> dict | None:
     trades = _load_open_trades()
     existing = trades.get(signal.symbol)
     is_stack = existing is not None and int(existing.get("qty", 0)) > 0
@@ -290,6 +292,8 @@ def _open_position_locked(client: MoomooClient, signal: Signal, qty: int,
             # so the dashboard/GUI can badge it (None for the other strategies).
             "pattern": (getattr(signal, "meta", {}) or {}).get("pattern_type"),
             "stacks": 1,
+            # P1-2: persist ML feature vector for retraining on close
+            "ml_features": ml_features,
         }
 
     trades[signal.symbol] = trade
@@ -301,7 +305,10 @@ def _close_and_log(symbol: str, trade: dict, qty: int, exit_price: float, reason
     """Record a close to risk_manager (state) + portfolio (R-multiple, MFE/MAE).
     Returns the realised pnl."""
     pnl = (exit_price - trade["entry_price"]) * qty
-    risk_manager.record_trade_close(pnl, account_usd=risk_manager.budget_usd())
+    # account_usd omitted on purpose → record_trade_close uses equity_baseline()
+    # (frozen seed while auto-compounding is armed), so the DD breaker's equity
+    # is never inflated by the compounding deployable budget.
+    risk_manager.record_trade_close(pnl)
 
     entry = float(trade["entry_price"]) or 1e-9
     hw = float(trade.get("high_water") or trade["entry_price"])
@@ -320,7 +327,9 @@ def _close_and_log(symbol: str, trade: dict, qty: int, exit_price: float, reason
         mfe_pct=mfe_pct,
         mae_pct=mae_pct,
         ml_proba_entry=trade.get("ml_proba_entry"),
+        ml_features=trade.get("ml_features"),
         strategy=trade.get("strategy", "trend"),
+        initial_risk=trade.get("init_risk_per_share"),
     )
     return pnl
 

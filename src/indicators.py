@@ -61,13 +61,23 @@ class Signal:
     # strategy). Stays empty for the others; carried into the buy audit `extra`
     # and used by pattern_vision so we don't overload the numeric `breakdown`.
     meta: dict = field(default_factory=dict)
+    # P0-2 (2026-06-26): structural stop override — set by main.py after
+    # computing a swing-low-based stop. When non-None, executor uses the TIGHTER
+    # of this and the ATR-based stop. None ⇒ ATR-only (legacy behaviour).
+    structural_stop: float | None = None
 
     @property
     def stop_loss(self) -> float:
         # Runtime override (owner-approved optimizer) beats .env, no restart;
         # falls back to the .env setting. Inline import avoids circular load.
         from . import runtime_config
-        return round(self.price - runtime_config.sl_atr_mult() * self.atr, 2)
+        atr_stop = round(self.price - runtime_config.sl_atr_mult() * self.atr, 2)
+        # P0-2: structural stop — when set, use the TIGHTER of the two.
+        # structural_stop is always ≥ atr_stop (see pattern_detect.structural_stop
+        # — it takes max(structural, atr_stop) to never exceed the risk budget).
+        if self.structural_stop is not None:
+            return max(atr_stop, self.structural_stop)
+        return atr_stop
 
     @property
     def take_profit(self) -> float:
@@ -184,13 +194,22 @@ def _score_vwap(df: pd.DataFrame, tf: TF) -> tuple[float, str]:
 
 # ---------- multi-timeframe helper ----------
 
-def check_gap(df_daily: pd.DataFrame, max_gap_pct: float = 3.0) -> tuple[bool, str]:
-    """Overnight gap filter — refuse to chase/catch big moves.
+def check_gap(df_daily: pd.DataFrame, max_gap_pct: float = 3.0,
+              block_up_gaps: bool = True) -> tuple[bool, str]:
+    """Overnight gap filter.
 
-    Compares today's open to yesterday's close on the DAILY chart.
-    Blocks if |gap| > max_gap_pct.
-      • Gap-up: chase risk (mean-reversion likely)
-      • Gap-down: knife-catch (downtrend may continue)
+    By default (block_up_gaps=True), blocks BOTH gap-up and gap-down outside
+    ±max_gap_pct. This is the safe, symmetric behaviour — suitable for mean-
+    reversion strategies where gap-ups tend to revert.
+
+    When block_up_gaps=False, positive gaps are ALWAYS passed. This is the
+    correct setting for trend/momentum strategies: a gap-up on strong volume
+    IS the breakout signal the strategy is designed to catch, and blocking it
+    filters out the very trades that made the backtest profitable (76 of the
+    76 gap skips in live trading were positive gaps on scores 72-90).
+
+    Gap-downs are ALWAYS blocked regardless of direction setting — catching a
+    falling knife is never the strategy's edge.
     """
     if len(df_daily) < 2:
         return True, "insufficient data for gap check"
@@ -199,8 +218,15 @@ def check_gap(df_daily: pd.DataFrame, max_gap_pct: float = 3.0) -> tuple[bool, s
     if prev_close <= 0:
         return True, "invalid prev close"
     gap_pct = (curr_open - prev_close) / prev_close * 100
-    if abs(gap_pct) > max_gap_pct:
-        return False, f"overnight gap {gap_pct:+.2f}% > ±{max_gap_pct}%"
+
+    # Gap-down → always block (knife-catch risk)
+    if gap_pct <= -max_gap_pct:
+        return False, f"overnight gap {gap_pct:+.2f}% < −{max_gap_pct}%"
+
+    # Gap-up → block only when symmetric mode is on
+    if block_up_gaps and gap_pct > max_gap_pct:
+        return False, f"overnight gap {gap_pct:+.2f}% > +{max_gap_pct}%"
+
     return True, f"gap {gap_pct:+.2f}% OK"
 
 

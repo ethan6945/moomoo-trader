@@ -238,8 +238,8 @@ python -m src.main scan
 | 退出方式 | 触发 | 开关（当前） |
 |---------|------|:--:|
 | 软止损 SL | 价 ≤ 入场 − `SL_ATR_MULT`(3.5)×ATR | 常开 |
-| 止盈 TP | 价 ≥ 入场 + `TP_ATR_MULT`(8.0)×ATR | 常开 |
-| 分批止盈 scale-out | +3R 卖 1/3、+6R 再卖 1/3、剩 1/3 跑到 TP（R = 入场−初始止损） | `USE_SCALE_OUT` ✅ |
+| 止盈 TP | 价 ≥ 入场 + `TP_ATR_MULT`(10.0)×ATR | 常开 |
+| 分批止盈 scale-out | +3R 卖 1/3、+6R 再卖 1/3、剩 1/3 跑到 TP（R = 入场−初始止损） | ⚠️ 当前空转（各档高于满仓 TP 天花板，运行时自动 DISABLED，详见下文）|
 | 保本移动止损 | 浮盈到 +1R → 止损上移到入场价（赢单不再变亏单） | `USE_BREAKEVEN_STOP` ✅ |
 | 最长持仓 | 满 `MAX_HOLD_DAYS`(7) 个**交易日**强平 | 常开 |
 | 跳空哨兵 | 持仓股财报 ≤1 天，或盘前 AI 判定有实锤利空 → 开盘清仓 | `GAP_SENTINEL_ENABLED` ✅ |
@@ -286,7 +286,6 @@ AI **不能**绕过这些：
 | `MOOMOO_TRADE_ENV` | `SIMULATE` | 模拟盘。切 REAL 在 Web 设置里做（2 次确认 + 交易密码 + 空仓才允许）。 |
 | `GAP_SENTINEL_ENABLED` | `true` | 跳空哨兵：财报临近或实锤利空 → 收盘前/开盘清仓。 |
 | `GAP_SENTINEL_AI_INTRADAY` | `true` | 盘中也跑 AI 跳空检查（默认设计是只盘前跑省钱；此处打开）。 |
-| `USE_SCALE_OUT` | `true` | 3 段分批止盈（+3R / +6R / 剩余跑 TP）。 |
 | `USE_BREAKEVEN_STOP` | `true` | +1R 保本移动止损。 |
 | `REAL_USE_SOFT_EXITS` | `true` | REAL 也用软退出，和回测口径一致。 |
 | `DYNAMIC_UNIVERSE_ENABLED` | `true` | 每周日按 6-1 动量从流动性池选 top-N 重建 watchlist。 |
@@ -308,6 +307,7 @@ AI **不能**绕过这些：
 | **`SENTIMENT_SCORING_ENABLED`** / `SENTIMENT_SIZING` | `false` | moomoo 式看好/看空打分（Phase 2B）。纯建议、不改下单，默认关省调用。 |
 | **`OPTIONS_FLOW_ENABLED`** | `false` | 期权异动。期权订阅虽已开通可用，但它只被 smart_exit / sentiment（都关着）消费——单独开它什么也不做还加延迟。等那两个开了再开。 |
 | **`STALL_OUT_ENABLED`** | `false` | 停滞退出。exit parity：验证引擎没有它，且其 max-hold 桶净赚；实盘仅有的 2 次停滞退出全亏。 |
+| **`USE_SCALE_OUT`** | `true` → **运行时空转** | 分批止盈。`TP1_R`=3.0 × `SL_ATR_MULT`=3.5 = +10.5 ATR ≥ 满仓 TP 天花板（`TP_ATR_MULT`=10.0 ATR，即 10.0/3.5=2.86R，原 2.29R），任何一档都打不到 → `config.py` 检测到后打印告警并按 **DISABLED** 处理。2026-06-25 sweep：把梯子压到天花板下让它真能触发，反而降 $/天（过早落袋、杀掉肥尾），故 .env 虽 `true` 但**故意保持空转**。 |
 
 ### 已**删除**（不再是开关）
 
@@ -317,7 +317,7 @@ AI **不能**绕过这些：
 
 ### 其它关键数值（Optuna / 回测调出）
 
-`ENTRY_SCORE_THRESHOLD=70`｜`SCAN_INTERVAL_MIN=30`｜`MAX_HOLD_DAYS=7`｜`TIMEFRAME=HOUR_1`｜`TP_ATR_MULT=8.0`｜`SL_ATR_MULT=3.5`｜`MAX_GAP_PCT=4.0`｜`RISK_PER_TRADE=0.05`｜`MAX_POSITIONS=5`｜`MAX_POSITION_PCT=0.40`｜`DAILY_DRAWDOWN_STOP=0.06`｜`DD_SIZE_CUT_PCT=10`｜`DD_HALT_PCT=18`。
+`ENTRY_SCORE_THRESHOLD=70`｜`SCAN_INTERVAL_MIN=30`｜`MAX_HOLD_DAYS=7`｜`TIMEFRAME=HOUR_1`｜`TP_ATR_MULT=10.0`｜`SL_ATR_MULT=3.5`｜`MAX_GAP_PCT=4.0`｜`RISK_PER_TRADE=0.05`｜`MAX_POSITIONS=5`｜`MAX_POSITION_PCT=0.40`｜`DAILY_DRAWDOWN_STOP=0.06`｜`DD_SIZE_CUT_PCT=10`｜`DD_HALT_PCT=18`。
 
 ---
 

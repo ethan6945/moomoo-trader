@@ -43,8 +43,8 @@ from typing import Optional
 import pandas as pd
 from moomoo import KLType
 
-from .config import settings, gemini_cascade
-from . import finbert_sentiment, news_fetcher, notifier
+from .config import settings
+from . import ai, news_fetcher, notifier  # P0-5: finbert_sentiment removed — noise > signal
 from .moomoo_client import client as _moomoo_client
 
 
@@ -556,41 +556,18 @@ def _score_bar(score: int) -> str:
 # ─── GEMINI AI (盘前 only) ────────────────────────────────────────────────────
 
 def _call_gemini(prompt: str) -> Optional[dict]:
+    if not ai.has_key():
+        return None
     try:
-        from google import genai
-    except ImportError:
+        # Low temperature → stable, repeatable decisions (less run-to-run swing in
+        # score/action). Default (~1.0) made the same setup swing e.g. 5/10 ↔ 8/10.
+        text, model_name = ai.generate(prompt, temperature=0.15)
+        raw = re.sub(r"```json|```", "", text.strip()).strip()
+        result = json.loads(raw)
+        result["_model"] = model_name
+        return result
+    except Exception:
         return None
-
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return None
-
-    for model_name in gemini_cascade():
-        for key in keys:
-            for attempt in range(2):
-                try:
-                    client = genai.Client(api_key=key)
-                    # Low temperature → stable, repeatable decisions (less run-to-run
-                    # swing in score/action). Was default (~1.0) which made the same
-                    # setup swing e.g. 5/10 ↔ 8/10 between calls.
-                    resp = client.models.generate_content(
-                        model=model_name, contents=prompt,
-                        config={"temperature": 0.15})
-                    raw  = re.sub(r"```json|```", "", resp.text.strip()).strip()
-                    result = json.loads(raw)
-                    result["_model"] = model_name
-                    return result
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                        # Quota exhausted for this key+model → try next key.
-                        break
-                    if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
-                        time.sleep(4)
-                        continue
-                    break
-        # All keys failed / quota'd for this model → outer loop tries next (lighter) model.
-    return None
 
 
 def _gemini_signal(tech: dict, ticker_news: list, macro_news: list) -> dict:
@@ -908,37 +885,15 @@ _CLOSE_FORMAT = """输出格式（Telegram 紧凑卡片，纯文本+emoji，总�
 
 
 def _call_gemini_text(prompt: str, use_search: bool = True) -> Optional[str]:
-    """像 _call_gemini，但返回纯文本（简报卡片），并尽量启用 google_search
-    grounding 让模型自己补全最新宏观/个股新闻。不支持 tools 的模型/版本
-    自动降级为无搜索调用。"""
+    """像 _call_gemini，但返回纯文本（简报卡片）。在 Gemini 上尽量启用
+    google_search grounding 让模型自己补全最新宏观/个股新闻（不支持 tools 的
+    模型自动降级为无搜索）。DeepSeek 无 grounding，按纯文本调用。"""
+    if not ai.has_key():
+        return None
     try:
-        from google import genai
-    except ImportError:
+        return ai.generate_text(prompt, temperature=0.3, search=use_search)
+    except Exception:
         return None
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return None
-    for model_name in gemini_cascade():
-        for key in keys:
-            configs = []
-            if use_search:
-                configs.append({"temperature": 0.3, "tools": [{"google_search": {}}]})
-            configs.append({"temperature": 0.3})
-            for cfg in configs:
-                try:
-                    client = genai.Client(api_key=key)
-                    resp = client.models.generate_content(
-                        model=model_name, contents=prompt, config=cfg)
-                    text = (resp.text or "").strip()
-                    if text:
-                        return text
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                        break  # 此 key 配额尽 → 换 key
-                    # tools 不支持等其他错误 → 试下一个 config / key
-                    continue
-    return None
 
 
 def _weekly_sr(c, sym: str) -> dict:
@@ -1176,7 +1131,7 @@ def run_premarket() -> None:
     results    = []
     df_d_cache: dict = {}
 
-    finbert_on = finbert_sentiment.is_available()
+    finbert_on = False   # P0-5: FinBERT removed — AI validator handles sentiment
     if finbert_on:
         log.info("signal_reporter premarket: FinBERT enabled — will score news headlines")
 
@@ -1205,7 +1160,7 @@ def run_premarket() -> None:
             sentiment = None
             if finbert_on and ticker_news:
                 headlines = [n.get("title", "") for n in ticker_news[:8]]
-                sentiment = finbert_sentiment.score_headlines(headlines)
+                sentiment = None  # P0-5: FinBERT removed
             # Macro & per-ticker context. yfinance fetches (pre-market, insider)
             # add ~1-2s/ticker; acceptable since premarket runs once/day.
             sector_data = _sector_snap(c, sym)

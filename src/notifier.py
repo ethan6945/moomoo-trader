@@ -30,7 +30,9 @@ def send(text: str) -> None:
     }
     for attempt in range(3):
         try:
-            requests.post(url, data=payload, timeout=15)
+            r = requests.post(url, data=payload, timeout=15)
+            if not r.ok:
+                log.warning("telegram send HTTP %s: %s", r.status_code, r.text[:120])
             return
         except Exception as e:
             if attempt < 2:

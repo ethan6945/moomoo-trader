@@ -31,7 +31,7 @@ from .config import settings
 log = logging.getLogger(__name__)
 
 DB_FILE = settings.root / "data" / "trader.db"
-SCHEMA_VERSION = 2          # v2: add MFE/MAE, ml_proba_entry, strategy, high/low water
+SCHEMA_VERSION = 3          # v3: add extra column to closed_trades (v2 bugfix)
 _init_lock = threading.Lock()
 _initialised = False
 
@@ -91,7 +91,8 @@ CREATE TABLE IF NOT EXISTS closed_trades (
     mfe_pct         REAL,        -- max favorable excursion while open (% above entry)
     mae_pct         REAL,        -- max adverse excursion (% below entry)
     ml_proba_entry  REAL,        -- ML model's proba at entry (for calibration)
-    strategy        TEXT         -- "trend" | "mean_revert"
+    strategy        TEXT,         -- "trend" | "mean_revert"
+    extra           TEXT          -- JSON blob for forward-compat fields (ml_features, etc.)
 );
 CREATE INDEX IF NOT EXISTS idx_closed_ts     ON closed_trades(ts);
 CREATE INDEX IF NOT EXISTS idx_closed_symbol ON closed_trades(symbol);
@@ -175,6 +176,8 @@ def _ensure_initialised() -> None:
                 _migrate_from_json(c)
             if user_v < 2:
                 _migrate_v2(c)
+            if user_v < 3:
+                _migrate_v3(c)
             if user_v < SCHEMA_VERSION:
                 c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             c.commit()
@@ -200,6 +203,7 @@ def _migrate_v2(c: sqlite3.Connection) -> None:
         ("mae_pct", "REAL"),
         ("ml_proba_entry", "REAL"),
         ("strategy", "TEXT"),
+        ("extra", "TEXT"),          # P1-2: ML feature vectors + forward-compat
     ]
     existing_open = {r[1] for r in c.execute("PRAGMA table_info(open_trades)").fetchall()}
     for col, typ in new_cols_open:
@@ -212,6 +216,22 @@ def _migrate_v2(c: sqlite3.Connection) -> None:
     # Strategy index — created after the column exists.
     c.execute("CREATE INDEX IF NOT EXISTS idx_closed_strategy ON closed_trades(strategy)")
     log.info("schema migrated to v2 (added MFE/MAE/ml_proba/strategy columns)")
+
+
+def _migrate_v3(c: sqlite3.Connection) -> None:
+    """v2 → v3: add missing `extra` column to closed_trades.
+
+    v2's CREATE TABLE and migration both included `extra` in the code, but if
+    the DB was created before `extra` was added to those lists, user_version was
+    already bumped to 2 — so the migration never re-ran and the column was
+    silently missing. Every closed_trade INSERT failed with "no column named
+    extra". v3 fixes this by checking the column independently of the version
+    gate and adding it if absent.
+    """
+    existing = {r[1] for r in c.execute("PRAGMA table_info(closed_trades)").fetchall()}
+    if "extra" not in existing:
+        c.execute("ALTER TABLE closed_trades ADD COLUMN extra TEXT")
+        log.info("schema migrated to v3: added extra column to closed_trades")
 
 
 # ---------- one-time JSON → SQLite migration ----------
@@ -589,8 +609,8 @@ def closed_trade_insert(row: dict) -> None:
             INSERT INTO closed_trades
             (ts, symbol, qty, entry, stop, exit, exit_reason,
              pnl, pnl_pct, r_multiple, opened_at,
-             mfe_pct, mae_pct, ml_proba_entry, strategy)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             mfe_pct, mae_pct, ml_proba_entry, strategy, extra)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             row.get("ts") or datetime.utcnow().isoformat(),
             row["symbol"], int(row["qty"]),
@@ -603,6 +623,7 @@ def closed_trade_insert(row: dict) -> None:
             row.get("mae_pct"),
             row.get("ml_proba_entry"),
             row.get("strategy"),
+            row.get("extra"),
         ))
 
 

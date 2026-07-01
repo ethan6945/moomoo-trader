@@ -73,10 +73,15 @@ def _score_volume(df: pd.DataFrame, tf: TF) -> tuple[float, str]:
     return 10, f"vol weak ×{ratio:.2f}"
 
 
-def _admit(patterns: list[dict]) -> list[dict]:
+def _admit(patterns: list[dict], df: pd.DataFrame | None = None) -> list[dict]:
     """Apply the configurable admission filters (settings.pattern_*). Read at
     call-time so a backtest sweep can mutate the settings singleton between runs.
-    Defaults are inert: all types, no confidence floor, triggered-optional."""
+    Defaults are inert: all types, no confidence floor, triggered-optional.
+
+    P0-1 (2026-06-26): Wyckoff volume-confirmation hard filter. A triggered
+    breakout without volume conviction is a false breakout — filter it, not just
+    score it lower. The 1.5× average-volume threshold is the same bar used by
+    every volume-confirmation method since Livermore."""
     allowed = settings.pattern_allowed_types
     min_conf = settings.pattern_min_confidence
     req_trig = settings.pattern_require_triggered
@@ -88,6 +93,21 @@ def _admit(patterns: list[dict]) -> list[dict]:
             continue
         if req_trig and not p["triggered"]:
             continue
+        # P0-1: volume hard-filter — a triggered breakout MUST have conviction
+        # volume (≥1.5× 20-bar average). Patterns that haven't triggered yet
+        # (anticipation entries) skip this check — they're coiled, not breaking.
+        if p.get("triggered") and df is not None and len(df) >= 21:
+            bar_vol = float(df["volume"].iloc[-1])
+            avg_vol = float(df["volume"].iloc[-21:-1].mean())
+            if avg_vol > 0 and bar_vol < avg_vol * 1.5:
+                # Downgrade confidence instead of hard-dropping — caller still
+                # sees it in patterns_all for audit, but the score takes the hit.
+                p = dict(p)
+                p["confidence"] = max(0.0, p["confidence"] - 25)
+                p["volume_confirmed"] = False
+            else:
+                p = dict(p)
+                p["volume_confirmed"] = True
         out.append(p)
     return out
 
@@ -117,7 +137,7 @@ def evaluate(symbol: str, df: pd.DataFrame) -> Signal:
             strategy="pattern",
         )
 
-    patterns = _admit(pattern_detect.detect_all(df, tf))
+    patterns = _admit(pattern_detect.detect_all(df, tf), df)
     price = float(df["close"].iloc[-1])
     atr = float(ta.atr(df["high"], df["low"], df["close"], length=tf.atr_period).iloc[-1])
     if not patterns:

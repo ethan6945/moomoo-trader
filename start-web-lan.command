@@ -28,8 +28,19 @@ nohup .venv/bin/python web/server.py > logs/web.log 2>&1 &
 echo $! > logs/web.pid
 disown
 IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+
+# Wait until the server actually responds before opening the browser.
+echo -n "Waiting for web server..."
+for i in $(seq 1 20); do
+    if curl -s -o /dev/null -w '' --max-time 1 "http://127.0.0.1:$PORT/login" 2>/dev/null; then
+        echo " ready (${i}s)"
+        break
+    fi
+    echo -n "."
+    sleep 1
+done
+
 echo "✓ Web dashboard launched (PID $!)"
 echo "   本机:   http://127.0.0.1:$PORT"
 echo "   手机:   http://${IP:-<Mac的局域网IP>}:$PORT   (需同一 WiFi + 密码)"
-sleep 2
 open "http://127.0.0.1:$PORT"

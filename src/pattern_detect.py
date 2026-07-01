@@ -422,7 +422,29 @@ def _atr(df: pd.DataFrame, period: int) -> float:
     return float(np.mean(tr[-period:]))
 
 
-def detect_all(df: pd.DataFrame, tf: TF, pivot_k: int = 3) -> list[dict]:
+def structural_stop(df: pd.DataFrame, entry_price: float,
+                    atr_stop: float) -> float:
+    """P0-2 (2026-06-26): Return the TIGHTER of the nearest swing-low stop and
+    the ATR-based stop. A stop placed at a visible structural level (prior swing
+    low minus 1%) is invisible to market-makers scanning for ATR-stop clusters,
+    yet still bounded by the ATR stop so it can never be wider than the
+    risk-model permits. If no pivots are found, returns the ATR stop unchanged.
+
+    Sources: Al Brooks price-action trading, Bob Volman's structural stop method.
+    """
+    if df is None or len(df) < 5:
+        return atr_stop
+    try:
+        highs, lows = find_pivots(df)
+        if not lows:
+            return atr_stop
+        nearest_low = float(df["low"].iloc[lows[-1]])
+        structural = nearest_low * 0.99  # 1% below the swing low
+        # Never use a structural stop BELOW the ATR stop — that would exceed
+        # the risk budget. Take the tighter of the two.
+        return max(structural, atr_stop)
+    except Exception:
+        return atr_stop
     """Run every detector and return the found patterns, highest confidence first.
 
     Each detector is wrapped so a single bad-geometry edge case can never crash

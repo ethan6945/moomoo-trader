@@ -501,6 +501,14 @@ def simulate_v3(
             elif vix_rf > 25:
                 qty_mult *= 0.5
 
+        # Continuous score-based conviction sizing (experiment, default off,
+        # parity-suppressed). Binary threshold gives 72 and 95 the same size;
+        # this scales size with how far the score clears the threshold.
+        if cfg.use_score_sizing and not parity_mode:
+            span = max(1e-9, 100.0 - cfg.threshold)
+            frac = min(1.0, max(0.0, (sig.score - cfg.threshold) / span))
+            qty_mult *= cfg.score_size_lo + (cfg.score_size_hi - cfg.score_size_lo) * frac
+
         # ---- fill model (independent copy) ----
         next_bar = df.iloc[i + 1]
         limit_price = float(sig.price)

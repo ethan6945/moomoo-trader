@@ -22,17 +22,13 @@ import io
 import json
 import logging
 import re
-import time
 
 import matplotlib
 matplotlib.use("Agg")          # headless — no display, safe in a scheduler/daemon
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from google import genai
-from google.genai import types
-
-from .config import settings, gemini_cascade
+from . import ai
 from .indicators import Signal
 
 log = logging.getLogger(__name__)
@@ -94,9 +90,13 @@ def confirm(signal: Signal, df: pd.DataFrame) -> tuple[bool, int | None, str, st
     Returns (confirmed, vision_conf_0_100 | None, label, reason).
     FAIL-SAFE: any error / no key / quota → (True, None, "vision n/a", reason).
     """
-    keys = list(settings.gemini_keys)
-    if not keys:
-        return True, None, "vision-skip", "no Gemini key — vision layer inert (pass)"
+    # Vision is multimodal — only Gemini supports it. When the active provider is
+    # DeepSeek (text-only), skip this confirmation layer entirely (the algorithmic
+    # pattern detector still gates the trade); fail-safe pass.
+    if not ai.supports_vision():
+        return True, None, "vision-skip", "provider has no vision — pass (algo pattern stands)"
+    if not ai.has_key():
+        return True, None, "vision-skip", "no AI key — vision layer inert (pass)"
     if not signal.meta.get("pattern_type"):
         return True, None, "vision-skip", "no pattern meta — pass"
 
@@ -114,44 +114,20 @@ def confirm(signal: Signal, df: pd.DataFrame) -> tuple[bool, int | None, str, st
         triggered=signal.meta.get("pattern_triggered"),
         key_levels=signal.meta.get("key_levels"),
     )
-    image_part = types.Part.from_bytes(data=png, mime_type="image/png")
 
-    # Cost control: ONE fixed cheap model (not the strongest-first cascade) by
-    # default, but still fall through the cascade on quota so a transient 429
-    # doesn't blank the layer.
-    primary = settings.pattern_vision_model
-    models = [primary] + [m for m in gemini_cascade() if m != primary]
-    for model_name in models:
-        for key in keys:
-            for attempt in range(2):
-                try:
-                    client = genai.Client(api_key=key)
-                    resp = client.models.generate_content(
-                        model=model_name, contents=[image_part, prompt])
-                    text = resp.text.strip()
-                    match = re.search(r"\{.*\}", text, re.DOTALL)
-                    payload = json.loads(match.group(0) if match else text)
-                    verdict = str(payload.get("verdict", "confirm")).lower()
-                    confidence = int(payload.get("confidence", 40))
-                    reason = payload.get("reason", "")
-                    seen = payload.get("pattern", "")
-                    confirmed = verdict == "confirm"
-                    log.info("pattern_vision [%s] %s → %s (%d) %s",
-                             model_name, signal.symbol, verdict, confidence, seen)
-                    return confirmed, confidence, seen, reason
-                except Exception as e:
-                    err = str(e)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                        break                     # quota on this key → next key
-                    if attempt == 0 and any(x in err for x in ("503", "500", "UNAVAILABLE")):
-                        time.sleep(4)
-                        continue
-                    log.warning("pattern_vision: %s error on %s: %s",
-                                model_name, signal.symbol, e)
-                    break
-        log.info("pattern_vision: all keys quota'd on %s for %s → next model",
-                 model_name, signal.symbol)
-
-    log.warning("pattern_vision: all models exhausted for %s — pass (fail-safe)",
-                signal.symbol)
-    return True, None, "vision-exhausted", "AI vision unavailable — pass (fail-safe)"
+    try:
+        text, model_name = ai.generate(prompt, image=png)
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        payload = json.loads(match.group(0) if match else text)
+        verdict = str(payload.get("verdict", "confirm")).lower()
+        confidence = int(payload.get("confidence", 40))
+        reason = payload.get("reason", "")
+        seen = payload.get("pattern", "")
+        confirmed = verdict == "confirm"
+        log.info("pattern_vision [%s] %s → %s (%d) %s",
+                 model_name, signal.symbol, verdict, confidence, seen)
+        return confirmed, confidence, seen, reason
+    except Exception as e:
+        log.warning("pattern_vision: AI vision unavailable for %s (%s) — pass (fail-safe)",
+                    signal.symbol, e)
+        return True, None, "vision-exhausted", "AI vision unavailable — pass (fail-safe)"

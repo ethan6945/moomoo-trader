@@ -20,6 +20,18 @@ sleep 1
 nohup .venv/bin/python web/server.py > logs/web.log 2>&1 &
 echo $! > logs/web.pid
 disown
-echo "✓ Web dashboard launched (PID $!) on http://127.0.0.1:$PORT"
-sleep 2
+
+# Wait until the server actually responds before opening the browser.
+# Flask imports (src.ai, src.db, etc.) can take 3-6 seconds on a cold start.
+echo -n "Waiting for web server..."
+for i in $(seq 1 20); do
+    if curl -s -o /dev/null -w '' --max-time 1 "http://127.0.0.1:$PORT/login" 2>/dev/null; then
+        echo " ready (${i}s)"
+        break
+    fi
+    echo -n "."
+    sleep 1
+done
+
 open "http://127.0.0.1:$PORT"
+echo "✓ Web dashboard launched (PID $(cat logs/web.pid)) on http://127.0.0.1:$PORT"

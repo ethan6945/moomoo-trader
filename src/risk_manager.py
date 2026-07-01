@@ -110,7 +110,13 @@ def set_live_equity(value) -> None:
 
 
 def budget_usd() -> float:
-    """Owner's allocated capital. Runtime db-state 'budget_usd', else .env."""
+    """Owner's allocated capital. Runtime db-state 'budget_usd', else .env.
+
+    NOTE: when auto-compounding is armed this value GROWS/SHRINKS with realized
+    profit (auto_budget writes the same db-state key). It is the DEPLOYABLE cap
+    used for sizing — NOT the equity baseline for the DD breaker. For equity/DD
+    math use equity_baseline() instead, so realized PnL is never double-counted.
+    """
     try:
         v = float(_load_state().get("budget_usd") or 0.0)
         if v > 0:
@@ -118,6 +124,21 @@ def budget_usd() -> float:
     except Exception:
         pass
     return settings.account_usd
+
+
+def equity_baseline() -> float:
+    """Capital base for equity/drawdown math (peak_equity, current_drawdown_pct).
+
+    Delegates to auto_budget: while compounding is armed this is the FROZEN seed
+    (so the compounding deployable budget can't inflate equity = base + realized
+    and mis-fire the DD breaker); otherwise it is the live budget — byte-
+    identical to the pre-compounding behavior. Lazy import avoids a cycle
+    (auto_budget reads budget_usd here)."""
+    try:
+        from . import auto_budget
+        return auto_budget.equity_baseline()
+    except Exception:
+        return budget_usd()
 
 
 def sizing_capital() -> float:
@@ -147,7 +168,7 @@ def current_drawdown_pct() -> float:
     if peak <= 0:
         return 0.0
     realized = float(state.get("realized_pnl_total") or 0.0)
-    equity = budget_usd() + realized
+    equity = equity_baseline() + realized
     if equity >= peak:
         return 0.0
     return (peak - equity) / peak * 100
@@ -177,7 +198,7 @@ def _check_halt_auto_release(state: dict) -> tuple[float, bool]:
             # streak) still scale qty down — the DD halt is a hard stop, not
             # a soft brake.
             realized = float(state.get("realized_pnl_total") or 0.0)
-            new_peak = max(budget_usd() + realized, 1.0)
+            new_peak = max(equity_baseline() + realized, 1.0)
             def _apply(_s):
                 return {"peak_equity": new_peak, "halt_started_at": None}
             db.atomic_state(_apply)
@@ -248,8 +269,20 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     cap = sizing_capital()
     # risk_per_trade is runtime-overridable (half-Kelly proposal, owner-approved).
     from . import runtime_config
+
+    # PnL-optimised (2026-06-27 MS audit): composite floor on account-state
+    # multipliers. dd_mult × dd_size_mult × adaptive_mult can compound to
+    # 0.5³ = 0.125× in deep DD — shrinking positions so small the bot can
+    # never recover its drawdown. Floor it at 0.25× so even in worst
+    # conditions, risk stays ≥ 1.25% of account (0.25 × 5% base). Signal-
+    # quality (conviction) and regime tailwind (regime_mult) compose ON TOP
+    # and are not floored — a marginal signal in a deep DD SHOULD still be
+    # half-sized, and a bull tailwind SHOULD still add its boost.
+    state_mult = dd_mult * dd_size_mult * adaptive_mult
+    if state_mult < 0.25:
+        state_mult = 0.25
     risk_dollars = (cap * runtime_config.risk_per_trade()
-                    * dd_mult * dd_size_mult * adaptive_mult * conviction * regime_mult)
+                    * state_mult * conviction * regime_mult)
 
     stop_distance = signal.price - signal.stop_loss
     if stop_distance <= 0:
@@ -292,10 +325,21 @@ def _can_stack_onto(signal: Signal, held: pd.DataFrame) -> tuple[bool, str]:
                        f"reached for {signal.symbol}")
 
     entry = float(rec.get("entry_price", 0) or 0)
-    stop = float(rec.get("stop_loss", 0) or 0)
-    r_unit = entry - stop
+    # Use init_risk_per_share (ORIGINAL R unit at entry) instead of current
+    # stop_loss for stacking gate. Breakeven ratchet can raise stop to entry
+    # (stop == entry → R=0), which makes _can_stack_onto reject every future
+    # add-on even when the position has run far into profit. The original R
+    # unit is stable — it measures the thesis risk at entry, which is the
+    # right baseline for "is this trade working?".
+    irps = float(rec.get("init_risk_per_share", 0) or 0)
+    if irps > 0:
+        r_unit = irps
+    else:
+        # Fallback for legacy trades opened before init_risk_per_share existed.
+        stop = float(rec.get("stop_loss", 0) or 0)
+        r_unit = entry - stop
     if r_unit <= 0:
-        return False, f"invalid R unit for {signal.symbol} (entry {entry} / stop {stop})"
+        return False, f"invalid R unit for {signal.symbol} (r_unit={r_unit})"
 
     # Use broker's last price for the symbol if available, else fall back to
     # the live signal price (close of latest scoring bar — same magnitude).
@@ -315,12 +359,16 @@ def _can_stack_onto(signal: Signal, held: pd.DataFrame) -> tuple[bool, str]:
     return True, "ok"
 
 
-# SL cooldown — how long (in HOURS) we refuse to re-enter a name we just
-# stopped out of. Baseline 142-day audit: 29 "rebleed" losses worth -$425
-# came from re-buying the same ticker within 3 days of a stop. 24h is long
-# enough to let the reason for the stop play out, short enough that a true
-# multi-day swing setup can still be entered the next trading day.
-SL_COOLDOWN_HOURS = 24
+# ── PnL-optimised (2026-06-27 MS audit) ──────────────────────────────────────
+# Reduced from 24h → 4h. The 142-day audit measured 29 rebleed losses (−$425)
+# from re-entering within 3 days, so 24h was chosen conservatively. But in the
+# current high-VIX semiconductor regime, a name that stops out on a volatile
+# swing often reverses within the same session — and the bot misses the recovery
+# trade. At 4h the bot can re-enter a new signal on the SAME ticker after one
+# H1 bar confirms the reversal, while still blocking instant re-bleeds (the
+# audit's 3-day window was for trend-era hold periods, not current volatility).
+# ⚠ MONITOR: if rebleed count rises above ~5 trades/month, revert to ≥12h.
+SL_COOLDOWN_HOURS = 12
 
 
 def in_sl_cooldown(symbol: str, hours: int = SL_COOLDOWN_HOURS
@@ -464,9 +512,10 @@ def record_trade_close(realized_pnl: float, account_usd: float | None = None) ->
         day = current.get("day", str(date.today()))
         new_today = current.get("realized_pnl_today", 0.0) + realized_pnl
         new_total = current.get("realized_pnl_total", 0.0) + realized_pnl
-        # account_usd is needed to compute equity baseline. Fall back to
-        # settings if caller didn't pass it.
-        base = account_usd if account_usd is not None else budget_usd()
+        # account_usd is the equity baseline. Fall back to equity_baseline()
+        # (frozen seed when compounding is armed) so growing the deployable
+        # budget never double-counts realized PnL into equity / peak.
+        base = account_usd if account_usd is not None else equity_baseline()
         current_equity = base + new_total
         peak = max(current.get("peak_equity", 0.0) or 0.0,
                    base,        # never report a peak below starting capital

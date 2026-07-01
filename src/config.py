@@ -20,6 +20,11 @@ def _timeframe(default: str = "HOUR_1") -> str:
     # DAILY trading mode removed 2026-06-07 — coerce any legacy value to HOUR_1
     # so no string-keyed branch (MTF/gap/scoring) ever sees a stale "DAILY".
     tf = os.getenv("TIMEFRAME", default).upper()
+    if tf == "DAILY":
+        import logging
+        logging.getLogger(__name__).warning(
+            "TIMEFRAME=DAILY is no longer supported (removed 2026-06-07) — "
+            "coerced to HOUR_1. Update your .env to avoid this warning.")
     return "HOUR_1" if tf == "DAILY" else tf
 
 
@@ -39,9 +44,20 @@ class Settings:
 
     tavily_key: str = os.getenv("TAVILY_API_KEY", "")
 
-    # (DeepSeek removed 2026-06-08 — the whole system is unified on Gemini 3.5
-    # Flash. The autonomous optimizer now asks Gemini for proposals via
-    # gemini_model below; no second provider/key to manage.)
+    # AI provider (2026-06-23): the whole system can run on Gemini OR DeepSeek,
+    # flipped live from the web panel (db-state override, no restart — see
+    # src/ai.py). These are the .env DEFAULTS; the runtime override wins. The
+    # owner reaches for DeepSeek when Gemini is quota'd/down. DeepSeek is
+    # OpenAI-compatible REST (text only — no vision), reached via `requests`.
+    ai_provider: str = os.getenv("AI_PROVIDER", "gemini").strip().lower()
+    deepseek_keys: tuple = tuple(
+        k.strip()
+        for k in (
+            os.getenv("DEEPSEEK_API_KEYS") or os.getenv("DEEPSEEK_API_KEY") or ""
+        ).split(",")
+        if k.strip()
+    )
+    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -238,6 +254,81 @@ class Settings:
     # halt new entries entirely until equity recovers above the soft-cut line.
     dd_size_cut_pct: float = _float("DD_SIZE_CUT_PCT", 10.0)   # half qty
     dd_halt_pct: float = _float("DD_HALT_PCT", 15.0)           # no new entries
+
+    # ── Auto-compounding budget (2026-06-26): "money making more money" ──
+    # Grow the deployable budget as the bot's realized equity rises above the
+    # line where compounding was armed, and shrink it in drawdown — so a
+    # validated daily edge compounds GEOMETRICALLY instead of staying linear.
+    # The DD breaker is unaffected: while armed, risk_manager.equity_baseline()
+    # anchors equity to the FROZEN seed, never the compounding budget (see
+    # src/auto_budget.py). DEFAULT OFF — flip on (or use the web toggle) to arm;
+    # arming is neutral (target == seed until new profit is earned). The runtime
+    # db-state toggle 'auto_budget_enabled' wins over this .env default.
+    auto_budget_enabled: bool = os.getenv("AUTO_BUDGET_ENABLED", "false").lower() in ("1", "true", "yes")
+    # Fraction of bot-earned profit folded into the base. 1.0 = full reinvest
+    # (symmetric: +$1 earned grows the base $1, −$1 lost shrinks it $1 — "press
+    # winners, cut size when losing"). <1.0 banks the rest as a safety cushion.
+    auto_budget_reinvest_frac: float = _float("AUTO_BUDGET_REINVEST_FRAC", 1.0)
+    # Guardrails relative to the seed: never de-risk below seed×MIN_FRAC (the
+    # give-back floor), never run away above seed×MAX_MULT. Live account equity
+    # is an additional hard cap (can't deploy money that isn't there).
+    auto_budget_min_frac: float = _float("AUTO_BUDGET_MIN_FRAC", 0.5)
+    auto_budget_max_mult: float = _float("AUTO_BUDGET_MAX_MULT", 5.0)
+    # Hysteresis: only move the budget when the change clears max($STEP, PCT×cur)
+    # — stops daily churn (and Telegram spam) on noise.
+    auto_budget_min_step_usd: float = _float("AUTO_BUDGET_MIN_STEP_USD", 250.0)
+    auto_budget_min_step_pct: float = _float("AUTO_BUDGET_MIN_STEP_PCT", 0.05)
+
+    # ── Bear-market cash-yield sweep (2026-06-26): "petty money in bad markets" ──
+    # When the regime is BEAR (strategy paused), park idle cash in a T-bill ETF
+    # (SGOV ~4-5%/yr, near-zero risk) instead of earning 0%, and unwind back to
+    # cash when the regime is tradeable again. Conservative by default: ONLY
+    # sweeps in BEAR (so it can't starve a real entry of cash) and keeps a liquid
+    # buffer. DEFAULT OFF. Runtime db-state 'cash_yield_enabled' wins over .env.
+    cash_yield_enabled: bool = os.getenv("CASH_YIELD_ENABLED", "false").lower() in ("1", "true", "yes")
+    cash_yield_symbol: str = os.getenv("CASH_YIELD_SYMBOL", "SGOV").strip().upper()
+    cash_yield_only_bear: bool = os.getenv("CASH_YIELD_ONLY_BEAR", "true").lower() in ("1", "true", "yes")
+    cash_yield_buffer_usd: float = _float("CASH_YIELD_BUFFER_USD", 500.0)     # keep this much liquid
+    cash_yield_min_trade_usd: float = _float("CASH_YIELD_MIN_TRADE_USD", 500.0)  # ignore dust sweeps
+
+    # ── Inverse-ETF sleeve (2026-06-26): profit from confirmed downtrends ──
+    # Cash account can't short → buy an inverse ETF (SH −1x, or SQQQ −3x) when a
+    # downtrend is CONFIRMED (BEAR regime + inverse ETF above its own SMA), exit
+    # when trend/regime ends or stop/TP/max-hold. A small SLEEVE, capped at
+    # MAX_PCT of budget. ⚠ NOT VALIDATED — DEFAULT OFF; only the owner enables it
+    # after scripts/inverse_sleeve_backtest.py clears the dual-window gate.
+    inverse_sleeve_enabled: bool = os.getenv("INVERSE_SLEEVE_ENABLED", "false").lower() in ("1", "true", "yes")
+    inverse_sleeve_symbol: str = os.getenv("INVERSE_SLEEVE_SYMBOL", "SH").strip().upper()
+    inverse_sleeve_max_pct: float = _float("INVERSE_SLEEVE_MAX_PCT", 0.25)   # ≤ this fraction of budget
+    inverse_sleeve_sl_atr: float = _float("INVERSE_SLEEVE_SL_ATR", 2.5)
+    inverse_sleeve_tp_atr: float = _float("INVERSE_SLEEVE_TP_ATR", 6.0)
+    inverse_sleeve_sma_len: int = _int("INVERSE_SLEEVE_SMA_LEN", 20)
+    inverse_sleeve_atr_len: int = _int("INVERSE_SLEEVE_ATR_LEN", 14)
+    inverse_sleeve_max_hold_days: int = _int("INVERSE_SLEEVE_MAX_HOLD_DAYS", 30)
+
+    # ── Smart regime sensing (2026-06-26) ──
+    # The richer regime telemetry (vix/strength/sub_label/confirmed_label) is
+    # ALWAYS computed (harmless). This flag controls the one BEHAVIOR change:
+    # when true, entry-block + cash-yield + inverse-sleeve gate on the HYSTERESIS-
+    # smoothed `confirmed` label instead of the raw label, cutting 1-day whipsaw
+    # around the 200-MA. DEFAULT OFF — validate with scripts/regime_diagnose.py
+    # first. (The advisory risk_mult is never auto-applied — VIX sizing already
+    # de-risks, so applying it too would double-count.)
+    smart_regime_enabled: bool = os.getenv("SMART_REGIME_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    # ── Market breadth filter (P0-3, 2026-06-26) ──
+    # When true, an unhealthy breadth reading BLOCKS new entries (advisory
+    # otherwise — logs + notifies, but doesn't block). DEFAULT OFF (advisory
+    # only) while the owner validates the Spy-proxy fallback against real
+    # market snaps. Set true to arm the hard filter.
+    breadth_blocking: bool = os.getenv("BREADTH_BLOCKING", "false").lower() in ("1", "true", "yes")
+
+    # ── AI ensemble voting (P1-1, 2026-06-26) ──
+    # When true AND both Gemini + DeepSeek keys are configured, the AI validator
+    # calls BOTH providers in parallel. Consensus = high-confidence pass/veto;
+    # conflict = pass with reduced confidence. Off by default (uses single
+    # provider) — turn on after confirming both keys work.
+    ai_ensemble_enabled: bool = os.getenv("AI_ENSEMBLE_ENABLED", "false").lower() in ("1", "true", "yes")
 
     # (ML alpha engine removed 2026-06-03 — proven inert, AUC ~0.5.)
 

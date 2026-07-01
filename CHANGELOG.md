@@ -1,5 +1,39 @@
 # CHANGELOG
 
+## 2026-06-26 — 更聪明的 regime 感知（VIX 感知 + 防抖滞回）
+
+升级 `src/regime.py`：在不动原始 `label`/`block_new_entries`（回测一致性是硬约束，两个引擎都用 `assess()` 重算入场日 regime）的前提下，新增**始终计算**的咨询字段——`vix`（让 regime 知道波动环境）、`strength`（−1..+1 距 200MA 的强弱）、`sub_label`（STRONG_BULL/HIGH_VOL_BULL/DEEP_BEAR/HIGH_VOL_BEAR…）、`confirmed_label`（**滞回平滑**后的标签）、`risk_mult`（咨询用，**不自动施加**——VIX 已在 calc_position_size 减仓，避免重复扣）。
+
+- **唯一行为改动**（`SMART_REGIME_ENABLED`，默认关）：入场闸 + cash_yield + inverse_sleeve 改用滞回后的 `confirmed` 标签（200MA 上下 0.4% 死区 + 上一标签），不再被单根 K 线擦边 200MA 来回甩进/甩出 BEAR。默认关时 `effective_label==raw label`，行为与回测逐字节一致。
+- **接线**：`main.py` 给 `assess()` 传 `vix` + 上一 `confirmed`（存 db-state `regime_last_label`），算出 `effective_label` 喂给 kill_switch/两个 sweep；snapshot 增 `regime_sub`/`regime_confirmed`。`assess()` 签名向后兼容（vix/prev_label 关键字可选，3 处位置构造 Regime 仍可用）。
+- **验证**：20/20 单测（回测一致性/位置构造/strength/sub_label/滞回各分支/risk_mult）；新 `scripts/smart_regime_diagnose.py` 实跑 OpenD **485 天：regime 翻转 35→4（−89%），BEAR 天数 47→57（基本不变）→ HELPS**。这是少数通过验证的"加复杂度"改动。
+
+## 2026-06-26 — 自动复利预算（"钱生钱"）
+
+新增 `src/auto_budget.py`：让"可投入预算"随机器人的已实现盈利自动滚动增长（创新高随高水位增投、回撤则缩减），把线性的日内 edge 变成几何复利。每日收盘后（16:45 ET）跑一次，全自动 + 每次变动 Telegram 通知 + 审计历史；可在网页面板 arm/disarm/查看（`/api/auto-budget`）。
+
+- **不会破坏回撤熔断**（关键不变量）：复利会写大 `budget_usd`（部署上限），但 DD 用的 equity 锚定在 arm 时冻结的 **seed** 上（新增 `risk_manager.equity_baseline()`），所以 `equity = seed + realized` 永不把已实现盈亏重复计两次。未启用时 `equity_baseline()==budget_usd()`，行为与之前逐字节一致。
+- 护栏：reinvest 比例（默认 1.0 全复投，对称"赢加码/亏减码"）、下限 seed×0.5、上限 seed×5、再被实际账户净值封顶、滞回步长 max($250, 5%) 防抖。全部 .env / 网页可调，**默认关**（`AUTO_BUDGET_ENABLED=false`）。
+- 接线：`main.py` 新增 `_daily_auto_budget_job`（16:45 ET 周一至五）+ 启动 catch-up + `cron_state` 注册。`/api/status` 暴露 auto_budget 快照。
+- 验证：20/20 单测通过（复投/缩减/上下限/净值封顶/滞回/DD 解耦/禁用即 no-op）+ 端到端 Flask test_client（arm→赚$1300→预算 $4500→$5800→disarm）。
+
+## 2026-06-26 — 熊市现金生息（"坏行情也赚点小钱"）
+
+新增 `src/cash_yield.py`：熊市（regime=BEAR，策略已暂停开多）时把闲置现金买入国债 ETF（默认 SGOV，~4-5% 年化、近零风险、极高流动性）吃无风险收益，行情转可交易时自动全部卖回现金给策略开多用。诚实版"坏行情赚钱"——不是玄学 alpha，只是别让现金躺着吃 0%。
+
+- **保守作用域**：默认仅在 BEAR 扫到（`CASH_YIELD_ONLY_BEAR=true`），所以永不和核心策略抢现金；留流动性缓冲 + 忽略零碎额度。在 regime 早退之前调用（否则熊市里根本跑不到）。卖出在每个可交易扫描，先于开多逻辑。
+- **隔离**：reconcile 把该 ETF 从 orphan/mismatch 检测里排除（它是现金等价物不是策略仓位）；不在 watchlist/评分里，executor 只管自己跟踪的策略仓 → 不会被当成策略仓管理。
+- 接线：`main.py` 扫描中 `cash_yield.manage(c, regime.label, cash, positions)`；下单复用 `place_limit_order`（买 last×1.001 / 卖 last×0.999 marketable）。Web `GET/POST /api/cash-yield` 开关。**默认关**。
+- 验证：6/6 单测（BEAR 买入/可交易清仓/零碎不动/无价不动/NEUTRAL 视为可交易解除）+ 全量 import clean。
+
+## 2026-06-26 — 反向 ETF 对冲 sleeve（脚手架 + 回测闸门，未验证默认关）
+
+新增 `src/inverse_sleeve.py` + `scripts/inverse_sleeve_backtest.py`：现金账户不能做空 → 在确认下跌时买入反向 ETF（默认 SH −1x，或 SQQQ −3x）赚下跌的钱。规则严格（反向 ETF 在 chop 里会损耗）：**BEAR 且反向 ETF 站上自己的 SMA20** 才进，趋势/regime 结束或止损/止盈/最长持有则出。仓位封顶 `INVERSE_SLEEVE_MAX_PCT`(默认 25%)。
+
+- **⚠ 唯一会以新方式亏钱的功能 → 完全照 pattern 策略的规矩走：默认关、未验证、代码就位**。owner 必须先跑 `python -m scripts.inverse_sleeve_backtest` 过双窗闸门（用 DAILY bars，绕开 HOUR_1 ~150d 上限，给出真实多年窗口；判据 = 在部署天数里跑赢 SGOV 无风险 且回撤不离谱）才能开 `INVERSE_SLEEVE_ENABLED=true`。
+- **隔离**：自己的 db-state 槽 `inverse_sleeve_position`（不进 open_trades，策略 executor 不碰它）；reconcile 把该 ETF 从 orphan 检测排除。`main.py` 扫描里在 cash_yield 之前调用（先占自己的 sleeve，剩下的现金再给 cash_yield 生息）。下单复用 `place_limit_order`。Web `GET/POST /api/inverse-sleeve`。
+- 验证：14/14 纯函数单测（indicators / entry / exit 各分支 / size 封顶 / regime 序列）+ 全量 import clean。回测脚本需 OpenD 在线、由 owner 跑。
+
 ## 2026-06-23 — Phase 2：moomoo 式 AI 智能退出 / 加权选股 / 期权流骨架
 
 复刻 moomoo 个股 AI 分析卡的能力（新闻情绪 + 技术 + 期权异动），接进现有风控。全部默认关、FAIL-SAFE、Gemini 全用 ≥3.5-flash。

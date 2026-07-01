@@ -84,10 +84,13 @@ SECTOR_MAP: dict[str, str] = {
 }
 
 # At most this many positions in the same sector bucket at once.
-# 2026-05-28: bumped to 5 (was 4) because MAX_POSITIONS dropped to 5 and our
-# top winners are semis-heavy (SNDK, MU, INTC, LRCX, AMD, SWKS, SNDK, WDC).
-# A cap of 4 blocked the 5th semis pick even when we wanted to be fully loaded.
-MAX_PER_SECTOR = 5
+# 2026-06-26 (MS audit): lowered from 5 to 3. MAX_POSITIONS=5 and
+# a semis-heavy universe meant the check was structurally non-binding
+# (5≥5 → never fired). At 3, the bot must hold at least 2 non-semi
+# names → natural hedge against a sector-wide gap-down (SOX −5%).
+# Still high enough that in a confirmed chip bull it can put 60% of
+# capital to work in the strongest sector.
+MAX_PER_SECTOR = 3
 
 
 # Sector → tracking-ETF map. Used by:

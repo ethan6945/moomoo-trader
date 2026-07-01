@@ -272,7 +272,7 @@
 
   <!-- SETTINGS MODAL -->
   <div id="settingsModal" class="modal hidden">
-    <div class="modal-box">
+    <div class="modal-box" style="width:min(700px,94vw)">
       <div class="modal-head"><h2>⚙ 设置 Settings</h2><button class="sm" id="btnCloseSet">✕</button></div>
 
       <div class="set-sec"><h3>交易模式 Trading Mode</h3>
@@ -289,6 +289,17 @@
 
       <div class="set-sec"><h3>运行配置 Run Config <span style="text-transform:none;font-weight:400">（只读）</span></h3>
         <div class="cfgchips" id="runCfg"><span class="mut" style="font-size:12px">—</span></div>
+      </div>
+
+      <div class="set-sec"><h3>AI 引擎 AI Engine</h3>
+        <div class="setdesc" style="margin-bottom:8px">选哪家 AI 做<b>全部</b>分析（信号审核 / 情绪 / 智能退出 / 自动优化）。Gemini 不可用时切到 DeepSeek，<b>下次扫描即生效，无需重启</b>。模型列表实时从各家 API 拉取——出了新模型也能直接选，不写死。先在下方「API Keys」填好对应 Key。</div>
+        <div class="set-row"><div style="flex:1"><b>引擎 Provider</b>
+          <div id="aiEngNote" class="setdesc" style="margin-top:4px">—</div></div>
+          <select id="selAiProvider"><option>…</option></select></div>
+        <div class="set-row"><div style="flex:1"><b>模型 Model</b><div class="setdesc">所选引擎当前可用的模型（实时拉取）。</div></div>
+          <select id="selAiModel"><option>加载中…</option></select></div>
+        <div class="set-row"><div id="aiEngState" class="setdesc" style="flex:1">—</div>
+          <button class="sm" id="btnAiApply">应用 Apply</button></div>
       </div>
 
       <div class="set-sec"><h3>API Keys</h3>
@@ -648,13 +659,68 @@ async function loadSettings(){
     $('#setBudget').value=Math.round(a.budget||0);
     // read-only run config — kept here (off the dashboard) so the main view stays clean
     $('#runCfg').innerHTML=[
+      ['AI 模型',a.ai_model],
       ['入场阈值',a.entry_threshold],['扫描间隔',(a.scan_interval_min??'—')+' min'],
-      ['K线周期',a.timeframe],['最长持仓',(a.max_hold_days??'—')+' 天'],['AI 模型',a.ai_model],
+      ['K线周期',a.timeframe],['最长持仓',(a.max_hold_days??'—')+' 天'],
     ].map(([k,v])=>`<span class="pill">${k}<b>${v??'—'}</b></span>`).join('');
   }catch(e){}
   loadWebAccess();
   loadTradeEnv();
+  loadAiEngine();
 }
+
+// ── AI engine (Gemini ⟷ DeepSeek) + live model dropdown ──
+let AIPROV=null;
+async function loadAiEngine(){
+  try{
+    const d=await api('/api/ai-provider'); AIPROV=d;
+    const sel=$('#selAiProvider');
+    sel.innerHTML=d.providers.map(p=>
+      `<option value="${p.id}">${p.label}${p.has_key?'':' (未设 Key)'}${p.vision?'':' · 无视觉'}</option>`).join('');
+    sel.value=d.provider;
+    updateAiNote();
+    await loadAiModels(d.provider, d.model);
+  }catch(e){
+    // Don't leave the dropdown spinning forever. A 404 here means the web server
+    // is running OLD code (started before this feature) — it needs a restart.
+    $('#selAiProvider').innerHTML='<option value="gemini">Gemini</option><option value="deepseek">DeepSeek</option>';
+    $('#selAiModel').innerHTML='<option value="">—</option>';
+    const stale=/404|接口不存在/.test(e.message);
+    $('#aiEngState').innerHTML = stale
+      ? '⚠ 网页服务在跑旧代码（这个开关是新加的）——请<b>重启 start-web</b> 后再打开设置即可。'
+      : '加载失败: '+e.message;
+  }
+}
+function updateAiNote(){
+  if(!AIPROV)return;
+  const p=AIPROV.providers.find(x=>x.id===$('#selAiProvider').value)||{};
+  let s = p.has_key ? '' : `⚠ 请先在下方「API Keys」填入 ${p.label} 的 API Key。`;
+  if(p.id==='deepseek') s+=(s?' ':'')+'DeepSeek 纯文本，无图表视觉——形态视觉确认层会自动跳过。';
+  $('#aiEngNote').innerHTML=s||'就绪。';
+}
+async function loadAiModels(provider, selectModel){
+  const sel=$('#selAiModel'); sel.innerHTML='<option>加载中…</option>';
+  try{
+    const d=await api('/api/ai-models?provider='+encodeURIComponent(provider));
+    const models=d.models||[];
+    sel.innerHTML = models.length
+      ? models.map(m=>`<option value="${m}">${m}</option>`).join('')
+      : '<option value="">(无可用模型)</option>';
+    if(selectModel && models.includes(selectModel)) sel.value=selectModel;
+    $('#aiEngState').innerHTML = d.fallback
+      ? `⚠ 实时拉取失败(${d.error||''})，用内置列表兜底。`
+      : `当前生效：<b>${AIPROV?AIPROV.provider:provider}</b> · <b>${AIPROV?AIPROV.model:''}</b>`;
+  }catch(e){ sel.innerHTML='<option value="">拉取失败</option>'; $('#aiEngState').textContent='拉取模型失败: '+e.message; }
+}
+$('#selAiProvider').onchange=e=>{ updateAiNote(); loadAiModels(e.target.value); };
+$('#btnAiApply').onclick=async()=>{
+  const provider=$('#selAiProvider').value, model=$('#selAiModel').value;
+  if(!model){alert('没有可选模型，请先确认该引擎的 API Key 已设置。');return;}
+  try{
+    const r=await api('/api/ai-provider',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider,model})});
+    alert(r.note||'已切换'); await loadAiEngine(); refresh();
+  }catch(e){ alert('切换失败: '+e.message); }
+};
 let ENVST=null;
 async function loadTradeEnv(){
   try{

@@ -42,9 +42,13 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
     Halt is reserved for repeated-after-fix drift (broken state we can't recover).
     """
     try:
-        our_trades = json.loads(OPEN_TRADES_FILE.read_text()) if OPEN_TRADES_FILE.exists() else {}
-    except json.JSONDecodeError:
-        our_trades = {}
+        our_trades = db.load_open_trades()
+    except Exception:
+        # Fall back to legacy JSON mirror if SQLite is unavailable
+        try:
+            our_trades = json.loads(OPEN_TRADES_FILE.read_text()) if OPEN_TRADES_FILE.exists() else {}
+        except json.JSONDecodeError:
+            our_trades = {}
 
     broker_holdings: dict[str, dict] = {}    # symbol → {qty, cost_price}
     if not broker_positions.empty:
@@ -58,6 +62,28 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
 
     our_syms = {s for s, t in our_trades.items() if t.get("qty", 0) > 0}
     broker_syms = set(broker_holdings.keys())
+
+    # The cash-yield ETF (e.g. SGOV) is a cash equivalent managed by
+    # src/cash_yield.py, NOT a strategy position — exclude it from reconcile so
+    # it is never adopted as an orphan or flagged as drift. Honors the runtime
+    # toggle (web), not just the .env default.
+    try:
+        from . import cash_yield
+        if cash_yield.enabled():
+            cy = cash_yield.symbol()
+            broker_syms.discard(cy)
+            broker_holdings.pop(cy, None)
+    except Exception:
+        pass
+    # Same for the inverse-ETF sleeve holding (managed by src/inverse_sleeve.py).
+    try:
+        from . import inverse_sleeve
+        if inverse_sleeve.enabled():
+            iv = inverse_sleeve.symbol()
+            broker_syms.discard(iv)
+            broker_holdings.pop(iv, None)
+    except Exception:
+        pass
 
     orphans = [
         {"symbol": s,
@@ -211,9 +237,16 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
         if fixes_applied:
             try:
                 OPEN_TRADES_FILE.write_text(json.dumps(our_trades, indent=2, default=str))
-                # Also push through the SQLite mirror in executor.
-                from . import executor
-                executor._save_open_trades(our_trades)
+                # Persist reconciled state to SQLite (primary store). Use the db
+                # layer directly instead of the executor-internal _save helper so
+                # reconcile doesn't couple to executor's private API surface.
+                existing_db = set(db.load_open_trades().keys())
+                for sym in existing_db - set(our_trades.keys()):
+                    db.delete_open_trade(sym)
+                for sym, t in our_trades.items():
+                    t = dict(t)
+                    t["symbol"] = sym
+                    db.upsert_open_trade(t)
             except Exception as e:
                 log.error("reconcile auto-fix write failed: %s", e)
 

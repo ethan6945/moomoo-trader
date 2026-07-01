@@ -50,7 +50,10 @@ def in_trade_phase(now: Optional[datetime] = None) -> bool:
     if n.weekday() >= 5:
         return False
     minutes = n.hour * 60 + n.minute
-    return TRADE_PHASE_START_MIN <= minutes <= TRADE_PHASE_END_MIN
+    # 2026-06-26 strict-boundary fix: 15:30 is the start of MOC volatility —
+    # the bot should NOT open new entries at/after 15:30. Use < instead of <=
+    # so the last valid entry minute is 15:29, consistent with the docstring.
+    return TRADE_PHASE_START_MIN <= minutes < TRADE_PHASE_END_MIN
 
 
 def evaluate(regime_block_new: bool, regime_label: str, regime_note: str,
