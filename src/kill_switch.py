@@ -100,18 +100,31 @@ def evaluate(regime_block_new: bool, regime_label: str, regime_note: str,
             gate="halt",
         )
 
-    starting_cash = float(state.get("starting_cash") or 0)
-    if starting_cash > 0:
-        drawdown = (starting_cash - current_cash) / starting_cash
-        if drawdown >= settings.daily_drawdown_stop:
-            # Set the halt flag atomically so subsequent scans short-circuit.
-            db.atomic_state(lambda s: {"halted": True})
-            return KillSwitchVerdict(
-                can_trade=False,
-                reason=(f"daily drawdown {drawdown:.1%} "
-                        f"≥ {settings.daily_drawdown_stop:.0%} — auto-halted"),
-                gate="drawdown",
-            )
+    # Daily drawdown — measured on TODAY'S REALIZED PnL against the equity
+    # baseline (frozen seed while auto-compounding is armed). 2026-07-02 audit
+    # P0-3: the previous cash-based measure was a dead fuse in SIMULATE (paper
+    # cash ≫ budget → the threshold was mathematically unreachable) and a false
+    # trigger in REAL (buying positions reduces cash and read as "drawdown").
+    # `current_cash` is no longer consumed here; the parameter stays so call
+    # sites don't churn.
+    realized_today = float(state.get("realized_pnl_today", 0.0) or 0.0)
+    if realized_today < 0:
+        try:
+            from . import risk_manager   # lazy: avoids any import-order cycle
+            base = float(risk_manager.equity_baseline())
+        except Exception:
+            base = 0.0
+        if base > 0:
+            loss_frac = -realized_today / base
+            if loss_frac >= settings.daily_drawdown_stop:
+                # Set the halt flag atomically so subsequent scans short-circuit.
+                db.atomic_state(lambda s: {"halted": True})
+                return KillSwitchVerdict(
+                    can_trade=False,
+                    reason=(f"daily drawdown {loss_frac:.1%} of ${base:.0f} "
+                            f"≥ {settings.daily_drawdown_stop:.0%} — auto-halted"),
+                    gate="drawdown",
+                )
 
     return KillSwitchVerdict(can_trade=True, reason="ok", gate="")
 

@@ -495,10 +495,16 @@ def _force_close(client: MoomooClient, symbol: str, trade: dict,
                 client.cancel_order(oid)
             except Exception as e:
                 log.warning("cancel %s %s failed: %s", symbol, key, e)
-    try:
-        client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
-    except Exception as e:
-        log.warning("force-sell %s failed: %s", symbol, e)
+    # The SELL must actually be placed before the close is booked (2026-07-02
+    # audit P1-1). The old version swallowed a failed order and booked the close
+    # anyway — the broker still held the shares, the books said "realized", and
+    # the next reconcile re-adopted the live position as an orphan with
+    # fabricated levels. Now a failure propagates to the caller (every call
+    # site wraps per-symbol), the trade record stays tracked, and the exit is
+    # retried next cycle. Note: any bracket legs were already cancelled above,
+    # so until the retry succeeds the position is soft-tracked only.
+    client.place_limit_order(symbol, trade["qty"],
+                             last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
     pnl = _close_and_log(symbol, trade, trade["qty"], last, reason)
     return pnl, {"type": reason.lower(), "symbol": symbol, "price": last,
                  "qty": trade["qty"], "pnl": pnl}
@@ -564,10 +570,16 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
             return
 
         if age_days >= runtime_config.max_hold_days():
-            # Pull bracket legs first, then market-sell remaining qty.
+            # Pull bracket legs first, then market-sell remaining qty. A leg
+            # that fails to cancel may still be live — or already FILLED —
+            # so selling on top of it risks a double sell. Defer to the next
+            # cycle: _check_bracket_fills will book a fill, or the cancel is
+            # retried (2026-07-02 audit P2).
             for oid in (trade["stop_order_id"], trade["tp_order_id"]):
-                if oid:
-                    client.cancel_order(oid)
+                if oid and not client.cancel_order(oid):
+                    log.warning("%s max-hold: cancel of bracket leg %s failed — "
+                                "deferring close to next cycle", symbol, oid)
+                    return
             client.place_limit_order(symbol, trade["qty"], last * (1 - PROTECTIVE_EXIT_SLIP), TrdSide.SELL)
             pnl = _close_and_log(symbol, trade, trade["qty"], last, "MAX_HOLD")
             actions.append({"type": "max_hold_bracket", "symbol": symbol,

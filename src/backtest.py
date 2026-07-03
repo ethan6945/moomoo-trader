@@ -86,6 +86,7 @@ class BacktestConfig:
     timeframe: str = "HOUR_1"
     threshold: float = 70.0
     tickers: list[str] = field(default_factory=list)
+    data_source: str = "moomoo"        # "moomoo" (OpenD) | "yfinance" (independent ~730d 1h window)
     account_usd: float = 4500.0
     risk_per_trade: float = 0.02
     max_position_pct: float = 0.20
@@ -861,7 +862,12 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
                 f"get_kline({sym}) hung > {_FETCH_TIMEOUT_SEC}s — OpenD silent; skipping"
             )
 
-    c = MoomooClient()
+    if getattr(cfg, "data_source", "moomoo") == "yfinance":
+        from .yfinance_source import YFinanceSource
+        c = YFinanceSource()
+        log.info("[prefetch] data source: yfinance (independent window)")
+    else:
+        c = MoomooClient()
     try:
         # SPY needed for the regime gate AND the Phase 3-A RS gate.
         if cfg.apply_regime_gate or cfg.apply_rs_gate:

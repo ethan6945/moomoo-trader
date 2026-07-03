@@ -490,12 +490,22 @@ def can_open_new(
         return False, (f"budget cap ${cap:.0f} would be exceeded "
                        f"(committed ${committed:.0f} + new ${required_cash:.0f})")
 
-    drawdown = (state["starting_cash"] - current_cash) / state["starting_cash"] \
-        if state["starting_cash"] else 0
-    if drawdown >= settings.daily_drawdown_stop:
-        state["halted"] = True
-        _save_state(state)
-        return False, f"daily drawdown {drawdown:.1%} ≥ {settings.daily_drawdown_stop:.0%}"
+    # Daily drawdown stop — measured on TODAY'S REALIZED PnL against the equity
+    # baseline (2026-07-02 audit P0-3). The old cash-based measure
+    # ((starting_cash − current_cash) / starting_cash) was structurally wrong on
+    # both ends: in SIMULATE the paper cash (~$1M) dwarfs the $50k budget so the
+    # 6% line could never fire even with the whole budget lost, and in REAL
+    # (cash ≈ budget) simply BUYING positions burns >6% of cash and would halt a
+    # perfectly healthy day. current_cash no longer feeds this check.
+    base = equity_baseline()
+    realized_today = float(state.get("realized_pnl_today", 0.0) or 0.0)
+    if base > 0 and realized_today < 0:
+        daily_loss_frac = -realized_today / base
+        if daily_loss_frac >= settings.daily_drawdown_stop:
+            state["halted"] = True
+            _save_state(state)
+            return False, (f"daily drawdown {daily_loss_frac:.1%} of ${base:.0f} "
+                           f"≥ {settings.daily_drawdown_stop:.0%}")
 
     return True, "ok"
 

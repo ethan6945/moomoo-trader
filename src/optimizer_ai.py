@@ -98,7 +98,7 @@ _PARAM_TO_CFG = {
     "max_position_pct": "max_position_pct",
 }
 _INT_PARAMS = {"max_hold_days", "universe_top_n"}
-_VALIDATE_WINDOWS = (180, 360)
+_VALIDATE_WINDOWS = (60,)   # recent single window on OpenD (owner: 2026-07-02; was (180,360) yfinance)
 _PINNED = ["SNDK", "MU", "INTC", "LRCX", "DDOG", "AMD", "WDC", "SWKS", "PANW", "MCHP"]
 
 
@@ -126,6 +126,9 @@ def _base_cfg(days: int):
         days=days, timeframe=settings.timeframe,
         threshold=runtime_config.entry_threshold(),
         tickers=tickers, account_usd=risk_manager.budget_usd(),
+        # data_source defaults to "moomoo" (OpenD) — validation runs on the same
+        # live feed the bot trades, over a recent short window (_VALIDATE_WINDOWS).
+        # Owner's choice 2026-07-02: recent 60d OpenD, not yfinance/360d.
         risk_per_trade=runtime_config.risk_per_trade(),
         max_position_pct=runtime_config.max_position_pct(),
         max_hold_days=runtime_config.max_hold_days(),
@@ -221,9 +224,10 @@ def validate_proposals(proposals: list[dict]) -> list[dict]:
         deltas = {d: pd_d[d] - base_pd[d] for d in _VALIDATE_WINDOWS}
         dd_ok = all(dd_d[d] <= base_dd[d] + DD_TOLERANCE_PP for d in _VALIDATE_WINDOWS)
         beats = all(deltas[d] > 0 for d in _VALIDATE_WINDOWS) and dd_ok
-        log.info("optimizer: %s=%s → Δ180d %+.2f(DD%+.1f) Δ360d %+.2f(DD%+.1f) → %s",
-                 key, value, deltas[180], dd_d[180] - base_dd[180],
-                 deltas[360], dd_d[360] - base_dd[360], "PASS" if beats else "drop")
+        log.info("optimizer: %s=%s → %s → %s", key, value,
+                 " ".join(f"Δ{d}d {deltas[d]:+.2f}(DD{dd_d[d] - base_dd[d]:+.1f})"
+                          for d in _VALIDATE_WINDOWS),
+                 "PASS" if beats else "drop")
         if beats:
             validated.append(dict(p, _deltas=deltas, _dd=dict(dd_d)))
     return validated
@@ -288,8 +292,9 @@ def propose_from_review(review: dict) -> int:
         cur = _current_params().get(key)
         d = p.get("_deltas", {})
         dd = p.get("_dd", {})
-        gain = (f"backtested +${d.get(180, 0):.1f}/day(180d,DD{dd.get(180, 0):.1f}%), "
-                f"+${d.get(360, 0):.1f}/day(360d,DD{dd.get(360, 0):.1f}%)")
+        gain = "backtested " + ", ".join(
+            f"+${d.get(w, 0):.1f}/day({w}d,DD{dd.get(w, 0):.1f}%)"
+            for w in _VALIDATE_WINDOWS)
         # Bounded autonomy (2026-06-11, owner mandate): with AUTO_APPLY_PARAMS
         # on, a proposal that PASSED the dual-window gate and sits inside the
         # pre-approved ALLOWED_PARAMS bounds is applied immediately — with a

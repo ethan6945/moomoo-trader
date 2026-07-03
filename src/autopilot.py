@@ -53,7 +53,7 @@ DRAWDOWN_FREEZE_PCT = 0.10   # freeze all auto-changes when DD ≥ 10%
 # ── System prompt (sent to DeepSeek) ─────────────────────────────────────────
 SYSTEM_PROMPT = """You are the autonomous portfolio manager for moomoo-trader.
 
-ACCOUNT ($5,000 US cash, no leverage, long-only, no shorting):
+ACCOUNT (${budget:,.0f} US cash — owner-allocated budget; NEVER exceed it, no leverage/margin, long-only, no shorting):
 - Max 5 concurrent positions
 - Single position ≤ 55% of account
 - Single trade risk ≤ 8% (half-Kelly ceiling)
@@ -69,10 +69,11 @@ ADJUSTABLE PARAMETERS (you propose 0-3 changes per week, SMALL moves only):
 - universe_top_n (10-20): {universe_top_n}
 - max_position_pct (0.20-0.55): {max_position_pct}
 
-KNOWN PLATEAU PEAKS (don't move these without NEW evidence):
-- entry_threshold=70 is optimal (180d sweep: 55→−$11/day, 85→cuts trades)
-- tp_atr_mult=8 and max_hold_days=7 sit on measured plateau peaks
-- max_position_pct=0.40 beat 0.30/0.50/0.70 in the 2026-06-11 sweep
+CURRENT VALUES (already sweep-tuned — move only with NEW evidence; every proposal is
+re-validated on a recent 60-day OpenD backtest and dropped unless it beats these):
+- entry_threshold={entry_threshold} (past sweeps: 55→−$11/day, 85→cuts trades)
+- tp_atr_mult={tp_atr_mult}, max_hold_days={max_hold_days} sit near measured plateaus
+- max_position_pct={max_position_pct} (0.40 beat 0.30/0.50/0.70 in the 2026-06-11 sweep)
 
 ACTIVE STRATEGIES:
 {strategy_status}
@@ -126,6 +127,24 @@ def _within_guardrails(key: str, value: float) -> bool:
     return lo <= value <= hi
 
 
+def _effective_budget() -> float:
+    """The budget the owner ACTUALLY gave (db-state), not the stale .env constant.
+
+    Uses risk_manager.equity_baseline() — the same capital base the DD breaker
+    sizes against — so autopilot's freeze threshold is computed on the real
+    deployed budget (e.g. $50k) instead of settings.account_usd (the frozen
+    .env value, which was $5k and made the freeze fire ~10x too early).
+    """
+    try:
+        from . import risk_manager
+        b = float(risk_manager.equity_baseline())
+        if b > 0:
+            return b
+    except Exception:
+        pass
+    return float(settings.account_usd)
+
+
 def _current_drawdown() -> float:
     """Return the current realized drawdown as a fraction (0.0 = no loss)."""
     try:
@@ -133,62 +152,20 @@ def _current_drawdown() -> float:
         realized = float(state.get("realized_pnl_total", 0))
     except Exception:
         realized = 0.0
-    # DD = negative realized / seed capital
+    # DD = negative realized / seed capital (real owner budget, not .env)
     if realized >= 0:
         return 0.0
-    seed = float(settings.account_usd)
+    seed = _effective_budget()
     if seed <= 0:
         return 0.0
     return abs(realized) / seed
 
 
-def _run_backtest_with_param(key: str, value: float) -> dict | None:
-    """Run a quick backtest with one parameter changed. Returns metrics or None."""
-    try:
-        from .backtest_v3 import _base_cfg, simulate_v3
-        cfg = _base_cfg(days=90)
-        cfg_params = {
-            "threshold": runtime_config.entry_threshold(),
-            "tp_atr_mult": runtime_config.tp_atr_mult(),
-            "sl_atr_mult": runtime_config.sl_atr_mult(),
-            "max_hold_days": runtime_config.max_hold_days(),
-            "risk_per_trade": runtime_config.risk_per_trade(),
-            "max_position_pct": runtime_config.max_position_pct(),
-            "universe_top_n": runtime_config.universe_top_n(),
-            "breakeven_trigger_r": runtime_config.breakeven_trigger_r(),
-        }
-        # Map the key to the backtest config field
-        key_map = {
-            "entry_threshold": "threshold",
-            "tp_atr_mult": "tp_atr_mult",
-            "sl_atr_mult": "sl_atr_mult",
-            "max_hold_days": "max_hold_days",
-            "risk_per_trade": "risk_per_trade",
-            "max_position_pct": "max_position_pct",
-            "universe_top_n": "universe_top_n",
-            "breakeven_trigger_r": "breakeven_trigger_r",
-        }
-        if key in key_map:
-            cfg_params[key_map[key]] = value
-        from dataclasses import replace
-        cfg = replace(cfg, **{k: v for k, v in cfg_params.items()
-                              if hasattr(cfg, k)})
-        # Prefetch + simulate
-        from .backtest import prefetch_data
-        cache = prefetch_data(cfg)
-        result = simulate_v3(cfg, cache, enforce_cash=True)
-        metrics = result.get("metrics", {})
-        return {
-            "sortino": metrics.get("sortino_ratio", 0),
-            "net_pnl": metrics.get("net_pnl_usd", 0),
-            "per_day": metrics.get("per_day_usd", 0),
-            "max_dd": metrics.get("max_drawdown_pct", 0),
-            "n_trades": metrics.get("total_trades", 0),
-            "profit_factor": metrics.get("profit_factor", 0),
-        }
-    except Exception as e:
-        log.warning("backtest validation failed for %s=%s: %s", key, value, e)
-        return None
+# NOTE: the old `_run_backtest_with_param` was removed 2026-07-02. It imported
+# `_base_cfg` from `.backtest_v3` (where it does not exist) → every call raised
+# and returned None → autopilot applied changes with NO backtest validation.
+# Validation now goes through `optimizer_ai.validate_proposals` (independent
+# yfinance dual-window, beats-baseline + drawdown guard) in weekly_autopilot.
 
 
 def weekly_autopilot() -> dict:
@@ -293,6 +270,7 @@ def weekly_autopilot() -> dict:
         log.warning("strategy gate check failed: %s", e)
 
     # ── 2. Ask DeepSeek ──
+    from . import risk_manager
     prompt = SYSTEM_PROMPT.format(
         weekly_report=json.dumps(report, indent=2, default=str)
         if isinstance(report, dict) else str(report),
@@ -300,6 +278,7 @@ def weekly_autopilot() -> dict:
         backtest_health=bt_health,
         ml_status=ml_status,
         strategy_status=strategy_status,
+        budget=risk_manager.budget_usd(),
         **_current_params(),
     )
 
@@ -334,16 +313,14 @@ def weekly_autopilot() -> dict:
     queued = []
     skipped = []
 
+    # ── 3a. Guardrail triage — unknown / out-of-bounds never auto-apply ──
+    in_bounds = []
     for p in proposals:
         key = p.get("key", "")
         value = p.get("value")
-        rationale = p.get("rationale", "no rationale")
-
         if key not in GUARDRAILS:
             queued.append({**p, "reason": "unknown parameter"})
             continue
-
-        # Guardrail check
         if not _within_guardrails(key, value):
             approvals.enqueue(
                 kind="param_change",
@@ -353,27 +330,44 @@ def weekly_autopilot() -> dict:
             )
             queued.append({**p, "reason": f"outside guardrails {GUARDRAILS[key]}"})
             continue
+        in_bounds.append(p)
 
-        # Backtest validation
-        bt = _run_backtest_with_param(key, value)
-        if bt is not None and bt.get("sortino", 0) <= 0:
-            skipped.append({**p, "reason": f"backtest Sortino={bt['sortino']:.1f} ≤ 0"})
-            continue
+    # ── 3b. Validate on a recent OpenD backtest (owner 2026-07-02: 60d, OpenD) ──
+    # Reuse the optimizer's mature gate: a change must BEAT the current config's
+    # $/day without worsening drawdown by > DD_TOLERANCE_PP, must be a valid
+    # in-bounds param, and must not be in post-rollback cooldown. This REPLACES
+    # the old broken path (it imported _base_cfg from the wrong module → every
+    # backtest raised → returned None → autopilot applied with NO validation).
+    # Window + data source come from optimizer_ai (_VALIDATE_WINDOWS=60d / _base_cfg=OpenD).
+    validated = []
+    if in_bounds:
+        try:
+            from . import optimizer_ai
+            validated = optimizer_ai.validate_proposals(in_bounds)
+        except Exception as e:
+            log.warning("Autopilot: validation failed (%s) — applying nothing this cycle", e)
+            skipped.extend({**p, "reason": f"validation error: {e}"} for p in in_bounds)
+            validated = []
+    val_keys = {v.get("key") for v in validated}
+    for p in in_bounds:
+        if p.get("key") not in val_keys:
+            skipped.append({**p, "reason": "no improvement on the recent 60d OpenD backtest"})
 
-        # Auto-apply
+    # ── 3c. Apply the validated (independently-improving) changes ──
+    for v in validated:
+        key = v.get("key")
+        value = v.get("value")
         try:
             current = _current_params().get(key)
-            runtime_config.set_param(key, float(value),
-                                     f"autopilot_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
-            applied.append({
-                **p,
-                "old_value": current,
-                "backtest": bt,
-            })
-            log.info("Autopilot: APPLIED %s %.2f → %.2f (%s)",
-                     key, current, value, rationale)
+            runtime_config.set_param(
+                key, float(value),
+                f"autopilot_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+            applied.append({**v, "old_value": current,
+                            "backtest": {"deltas": v.get("_deltas"), "dd": v.get("_dd")}})
+            log.info("Autopilot: APPLIED %s %s → %s (%s)",
+                     key, current, value, v.get("rationale", ""))
         except Exception as e:
-            skipped.append({**p, "reason": str(e)})
+            skipped.append({**v, "reason": str(e)})
 
     # ── 4. Notify ──
     lines = ["🤖 *Autopilot 周报*"]
@@ -383,12 +377,11 @@ def weekly_autopilot() -> dict:
             lines.append(
                 f"  • {a['key']}: {a.get('old_value','?')} → {a['value']}"
             )
-            if a.get("backtest"):
-                bt = a["backtest"]
+            deltas = (a.get("backtest") or {}).get("deltas") or {}
+            if deltas:
                 lines.append(
-                    f"    回测: ${bt.get('net_pnl',0):+.0f}, "
-                    f"Sortino {bt.get('sortino',0):.1f}, "
-                    f"DD {bt.get('max_dd',0):.1f}%"
+                    "    回测(OpenD): "
+                    + ", ".join(f"{w}d Δ${deltas[w]:+.1f}/日" for w in sorted(deltas))
                 )
             lines.append(f"    理由: {a.get('rationale','')}")
     if queued:
@@ -428,41 +421,72 @@ def check_and_rollback() -> list[str]:
     notes: list[str] = []
     try:
         from . import db
+        from datetime import datetime, timedelta, timezone
+
+        def _ts(row):
+            """Parse a closed-trade timestamp to an aware UTC datetime, or None.
+            Tolerates missing/naive/malformed values so one bad row can't
+            silently disable the whole rollback check (old code let a bad ts
+            raise and swallow the entire pass)."""
+            raw = row.get("ts") or row.get("closed_at") or ""
+            try:
+                dt = datetime.fromisoformat(str(raw))
+            except (ValueError, TypeError):
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
         state = db.get_state()
         hist = list(state.get("param_history", []))
-        # Find recently auto-applied changes (last 7 days)
-        from datetime import datetime, timedelta, timezone
-        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        rows = db.closed_trades(limit=200)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=7)
+        MIN_TRADES_SINCE = 5   # need a real post-change sample, not loss noise
+
         for h in reversed(hist):
             if not h.get("active"):
                 continue
-            if h.get("source", "").startswith("autopilot_"):
-                applied_at = h.get("applied_at", "")
-                try:
-                    at = datetime.fromisoformat(applied_at)
-                except (ValueError, TypeError):
+            if not str(h.get("source", "")).startswith("autopilot_"):
+                continue
+            try:
+                at = datetime.fromisoformat(h.get("applied_at", ""))
+            except (ValueError, TypeError):
+                continue
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at < cutoff:
+                continue
+
+            # Evidence-based: split closed trades into before/after the change.
+            after, before = [], []
+            for r in rows:
+                t = _ts(r)
+                if t is None:
                     continue
-                if at < cutoff:
-                    continue
-                # Check if there's evidence of harm (simplified: check if
-                # any losses happened since). Full backtest is too heavy
-                # for a pre-review quick check.
-                rows = db.closed_trades(limit=200)
-                losses_since = sum(
-                    1 for r in rows
-                    if r.get("pnl", 0) < 0
-                    and (datetime.fromisoformat(r.get("ts", "")) >= at)
+                (after if t >= at else before).append(r)
+            if len(after) < MIN_TRADES_SINCE:
+                continue  # not enough post-change evidence yet — wait, don't guess
+
+            net_after = sum(float(r.get("pnl", 0) or 0) for r in after)
+            exp_after = net_after / len(after)
+            exp_before = (sum(float(r.get("pnl", 0) or 0) for r in before) / len(before)
+                          if before else 0.0)
+
+            # Roll back ONLY on real deterioration: net loss since the change AND
+            # per-trade expectancy clearly worse than the window before it. (The
+            # old "≥3 losses" rule fired on normal ~50% loss cadence regardless
+            # of whether the change helped.)
+            if net_after < 0 and exp_after < exp_before:
+                runtime_config.revert_param(
+                    h["key"],
+                    f"auto-rollback: net ${net_after:+.0f} over {len(after)} trades "
+                    f"since change; exp/trade {exp_after:+.1f} < {exp_before:+.1f} before"
                 )
-                if losses_since >= 3:
-                    runtime_config.revert_param(
-                        h["key"],
-                        f"auto-rollback: {losses_since} losses since autopilot change"
-                    )
-                    notes.append(
-                        f"🔄 Autopilot 自动回滚: {h['key']} "
-                        f"{h.get('new','?')} → {h.get('old','?')} "
-                        f"({losses_since} losses since change)"
-                    )
+                notes.append(
+                    f"🔄 Autopilot 自动回滚: {h['key']} "
+                    f"{h.get('new','?')} → {h.get('old','?')} "
+                    f"(改动后 {len(after)} 笔净 ${net_after:+.0f}, "
+                    f"期望/笔 {exp_after:+.1f} < 改前 {exp_before:+.1f})"
+                )
     except Exception as e:
         log.warning("autopilot rollback check failed: %s", e)
     return notes
