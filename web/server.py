@@ -726,8 +726,19 @@ def api_budget():
         assert val > 0
     except Exception:
         return jsonify({"ok": False, "error": "bad value"}), 400
-    db.update_state({"budget_usd": val})
-    return jsonify({"ok": True, "budget": val})
+    # Re-anchor the DD breaker's peak to the NEW capital base + realized PnL.
+    # 2026-07-07: a peak recorded under the old budget is meaningless under the
+    # new one — after a 50k→5k change the bot computed a phantom 90% drawdown
+    # and halted all new entries until the 7-day auto-release.
+    def _apply(s: dict) -> dict:
+        realized = float(s.get("realized_pnl_total") or 0.0)
+        base = float(s.get("auto_budget_seed") or val)
+        return {"budget_usd": val,
+                "peak_equity": max(base + realized, 1.0),
+                "halt_started_at": None}
+    db.atomic_state(_apply)
+    return jsonify({"ok": True, "budget": val,
+                    "note": "预算已更新，回撤峰值已重锚到新资金基数"})
 
 
 # ── Auto-compounding budget: "money making more money" ───────────────────────

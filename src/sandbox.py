@@ -180,7 +180,13 @@ class SimFeed:
             n_h = len(self._hourly.get(sym, pd.DataFrame()))
             print(f"    {tag}: {n_h}h, {n_d}d bars")
         print(f"  Done: {len(self._hourly)}/{len(all_syms)} tickers loaded")
-        del client
+        # close() (not just del): the moomoo SDK's quote context spawns
+        # NON-DAEMON threads — a leaked context keeps the whole process alive
+        # after main() returns (the 2026-07-07 optimizer hang at exit).
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def get_kline(self, symbol: str, bars: int = 120, ktype=None):
         """Pure clock-driven truncation — no _idx, no advance_all."""
