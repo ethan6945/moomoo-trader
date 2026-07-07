@@ -55,6 +55,7 @@ SIGNAL_WL_FILE = ROOT / "config" / "signal_watchlist.json"
 SELF_REVIEW_FILE = ROOT / "data" / "self_review_last.json"
 SCHED_PID = ROOT / "logs" / "scheduler.pid"
 MENUBAR_PID = ROOT / "logs" / "menubar.pid"
+OPEND_PID = ROOT / "logs" / "opend.pid"
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 
 app = Flask(__name__, static_folder=None)
@@ -219,10 +220,18 @@ def _tail(p: Path, n: int) -> list[str]:
 
 
 def _pid_running(pid_file: Path) -> int | None:
-    """Return the live PID recorded in pid_file, or None if not running."""
+    """Return the live PID recorded in pid_file, or None if not running.
+
+    2026-07-07: also reject ZOMBIES — os.kill(pid, 0) succeeds on a defunct
+    child this server spawned but never reaped, so a dead scheduler showed
+    as "running" on the dashboard until the web server restarted."""
     try:
         pid = int(pid_file.read_text().strip())
         os.kill(pid, 0)   # signal 0 = liveness check
+        out = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3)
+        if out.stdout.strip().startswith("Z"):
+            return None   # zombie — process is dead, entry not yet reaped
         return pid
     except Exception:
         return None
@@ -230,6 +239,145 @@ def _pid_running(pid_file: Path) -> int | None:
 
 def _scheduler_running() -> bool:
     return _pid_running(SCHED_PID) is not None
+
+
+def _opend_running() -> bool:
+    """True if OpenD is reachable on the configured host:port."""
+    try:
+        with socket.create_connection(
+            (settings.moomoo_host, settings.moomoo_port), timeout=0.6
+        ):
+            return True
+    except Exception:
+        return False
+
+
+def _opend_password() -> str:
+    """OpenD login password — macOS Keychain first (service "moomoo-opend",
+    2026-07-07 hardening), legacy .env/env-var fallback for fresh installs."""
+    try:
+        out = subprocess.run(
+            ["/usr/bin/security", "find-generic-password",
+             "-s", "moomoo-opend", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return ((_read_env().get("OPEND_LOGIN_PWD") or "").strip()
+            or os.getenv("OPEND_LOGIN_PWD", "").strip())
+
+
+def _start_opend() -> str | None:
+    """Start OpenD-rs if not already running. Returns error message or None on success."""
+    if _opend_running():
+        return None  # already up
+
+    opend_bin = "/opt/homebrew/bin/futu-opend"
+    futucli_bin = "/opt/homebrew/bin/futucli"
+
+    account = ((_read_env().get("OPEND_LOGIN_ACCOUNT") or "").strip()
+               or os.getenv("OPEND_LOGIN_ACCOUNT", "").strip())
+    pwd = _opend_password()
+
+    if not account or not pwd:
+        return ("OpenD 凭证未配置 — .env 设置 OPEND_LOGIN_ACCOUNT，密码存入 Keychain: "
+                "security add-generic-password -U -a <账号> -s moomoo-opend -w '<密码>'")
+    if not Path(opend_bin).is_file():
+        return f"futu-opend 未安装 — 运行: brew install futuleaf/tap/futu-opend-rs"
+
+    # --login-pwd-file: argv shows only a path (never the password in `ps`).
+    # 600-perm temp file, removed right after the ready-wait (OpenD reads it
+    # once at startup).
+    import tempfile
+    pwd_file = None
+    try:
+        fd, pwd_file = tempfile.mkstemp(prefix="opend_pwd.")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pwd)
+        log_f = (ROOT / "logs" / "opend.log").open("a")
+        proc = subprocess.Popen(
+            [opend_bin,
+             "--login-account", account,
+             "--login-pwd-file", pwd_file,
+             "--platform", "moomoo",
+             "--rest-port", "22222",
+             "--grpc-port", "33333"],
+            cwd=str(ROOT), stdout=log_f, stderr=log_f,
+            start_new_session=True,
+        )
+        OPEND_PID.write_text(str(proc.pid))
+    except Exception as e:
+        if pwd_file:
+            try:
+                os.unlink(pwd_file)
+            except OSError:
+                pass
+        return f"启动 OpenD 失败: {e}"
+
+    # Wait up to 15s for port 11111
+    try:
+        for i in range(1, 16):
+            if _opend_running():
+                break
+            time.sleep(1)
+        else:
+            return "OpenD 启动后端口 11111 未就绪（查阅 logs/opend.log）"
+    finally:
+        try:
+            os.unlink(pwd_file)
+        except OSError:
+            pass
+
+    # Unlock US trading
+    try:
+        subprocess.run(
+            [futucli_bin, "unlock-trade", "--security-firm", "us"],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass  # non-fatal; may already be unlocked
+
+    return None  # success
+
+
+def _stop_opend() -> bool:
+    """Stop the OpenD process we started. Returns True if there was one to stop."""
+    pid = _pid_running(OPEND_PID)
+    if pid is None:
+        # Also try killing any futu-opend by name (belt-and-suspenders)
+        try:
+            subprocess.run(["pkill", "-x", "futu-opend"], timeout=3)
+        except Exception:
+            pass
+        try:
+            OPEND_PID.unlink()
+        except FileNotFoundError:
+            pass
+        return False
+    # killpg first (OpenD may have children); fall back to a direct kill —
+    # the old version's `except Exception` fallback was unreachable because
+    # every kill failure is an OSError subclass caught by the first clause.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(10):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.2)
+    try:
+        OPEND_PID.unlink()
+    except FileNotFoundError:
+        pass
+    return True
 
 
 def _launch_menubar() -> None:
@@ -498,7 +646,6 @@ def api_reset_stats():
         "stats_reset_at": now,
         "realized_pnl_total": 0.0,
         "realized_pnl_today": 0.0,
-        "loss_streak_days": 0,
         "peak_equity": risk_manager.budget_usd(),
     })
     return jsonify({"ok": True, "reset_at": now})
@@ -720,7 +867,12 @@ def api_ai_models():
 
 def _spawn_scheduler() -> int:
     """Launch the trading scheduler as a detached, caffeinated process and record
-    its pid. Shared by the start + restart actions so they stay byte-identical."""
+    its pid. Shared by the start + restart actions so they stay byte-identical.
+    Ensures OpenD is running before launching the scheduler."""
+    # Ensure OpenD is up first
+    err = _start_opend()
+    if err:
+        raise RuntimeError(err)
     log = (ROOT / "logs" / "scheduler.log").open("a")
     proc = subprocess.Popen(
         ["/usr/bin/caffeinate", "-is", str(VENV_PY), "-m", "src.main", "run"],
@@ -736,11 +888,18 @@ def api_scheduler(action):
     if action == "start":
         if _scheduler_running():
             return jsonify({"ok": True, "note": "already running"})
+        # Ensure OpenD is up before spawning scheduler
+        opend_err = _start_opend()
+        if opend_err:
+            return jsonify({"ok": False, "error": opend_err}), 500
         return jsonify({"ok": True, "pid": _spawn_scheduler()})
     if action == "stop":
-        had = _stop_pid(SCHED_PID)
-        return jsonify({"ok": True, "running": _scheduler_running(),
-                        "note": "not running" if not had else "stopped"})
+        had_sched = _stop_pid(SCHED_PID)
+        had_opend = _stop_opend()
+        return jsonify({"ok": True,
+                        "running": _scheduler_running(),
+                        "note": "not running" if not had_sched else (
+                            "stopped (scheduler + OpenD)" if had_opend else "stopped (scheduler; OpenD was already off)")})
     if action == "restart":
         # _stop_pid blocks until the old process group is gone (or ~3s), so a
         # fresh spawn afterwards can't collide with it. Picks up the latest .env
@@ -993,16 +1152,14 @@ _bt = {"status": "idle", "result": None}
 def _run_bt(days: int):
     _bt["status"] = "running"
     try:
-        from dataclasses import replace
-        from src.backtest import BacktestConfig, prefetch_data, _run_live_engine
-        P = ["SNDK", "MU", "INTC", "LRCX", "DDOG", "AMD", "WDC", "SWKS", "PANW", "MCHP"]
-        cfg = BacktestConfig(
-            days=days, timeframe=settings.timeframe, threshold=settings.entry_threshold,
-            tickers=P, account_usd=settings.account_usd, risk_per_trade=settings.risk_per_trade,
-            max_position_pct=settings.max_position_pct, max_hold_days=settings.max_hold_days,
-            tp_atr_mult=settings.tp_atr_mult, sl_atr_mult=settings.sl_atr_mult,
-            max_gap_pct=settings.max_gap_pct, apply_mr_strategy=False,
-            use_scale_out=settings.use_scale_out, tp1_r=settings.tp1_r, tp2_r=settings.tp2_r)
+        from src.backtest import prefetch_data, _run_live_engine
+        # 2026-07-07: use _base_cfg — the SAME runtime-effective config the
+        # weekly health check scores (db-state overrides for threshold/tp/sl/
+        # risk/budget + the walk-forward universe). The old hand-built cfg here
+        # used frozen .env values and a hardcoded 10-ticker list, so the panel
+        # backtested a strategy the bot wasn't actually running.
+        from src.optimizer_ai import _base_cfg
+        cfg = _base_cfg(days=days)
         m = _run_live_engine(cfg, prefetch_data(cfg), rich_metrics=True)["metrics"]
         _bt["result"] = {
             "days": days, "per_day": round(m["net_pnl_usd"] / days, 2),
@@ -1046,6 +1203,27 @@ def _self_review_catchup_on_boot() -> None:
         )
     except Exception as e:
         print(f"self-review catchup check skipped: {e}", file=sys.stderr)
+
+
+# ── exit UI: kill everything (OpenD + scheduler + web server) ──────────────────
+@app.route("/api/exit", methods=["POST"])
+def api_exit():
+    """Exit the entire moomoo-trader system: stops OpenD, scheduler, menubar,
+    then kills this web server. The browser will show a brief confirmation
+    before the connection drops."""
+    _stop_opend()
+    _stop_pid(SCHED_PID)
+    try:
+        _stop_pid(MENUBAR_PID)
+    except Exception:
+        pass
+
+    def _shutdown():
+        time.sleep(0.5)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=_shutdown, daemon=True).start()
+    return jsonify({"ok": True, "note": "Shutting down — OpenD, scheduler, and web UI are all stopping now."})
 
 
 def main():

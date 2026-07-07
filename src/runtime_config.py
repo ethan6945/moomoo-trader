@@ -155,6 +155,11 @@ def set_param(key: str, value: float, source: str) -> dict:
             h["active"] = False
     hist.append(rec)
     db.update_state({f"param_{key}": float(value), "param_history": hist[-50:]})
+    # 2026-07-06: re-validate scale-out guard with runtime SL/TP values
+    # (the module-level guard in config.py uses static .env values and
+    # can't see runtime overrides — this plugs the gap).
+    if key in ("sl_atr_mult", "tp_atr_mult"):
+        _recheck_scale_out()
     return rec
 
 
@@ -173,3 +178,18 @@ def revert_param(key: str, reason: str) -> dict | None:
                              "param_history": hist})
             return h
     return None
+
+
+# ── scale-out re-validation (2026-07-06) ──────────────────
+
+def _recheck_scale_out() -> None:
+    """Re-validate the scale-out guard with current runtime SL/TP values.
+    Called automatically from set_param() when sl_atr_mult or tp_atr_mult
+    changes. Uses lazy import to avoid circular dependency at module load."""
+    try:
+        from .config import recheck_scale_out
+        sl = sl_atr_mult()
+        tp = tp_atr_mult()
+        recheck_scale_out(sl, tp)
+    except Exception:
+        pass  # scale-out guard is advisory; never crash on it

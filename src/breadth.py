@@ -36,8 +36,13 @@ class BreadthVerdict:
     note: str
 
 
-# Thresholds — tuned from Zweig/Williams consensus
-AD_HEALTHY_MIN = 0.70      # A/D ratio proxy < 0.7 ⇒ weak breadth
+# Thresholds — recalibrated 2026-07-07. The original 0.70 demanded 7 of the
+# last 10 SPY sessions close above their OPEN — that combination is true only
+# ~17% of the time (up-day base rate ≈53%), so the gate read "unhealthy" in
+# perfectly normal tapes and stood the bot down for weeks (the June breadth
+# standstill). Standard breadth-thrust math uses up-days vs PREVIOUS CLOSE
+# with a simple-majority threshold.
+AD_HEALTHY_MIN = 0.50      # <5 of last 10 days up (close vs prev close) ⇒ weak
 PCT_50MA_HEALTHY_MIN = 45  # < 45% above 50MA proxy ⇒ broad weakness
 VIX_PANIC = 30              # VIX > 30 ⇒ fear-driven tape, treat as unhealthy
 
@@ -59,12 +64,12 @@ def assess(client, vix: float = 0.0) -> BreadthVerdict:
             # Distance from 50MA → map to 0-100 scale
             pct_abv = (price / sma50 - 1.0) * 100
             pct_50ma = max(0.0, min(100.0, 50 + pct_abv * 8))
-            # A/D proxy: SPY win streak over last 10 days
-            n = len(spy_df)
-            days_up = sum(
-                1 for i in range(-10, 0)
-                if i + n >= 0 and spy_df["close"].iloc[i] > spy_df["open"].iloc[i]
-            )
+            # A/D proxy: SPY up-days (close vs PREV close — the standard
+            # definition; close-vs-open missed overnight drift and skewed low)
+            # over the last 10 sessions.
+            closes = spy_df["close"].astype(float)
+            diffs = closes.diff().iloc[-10:]
+            days_up = int((diffs > 0).sum())
             ad_ratio = max(0.1, days_up / 10)
             source = "spy_proxy"
         else:

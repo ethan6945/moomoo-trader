@@ -276,17 +276,17 @@ GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
             "where": "src/risk_manager.py: _dd_size_multiplier",
             "value": "减半 10% / 停盘 18%",
         },
-        "3 连亏熔断": {
-            "name": "3-Day Loss Streak Halt",
-            "summary": "连续 3 个交易日亏损就强制暂停",
+        "3 连亏熔断（已移除）": {
+            "name": "3-Day Loss Streak Halt (REMOVED 2026-07-07)",
+            "summary": "已按 owner 决定移除 — 由账户级 DD 熔断与日内回撤熔断接管",
             "explain": (
-                "防止“越亏越激进”的心理偏差。\n\n"
-                "每次平仓后:\n"
-                "  实现亏损 + 今天 last_close_day 不同 → 连亏 +1\n"
-                "  实现盈利 → 连亏清 0\n\n"
-                "达到 3 自动 halted=True，需要人工或 daily 重置才恢复。"
+                "旧机制只在“当天第一笔平仓是亏损”时 +1，且任何一笔盈利就清 0，\n"
+                "并不是真正的“连续亏损天数”，信号意义弱。\n\n"
+                "2026-07-07 移除。回撤响应现在由两层干净的机制负责:\n"
+                "  • 账户级 DD: ≥10% 仓位减半 / ≥18% 停开新仓 (7 天自动解除)\n"
+                "  • 日内回撤熔断: 当日已实现亏损 ≥ DAILY_DRAWDOWN_STOP 停开新仓"
             ),
-            "where": "src/risk_manager.py: record_trade_close",
+            "where": "src/risk_manager.py (removed)",
         },
         "组合热度 (Portfolio Heat)": {
             "name": "Portfolio Heat Cap",

@@ -82,29 +82,84 @@ def resolve(item_id: str, approved: bool) -> bool:
     return found["v"]
 
 
+# An execution claim older than this is treated as a crashed executor and
+# may be re-claimed (the lease exists to close the cross-process race, not
+# to serialize retries forever).
+_CLAIM_LEASE_SEC = 600
+
+
+def _claim_for_execution(item_id: str) -> bool:
+    """Atomically claim an approved item before executing it.
+
+    apply_approved() runs from THREE entry points — the scan loop, the 5-min
+    Telegram sync (scheduler process), and the web server right after an
+    approve tap — in different processes. Without a claim, two of them can
+    read status=approved/executed=False simultaneously and both execute; for
+    `manual_takeover_sell` that is a DOUBLE SELL. The claim rides on
+    db.atomic_state (BEGIN IMMEDIATE → serialized across processes), so
+    exactly one caller wins. A stale claim (executor crashed mid-run) is
+    reclaimable after _CLAIM_LEASE_SEC."""
+    won = {"v": False}
+
+    def _apply(state: dict) -> dict:
+        q = list(state.get(QUEUE_KEY, []))
+        for x in q:
+            if x.get("id") != item_id:
+                continue
+            if x.get("status") != "approved" or x.get("executed"):
+                return {}
+            lease = x.get("executing_at")
+            if lease:
+                try:
+                    age = (datetime.now()
+                           - datetime.fromisoformat(lease)).total_seconds()
+                except (ValueError, TypeError):
+                    age = _CLAIM_LEASE_SEC + 1
+                if age < _CLAIM_LEASE_SEC:
+                    return {}   # someone else is executing it right now
+            x["executing_at"] = _now()
+            won["v"] = True
+            return {QUEUE_KEY: q}
+        return {}
+
+    db.atomic_state(_apply)
+    return won["v"]
+
+
+def _finish_execution(item_id: str, success: bool) -> None:
+    """Mark the claimed item executed (success) or release the claim so the
+    next cycle retries (failure)."""
+    def _apply(state: dict) -> dict:
+        q = list(state.get(QUEUE_KEY, []))
+        for x in q:
+            if x.get("id") == item_id:
+                x.pop("executing_at", None)
+                if success:
+                    x["executed"] = True
+                    x["executed_at"] = _now()
+        return {QUEUE_KEY: q}
+
+    db.atomic_state(_apply)
+
+
 def apply_approved() -> list[dict]:
-    """Execute approved-but-unexecuted items. Called once per scan by main.py.
+    """Execute approved-but-unexecuted items. Called from the scan loop, the
+    5-min Telegram sync, and the web approve endpoint — the per-item atomic
+    claim guarantees only ONE of them executes each item (2026-07-07 fix).
     Returns the items that were applied (for a Telegram confirmation)."""
     applied: list[dict] = []
     todo = [a for a in list_all()
             if a.get("status") == "approved" and not a.get("executed")]
     for a in todo:
+        if not _claim_for_execution(a["id"]):
+            continue   # another process owns it (or it just got executed)
         try:
             _execute(a)
         except Exception as e:
             log.warning("apply approved %s failed: %s", a.get("id"), e)
+            _finish_execution(a["id"], success=False)   # release → retry next cycle
             continue
-        a_id = a["id"]
-
-        def _mark(state: dict, _id=a_id) -> dict:
-            q = list(state.get(QUEUE_KEY, []))
-            for x in q:
-                if x.get("id") == _id:
-                    x["executed"] = True
-                    x["executed_at"] = _now()
-            return {QUEUE_KEY: q}
-
-        db.atomic_state(_mark)
+        _finish_execution(a["id"], success=True)
         applied.append(a)
     return applied
 

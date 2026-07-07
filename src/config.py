@@ -393,21 +393,41 @@ class Settings:
 
 settings = Settings()
 
-# Phase 0 guard (2026-06-10): with R = sl_atr_mult × ATR, the first scale-out
-# partial sits at tp1_r × sl_atr_mult ATR above entry. If that is at/beyond the
-# full TP (tp_atr_mult × ATR), the whole position always closes first and
-# USE_SCALE_OUT=true is a silent no-op (exactly what shipped: TP1 = 3.0 × 3.5
-# = +10.5 ATR vs TP at +8 ATR). Surface it and disable cleanly so backtests
-# and live agree on what the exit actually is.
-if settings.use_scale_out and \
-        settings.tp1_r * settings.sl_atr_mult >= settings.tp_atr_mult:
-    logging.getLogger(__name__).warning(
-        "USE_SCALE_OUT=true but TP1 (%.1fR × %.1f ATR/R = +%.1f ATR) is at/"
-        "beyond the full TP (+%.1f ATR) — scale-out can never fire; treating "
-        "as DISABLED. Lower TP1_R/TP2_R or raise TP_ATR_MULT to activate it.",
-        settings.tp1_r, settings.sl_atr_mult,
-        settings.tp1_r * settings.sl_atr_mult, settings.tp_atr_mult)
-    object.__setattr__(settings, "use_scale_out", False)
+# ── Scale-out guard (extracted 2026-07-06) ──────────────────
+# With R = sl_atr_mult × ATR, the first scale-out partial sits at
+# tp1_r × sl_atr_mult ATR above entry. If that is at/beyond the full TP
+# (tp_atr_mult × ATR), the whole position always closes first and
+# USE_SCALE_OUT=true is a silent no-op. This function is callable from
+# config.py (module load, static values) AND from runtime_config.set_param()
+# (after a DB override changes sl/tp — handles the circular-import problem).
+# Returns True if scale-out was disabled by this check.
+
+def _check_scale_out(sl: float, tp: float, tp1=None) -> bool:
+    """Return True if scale-out was silently disabled due to TP1≥TP."""
+    if not settings.use_scale_out:
+        return False
+    _tp1 = tp1 if tp1 is not None else settings.tp1_r
+    if _tp1 * sl >= tp:
+        logging.getLogger(__name__).warning(
+            "USE_SCALE_OUT=true but TP1 (%.1fR × %.1f ATR/R = +%.1f ATR) is at/"
+            "beyond the full TP (+%.1f ATR) — scale-out can never fire; treating "
+            "as DISABLED. Lower TP1_R/TP2_R or raise TP_ATR_MULT to activate it.",
+            _tp1, sl, _tp1 * sl, tp)
+        object.__setattr__(settings, "use_scale_out", False)
+        return True
+    return False
+
+
+def recheck_scale_out(sl: float, tp: float) -> bool:
+    """Runtime re-check of the scale-out guard — call after any SL/TP change.
+    Uses current runtime values (not static .env), solving the circular-import
+    problem where the module-level guard in config.py can't import runtime_config.
+    Returns True if scale-out was disabled."""
+    return _check_scale_out(float(sl), float(tp))
+
+
+# Module-load check with static .env values (first line of defense)
+_check_scale_out(settings.sl_atr_mult, settings.tp_atr_mult)
 
 
 def derive_max_positions(capital: float) -> int:

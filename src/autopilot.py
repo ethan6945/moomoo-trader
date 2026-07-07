@@ -521,17 +521,16 @@ def health_check() -> list[str]:
                         f"active since {at.strftime('%Y-%m-%d')} — review if still valid"
                     )
 
-        # Check overdue cron jobs
+        # Check overdue cron jobs — read cron_state.json (the actual store;
+        # 2026-07-07 fix: the old code read db kv_state key "cron_self_review",
+        # which never existed, so this check could never fire).
         try:
-            last_sr = state.get("cron_self_review")
-            if last_sr:
-                from datetime import datetime as dt2
-                try:
-                    lr = dt2.fromisoformat(str(last_sr))
-                    if (now - lr).days > 8:
-                        issues.append(f"📋 self-review overdue (>8d)")
-                except Exception:
-                    pass
+            from . import cron_state
+            lr = cron_state.last_run("self_review")
+            if lr is not None:
+                lr_utc = lr if lr.tzinfo else lr.replace(tzinfo=timezone.utc)
+                if (now - lr_utc).days > 8:
+                    issues.append("📋 self-review overdue (>8d)")
         except Exception:
             pass
 

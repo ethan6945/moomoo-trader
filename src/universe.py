@@ -68,12 +68,15 @@ def select_universe(daily_by_sym: dict[str, pd.DataFrame | None],
     """Top-N pool names by 6-1 momentum using ONLY daily bars dated strictly
     before `asof`. Deterministic (momentum desc, then symbol asc for ties) so
     live and backtest reproduce each other exactly."""
-    cutoff = pd.Timestamp(asof)
+    cutoff = pd.Timestamp(asof, tz="US/Eastern")
     scores: dict[str, float] = {}
     for sym, df in daily_by_sym.items():
         if df is None or df.empty or "close" not in df:
             continue
-        d = df.loc[df.index < cutoff]
+        try:
+            d = df.loc[df.index < cutoff]
+        except TypeError:
+            d = df.loc[df.index < pd.Timestamp(asof)]
         if len(d) < MIN_BARS:
             continue
         closes = d["close"].astype(float)

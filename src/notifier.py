@@ -31,8 +31,20 @@ def send(text: str) -> None:
     for attempt in range(3):
         try:
             r = requests.post(url, data=payload, timeout=15)
-            if not r.ok:
-                log.warning("telegram send HTTP %s: %s", r.status_code, r.text[:120])
+            if r.ok:
+                return
+            # 2026-07-06: Markdown parse errors (HTTP 400 "can't parse entities")
+            # happen when message text contains unclosed formatting chars (* or _).
+            # Fall back to plain-text delivery so the notification still arrives.
+            # Retry IMMEDIATELY instead of `continue` — a continue on the last
+            # loop iteration would silently drop the message.
+            if r.status_code == 400 and "parse" in r.text.lower() and payload.get("parse_mode"):
+                log.warning("telegram markdown parse error — retrying as plain text")
+                payload.pop("parse_mode", None)
+                r = requests.post(url, data=payload, timeout=15)
+                if r.ok:
+                    return
+            log.warning("telegram send HTTP %s: %s", r.status_code, r.text[:120])
             return
         except Exception as e:
             if attempt < 2:

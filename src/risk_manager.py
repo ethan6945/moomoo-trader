@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import db
+from . import clock, db
 from .config import derive_max_positions, settings
 from .indicators import Signal
 
@@ -24,8 +24,6 @@ _DEFAULT_STATE = {
     "day": str(date.today()),
     "starting_cash": 0.0,
     "realized_pnl_today": 0.0,
-    "loss_streak_days": 0,
-    "last_close_day": None,
     "halted": False,
     # Account-level peak equity for the drawdown circuit breaker. Tracked
     # via record_trade_close on every realised PnL — independent of
@@ -53,31 +51,39 @@ def _save_state(state: dict) -> None:
 
 
 def reset_for_new_day(current_cash: float) -> dict:
-    state = _load_state()
-    today = str(date.today())
-    if state["day"] != today:
-        state["day"] = today
-        state["starting_cash"] = current_cash
-        state["realized_pnl_today"] = 0.0
-        state["halted"] = False
-        _save_state(state)
-    return state
+    """Idempotent daily rollover, keyed on the NY trading date.
+
+    2026-07-07 P0 fix: this used `date.today()` (SYSTEM LOCAL date) while
+    kill_switch.reset_for_new_day used the NY date — both write the same
+    kv_state 'day' key. On a GMT+8 host the local date flips to "tomorrow"
+    mid-session (~12:00 ET), so the two resets ping-ponged every scan for the
+    rest of the session: realized_pnl_today wiped to 0 (killing the daily-DD
+    fuse) and `halted` cleared (un-halting a halted bot). Both now key on the
+    NY date, and the rollover is an atomic read-modify-write instead of a
+    whole-state save that could clobber concurrent updates."""
+    today = clock.ny_now().strftime("%Y-%m-%d")
+
+    def _apply(s: dict) -> dict:
+        if s.get("day") != today:
+            return {
+                "day": today,
+                "starting_cash": current_cash,
+                "realized_pnl_today": 0.0,
+                "halted": False,
+            }
+        return {}
+
+    merged = db.atomic_state(_apply)
+    s = dict(_DEFAULT_STATE)
+    s.update(merged)
+    return s
 
 
-def _drawdown_risk_multiplier() -> float:
-    """Reduce risk after consecutive loss days.
-
-    2 losing days  → 75% risk
-    3+ losing days → 50% risk
-    Resets to 100% on next winning day (handled in record_trade_close).
-    """
-    state = _load_state()
-    losses = state.get("loss_streak_days", 0)
-    if losses >= 3:
-        return 0.5
-    if losses == 2:
-        return 0.75
-    return 1.0
+# Loss-streak day counter REMOVED 2026-07-07 (owner decision): the old
+# semantics only counted a day when its FIRST close was a loss and reset on
+# any single win — not a meaningful "consecutive losing days" signal. The
+# account-level DD breaker (_dd_size_multiplier + DD halt) and the adaptive
+# Sortino sizing already cover drawdown response with cleaner definitions.
 
 
 # Auto-release a sticky DD halt after this many calendar days. Without this
@@ -237,7 +243,9 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     """Risk-based sizing with independent scaling layers.
 
     Layer 1 — Base risk:      account_usd × risk_per_trade  (e.g. 2% of $4500 = $90)
-    Layer 2 — Drawdown mult:  100% / 75% / 50% by recent loss streak
+    Layer 2 — DD size cut:    50% when account drawdown ≥ DD_SIZE_CUT_PCT
+                              (loss-streak layer removed 2026-07-07 — owner
+                              decision; the DD breaker covers it cleanly)
     Layer 3 — VIX mult:       100% / 50% / 25% by vol regime
     Layer 4 — ML conviction:  caller-supplied 0.0-1.0 multiplier
                               (0.5 for neutral-zone ML, 1.0 for high-conviction)
@@ -254,8 +262,7 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     # Defensive: Layer 5 is an UP-scaler only — never let a stray <1 value secretly
     # shrink risk (that's what the DD/VIX/conviction layers are for).
     regime_mult = max(1.0, float(regime_mult))
-    dd_mult = _drawdown_risk_multiplier()
-    # Account-level DD breaker (new): independent of loss-streak.
+    # Account-level DD breaker: halve size at deep drawdown.
     dd_size_mult = _dd_size_multiplier()
     # Adaptive sizing — follows the rolling-30-trade Sortino. Lazy import
     # avoids a hard dependency at module load time (and a circular if
@@ -271,14 +278,14 @@ def calc_position_size(signal: Signal, vix: float = 15.0,
     from . import runtime_config
 
     # PnL-optimised (2026-06-27 MS audit): composite floor on account-state
-    # multipliers. dd_mult × dd_size_mult × adaptive_mult can compound to
-    # 0.5³ = 0.125× in deep DD — shrinking positions so small the bot can
-    # never recover its drawdown. Floor it at 0.25× so even in worst
-    # conditions, risk stays ≥ 1.25% of account (0.25 × 5% base). Signal-
-    # quality (conviction) and regime tailwind (regime_mult) compose ON TOP
-    # and are not floored — a marginal signal in a deep DD SHOULD still be
-    # half-sized, and a bull tailwind SHOULD still add its boost.
-    state_mult = dd_mult * dd_size_mult * adaptive_mult
+    # multipliers. dd_size_mult × adaptive_mult can compound to 0.25× in deep
+    # DD — shrinking positions so small the bot can never recover its
+    # drawdown. Floor it at 0.25× so even in worst conditions, risk stays
+    # ≥ 1.25% of account (0.25 × 5% base). Signal-quality (conviction) and
+    # regime tailwind (regime_mult) compose ON TOP and are not floored — a
+    # marginal signal in a deep DD SHOULD still be half-sized, and a bull
+    # tailwind SHOULD still add its boost.
+    state_mult = dd_size_mult * adaptive_mult
     if state_mult < 0.25:
         state_mult = 0.25
     risk_dollars = (cap * runtime_config.risk_per_trade()
@@ -368,7 +375,7 @@ def _can_stack_onto(signal: Signal, held: pd.DataFrame) -> tuple[bool, str]:
 # H1 bar confirms the reversal, while still blocking instant re-bleeds (the
 # audit's 3-day window was for trend-era hold periods, not current volatility).
 # ⚠ MONITOR: if rebleed count rises above ~5 trades/month, revert to ≥12h.
-SL_COOLDOWN_HOURS = 12
+SL_COOLDOWN_HOURS = 6   # 2026-07-04 timing audit: 12h too slow for fast H1 trading; allows same-session re-entry
 
 
 def in_sl_cooldown(symbol: str, hours: int = SL_COOLDOWN_HOURS
@@ -418,12 +425,13 @@ def can_open_new(
     pending_symbols: set[str] | None = None,
     vix: float = 15.0,
     conviction: float = 1.0,
+    regime_mult: float = 1.0,
 ) -> tuple[bool, str]:
     state = reset_for_new_day(current_cash)
     pending_symbols = pending_symbols or set()
 
     if state.get("halted"):
-        return False, "trading halted (daily/streak)"
+        return False, "trading halted (daily drawdown)"
 
     # SL cooldown — block re-entry on a name that just stopped out. Only
     # applies to brand-new entries; stacking adds onto an EXISTING profitable
@@ -471,7 +479,12 @@ def can_open_new(
     if signal.symbol in pending_symbols:
         return False, f"buy order for {signal.symbol} already pending"
 
-    qty = calc_position_size(signal, vix=vix, conviction=conviction)
+    # 2026-07-07: regime_mult is passed through so the cash/budget checks below
+    # price the SAME qty the caller will actually order (previously a >1 bull
+    # boost was applied only at order time, so these checks under-estimated
+    # the capital the entry would commit).
+    qty = calc_position_size(signal, vix=vix, conviction=conviction,
+                             regime_mult=regime_mult)
     if qty == 0:
         return False, "computed qty=0 (stop too tight, price too high, or conviction=0)"
 
@@ -502,8 +515,9 @@ def can_open_new(
     if base > 0 and realized_today < 0:
         daily_loss_frac = -realized_today / base
         if daily_loss_frac >= settings.daily_drawdown_stop:
-            state["halted"] = True
-            _save_state(state)
+            # Atomic single-key write — a whole-state save here could clobber
+            # concurrent updates (e.g. a close booking PnL on another thread).
+            db.atomic_state(lambda _s: {"halted": True})
             return False, (f"daily drawdown {daily_loss_frac:.1%} of ${base:.0f} "
                            f"≥ {settings.daily_drawdown_stop:.0%}")
 
@@ -511,15 +525,17 @@ def can_open_new(
 
 
 def record_trade_close(realized_pnl: float, account_usd: float | None = None) -> None:
-    """Race-safe R-M-W of PnL totals + loss streak via SQLite atomic_state.
+    """Race-safe R-M-W of PnL totals via SQLite atomic_state.
 
     Also bumps `peak_equity` for the DD circuit breaker. We measure equity as
     starting_capital + realized_pnl_total — a slight underestimate vs. mark-
     to-market open positions, but stable across position open/close cycles
     and good enough for the DD breaker's 10/15% thresholds.
+
+    (Loss-streak counter removed 2026-07-07 — owner decision; the DD breaker
+    and the daily-DD fuse are the drawdown responses.)
     """
     def _apply(current: dict) -> dict:
-        day = current.get("day", str(date.today()))
         new_today = current.get("realized_pnl_today", 0.0) + realized_pnl
         new_total = current.get("realized_pnl_total", 0.0) + realized_pnl
         # account_usd is the equity baseline. Fall back to equity_baseline()
@@ -530,19 +546,11 @@ def record_trade_close(realized_pnl: float, account_usd: float | None = None) ->
         peak = max(current.get("peak_equity", 0.0) or 0.0,
                    base,        # never report a peak below starting capital
                    current_equity)
-        updates: dict = {
+        return {
             "realized_pnl_today": new_today,
             "realized_pnl_total": new_total,
-            "last_close_day": day,
             "peak_equity": peak,
         }
-        if realized_pnl < 0 and current.get("last_close_day") != day:
-            updates["loss_streak_days"] = current.get("loss_streak_days", 0) + 1
-            if updates["loss_streak_days"] >= 3:
-                updates["halted"] = True
-        elif realized_pnl > 0:
-            updates["loss_streak_days"] = 0
-        return updates
 
     merged = db.atomic_state(_apply)
     # legacy mirror

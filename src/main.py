@@ -77,6 +77,12 @@ log = logging.getLogger("main")
 
 WATCHLIST_FILE = settings.root / "config" / "watchlist.json"
 NY = pytz.timezone("America/New_York")
+# Owner's home timezone — the Monday maintenance chain (autopilot/universe/
+# backtest/self-review/ML) is pinned to 20:00 KL sharp (owner request
+# 2026-07-07). KL has no DST, so these fire at the same wall-clock time
+# year-round regardless of US DST shifts (≈08:00 ET summer / 07:00 ET winter,
+# both pre-market).
+KL = pytz.timezone("Asia/Kuala_Lumpur")
 
 
 def load_watchlist() -> list[str]:
@@ -171,8 +177,8 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "ai_provider": ai.active_provider(),
             "ai_model": ai.active_model(),
             "scan_interval_min": settings.scan_interval_min,
-            "entry_threshold": settings.entry_threshold,
-            "max_hold_days": settings.max_hold_days,
+            "entry_threshold": runtime_config.entry_threshold(),   # 2026-07-06: use runtime override, not static .env
+            "max_hold_days": runtime_config.max_hold_days(),      # 2026-07-06: use runtime override, not static .env
             "timeframe": settings.timeframe,
             "trade_env": settings.moomoo_trade_env,
             "vix": round(vix or 0, 1),
@@ -438,8 +444,8 @@ def scan_once() -> None:
                 "ai_provider": ai.active_provider(),
                 "ai_model": ai.active_model(),
                 "scan_interval_min": settings.scan_interval_min,
-                "entry_threshold": settings.entry_threshold,
-                "max_hold_days": settings.max_hold_days,
+                "entry_threshold": runtime_config.entry_threshold(),   # 2026-07-06: use runtime override, not static .env
+                "max_hold_days": runtime_config.max_hold_days(),      # 2026-07-06: use runtime override, not static .env
                 "timeframe": settings.timeframe,
                 "trade_env": settings.moomoo_trade_env,
                 "vix": round(vix, 1),
@@ -802,23 +808,26 @@ def scan_once() -> None:
                 if settings.sentiment_sizing and sent_score is not None:
                     conviction *= max(0.5, min(1.25, sent_score / 50.0))
 
+            # Regime up-scaling (owner-approved tailwind press) — mirror the honest
+            # engine exactly: boost size ONLY in a confirmed strong bull AND calm
+            # VIX. settings.regime_bull_mult defaults to 1.0 (inert) until the
+            # owner sets REGIME_BULL_MULT in .env. Computed BEFORE the risk gate
+            # (2026-07-07) so can_open_new's cash/budget checks price the SAME
+            # qty we actually order below.
+            regime_mult = (settings.regime_bull_mult
+                           if (regime is not None and regime.bullish
+                               and vix < settings.regime_vix_calm)
+                           else 1.0)
+
             # --- Risk / heat / sizing (all factor in conviction) ---
             ok, reason = risk_manager.can_open_new(
                 sig, positions, cash, pending_value, pending_symbols,
-                vix=vix, conviction=conviction,
+                vix=vix, conviction=conviction, regime_mult=regime_mult,
             )
             if not ok:
                 _skip("risk", reason)
                 continue
 
-            # Regime up-scaling (owner-approved tailwind press) — mirror the honest
-            # engine exactly: boost size ONLY in a confirmed strong bull AND calm
-            # VIX. settings.regime_bull_mult defaults to 1.0 (inert) until the
-            # owner sets REGIME_BULL_MULT in .env.
-            regime_mult = (settings.regime_bull_mult
-                           if (regime is not None and regime.bullish
-                               and vix < settings.regime_vix_calm)
-                           else 1.0)
             qty = risk_manager.calc_position_size(
                 sig, vix=vix, conviction=conviction, regime_mult=regime_mult)
 
@@ -1148,7 +1157,7 @@ def _daily_auto_budget_job() -> None:
 
 
 def _weekly_autopilot_job() -> None:
-    """Monday 09:00 ET (KL 21:00) — DeepSeek autonomous portfolio manager."""
+    """Monday 20:00 KL (timezone-pinned) — DeepSeek autonomous portfolio manager."""
     log.info("weekly autopilot: starting")
     try:
         from . import autopilot
@@ -1161,7 +1170,7 @@ def _weekly_autopilot_job() -> None:
 
 
 def _weekly_ml_retrain_job() -> None:
-    """Monday 09:20 ET (KL 21:20) — re-train XGBoost on all closed trades.
+    """Monday 20:20 KL (timezone-pinned) — re-train XGBoost on all closed trades.
     Runs AFTER autopilot+backtest so the model trains on the freshest data.
     No-op if xgboost is not installed or <20 labeled trades exist.
     """
@@ -1273,20 +1282,25 @@ def _run_catchup_on_startup() -> None:
         # both were silent-execution violations; now manual GUI actions only.
         # universe_refresh (Phase 1) is different: it's a RULE the owner enabled
         # explicitly via DYNAMIC_UNIVERSE_ENABLED, and every change telegrams.
+        # ⚠ These expected-fire times MUST match the run_loop cron schedule
+        # below (Mon 20:00-20:20 KL, timezone-pinned). If they drift apart,
+        # every restart after the real run sees last_run < expected and
+        # re-fires the whole Monday chain — double autopilot param applies,
+        # duplicate Telegram storms. (P1 fix 2026-07-07.)
         ("universe_refresh",
-         cron_state.expected_last_fire_weekly(0, 9, 5),    # Monday 09:05 ET
+         cron_state.expected_last_fire_weekly(0, 20, 5, tz=KL),    # Mon 20:05 KL
          _universe_refresh_job, "Weekly universe refresh"),
         ("weekly_backtest",
-         cron_state.expected_last_fire_weekly(0, 9, 10),   # Monday 09:10 ET
+         cron_state.expected_last_fire_weekly(0, 20, 10, tz=KL),   # Mon 20:10 KL
          _weekly_backtest_validation_job, "Weekly backtest"),
         ("weekly_autopilot",
-         cron_state.expected_last_fire_weekly(0, 9, 0),    # Monday 09:00 ET
+         cron_state.expected_last_fire_weekly(0, 20, 0, tz=KL),    # Mon 20:00 KL
          _weekly_autopilot_job, "Weekly autopilot (DeepSeek)"),
         ("self_review",
-         cron_state.expected_last_fire_weekly(0, 9, 15),   # Monday 09:15 ET
+         cron_state.expected_last_fire_weekly(0, 20, 15, tz=KL),   # Mon 20:15 KL
          _weekly_self_review_job, "Weekly self-review"),
         ("ml_retrain",
-         cron_state.expected_last_fire_weekly(0, 9, 20),   # Monday 09:20 ET
+         cron_state.expected_last_fire_weekly(0, 20, 20, tz=KL),   # Mon 20:20 KL
          _weekly_ml_retrain_job, "Weekly ML retrain"),
         ("monthly_optuna",
          cron_state.expected_last_fire_monthly(1, 3, 0),
@@ -1412,9 +1426,15 @@ def run_loop() -> None:
     # free-running from process start. A free-running 30-min interval could
     # fire at e.g. :17/:47 — half a bar stale on every signal. :31 sees the
     # freshly closed hourly bar; :01 is the mid-bar management/missed-fill pass.
-    if settings.scan_interval_min == 30:
+    _ALIGNED_MINUTES = {30: "1,31", 15: "1,16,31,46", 10: "1,11,21,31,41,51",
+                        60: "1", 20: "1,21,41", 5: "1,6,11,16,21,26,31,36,41,46,51,56"}
+    if settings.scan_interval_min in _ALIGNED_MINUTES:
+        # Align to bar closes (+1 min) — a free-running interval drifts to
+        # arbitrary offsets (:07/:22/…) and scores every signal up to a full
+        # sub-bar stale. 2026-07-07: extended beyond the original 30-min case
+        # after SCAN_INTERVAL_MIN moved to 15 and silently lost alignment.
         sched.add_job(
-            job, "cron", minute="1,31",
+            job, "cron", minute=_ALIGNED_MINUTES[settings.scan_interval_min],
             next_run_time=clock.ny_now(),
             coalesce=True,
             misfire_grace_time=60,
@@ -1499,43 +1519,45 @@ def run_loop() -> None:
                   day_of_week="mon-fri", hour=9, minute=31,
                   coalesce=True, misfire_grace_time=600, max_instances=1)
 
-    # Weekly jobs — all run Monday morning ET (= Monday 9PM KL GMT+8).
+    # Weekly jobs — Monday 20:00 KL SHARP (owner request 2026-07-07), pinned to
+    # Asia/Kuala_Lumpur so US DST never shifts the wall-clock time (KL has no
+    # DST). ≈ Monday 08:00 ET in summer / 07:00 ET in winter — both pre-market.
     # Staggered by 5 min so each finishes before the next starts.
     # Order: autopilot (no deps) → universe → backtest (needs universe) → self-review
 
-    # P2-1: Weekly autopilot — Monday 09:00 ET (KL 21:00). DeepSeek reviews
-    # the week, proposes parameter changes, backtest-validates each, auto-applies
-    # within guardrails. Runs FIRST so any auto-applied changes feed into the
+    # P2-1: Weekly autopilot — Monday 20:00 KL. DeepSeek reviews the week,
+    # proposes parameter changes, backtest-validates each, auto-applies within
+    # guardrails. Runs FIRST so any auto-applied changes feed into the
     # universe/backtest/self-review that follow.
     sched.add_job(_weekly_autopilot_job, "cron",
-                  day_of_week="mon", hour=9, minute=0,
+                  day_of_week="mon", hour=20, minute=0, timezone=KL,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)
 
-    # Weekly universe refresh: Monday 09:05 ET (KL 21:05) — rule-based watchlist
-    # rebuild, BEFORE the 09:10 backtest so the health check scores next week's
-    # actual list. No-op unless DYNAMIC_UNIVERSE_ENABLED.
+    # Weekly universe refresh: Monday 20:05 KL — rule-based watchlist rebuild,
+    # BEFORE the 20:10 backtest so the health check scores next week's actual
+    # list. No-op unless DYNAMIC_UNIVERSE_ENABLED.
     sched.add_job(_universe_refresh_job, "cron",
-                  day_of_week="mon", hour=9, minute=5,
+                  day_of_week="mon", hour=20, minute=5, timezone=KL,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
-    # Weekly backtest validation: Monday 09:10 ET (KL 21:10) — health-check the
-    # strategy on a rolling 90-day window, now on the fresh ticker set.
+    # Weekly backtest validation: Monday 20:10 KL — health-check the strategy
+    # on a rolling 90-day window, now on the fresh ticker set.
     sched.add_job(_weekly_backtest_validation_job, "cron",
-                  day_of_week="mon", hour=9, minute=10,
+                  day_of_week="mon", hour=20, minute=10, timezone=KL,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
-    # Weekly SELF-REVIEW of REAL fills: Monday 09:15 ET (KL 21:15). Reviews what
-    # the bot actually did (not a backtest), emits suggestions for owner approval.
+    # Weekly SELF-REVIEW of REAL fills: Monday 20:15 KL. Reviews what the bot
+    # actually did (not a backtest), emits suggestions for owner approval.
     sched.add_job(_weekly_self_review_job, "cron",
-                  day_of_week="mon", hour=9, minute=15,
+                  day_of_week="mon", hour=20, minute=15, timezone=KL,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
-    # Weekly ML retrain: Monday 09:20 ET (KL 21:20). Re-trains the XGBoost
-    # model on all closed trades. Runs last in the Monday chain so it trains
-    # on the freshest data (autopilot may have applied param changes that
-    # affect the next week's trades).
+    # Weekly ML retrain: Monday 20:20 KL. Re-trains the XGBoost model on all
+    # closed trades. Runs last in the Monday chain so it trains on the
+    # freshest data (autopilot may have applied param changes that affect the
+    # next week's trades).
     sched.add_job(_weekly_ml_retrain_job, "cron",
-                  day_of_week="mon", hour=9, minute=20,
+                  day_of_week="mon", hour=20, minute=20, timezone=KL,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
     # Monthly Optuna re-optimization: 1st of each month at 03:00 ET. Runs
@@ -1621,7 +1643,7 @@ def run_loop() -> None:
 
     log.info(
         "scheduler started — scan=%dm, "
-        "weekly autopilot/backtest/review=Mon 09:00 ET (KL 21:00), "
+        "weekly autopilot/backtest/review=Mon 20:00 KL (timezone-pinned), "
         "monthly Optuna=1st@03:00, daily blacklist=23:00 ET",
         settings.scan_interval_min,
     )

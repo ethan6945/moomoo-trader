@@ -17,10 +17,15 @@ SECTOR_MAP: dict[str, str] = {
     "CSCO": "tech",                  # Cisco — enterprise networking
     "DDOG": "tech",                  # Datadog — observability cloud
     "FTNT": "tech", "PANW": "tech",  # Fortinet / Palo Alto — cybersecurity
+    "CRWD": "tech",                  # CrowdStrike — cybersecurity (2026-07-06 audit)
     "GEN": "tech",                   # Gen Digital — Norton / consumer security
     "AKAM": "tech",                  # Akamai — CDN / edge
+    "NET":  "tech",                  # Cloudflare — CDN / edge (2026-07-06 audit)
     "DELL": "tech", "HPQ": "tech", "HPE": "tech",   # PC / enterprise hardware
     "PLTR": "tech", "RDDT": "tech",  # Palantir, Reddit
+    "ADBE": "tech",                  # Adobe — cloud/creative (2026-07-06 audit)
+    "SNOW": "tech",                  # Snowflake — cloud data (2026-07-06 audit)
+    "ANET": "tech",                  # Arista — networking (2026-07-06 audit)
     "XLK":  "tech",                  # tech sector ETF
 
     # ─── Semiconductors (separate bucket — high intra-sector correlation) ───
@@ -49,13 +54,17 @@ SECTOR_MAP: dict[str, str] = {
     "DXCM": "healthcare",            # DexCom — CGM medical devices
     "LLY":  "healthcare", "UNH": "healthcare", "JNJ": "healthcare",
     "ABBV": "healthcare", "MRK": "healthcare", "ABT": "healthcare",
+    "PFE":  "healthcare",            # Pfizer (2026-07-06 audit)
+    "ISRG": "healthcare",            # Intuitive Surgical — medical devices (2026-07-06 audit)
     "XLV":  "healthcare",
 
     # ─── Consumer (discretionary + staples — high macro correlation) ───
     "AMZN": "consumer", "NFLX": "consumer", "DIS": "consumer",
     "COST": "consumer", "WMT": "consumer", "TGT": "consumer", "LOW": "consumer",
+    "HD":   "consumer",              # Home Depot (2026-07-06 audit)
     "SBUX": "consumer", "MCD": "consumer", "NKE": "consumer",
     "PEP":  "consumer", "KO": "consumer", "PG": "consumer",
+    "SHOP": "consumer",              # Shopify — e-commerce (2026-07-06 audit)
     "XLP":  "consumer", "XLY": "consumer",
 
     # ─── Mobility / travel ───
@@ -67,11 +76,15 @@ SECTOR_MAP: dict[str, str] = {
     # ─── Finance + crypto exchanges (high correlation to rates) ───
     "JPM":  "finance", "V": "finance", "MA": "finance",
     "BAC":  "finance", "WFC": "finance", "PYPL": "finance",
+    "GS":   "finance",               # Goldman Sachs (2026-07-06 audit)
+    "MS":   "finance",               # Morgan Stanley (2026-07-06 audit)
+    "AXP":  "finance",               # American Express (2026-07-06 audit)
     "COIN": "finance",               # Coinbase — crypto exchange
     "XLF":  "finance",
 
     # ─── Industrials ───
     "BA":   "industrial", "CAT": "industrial", "GE": "industrial",
+    "HON":  "industrial",            # Honeywell (2026-07-06 audit)
     "XLI":  "industrial",
 
     # ─── Energy ───

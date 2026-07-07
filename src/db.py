@@ -506,7 +506,12 @@ def save_state(state: dict) -> None:
 def update_state(updates: dict) -> dict:
     """Atomically merge `updates` into kv_state. For dependent updates
     (next = f(current)), use `atomic_state(fn)` instead — this method's read
-    happens before the lock and is unsafe under concurrency."""
+    happens before the lock and is unsafe under concurrency.
+
+    Also mirrors to state.json so the GUI/legacy consumers stay in sync
+    after runtime_config.set_param() writes directly to DB (2026-07-06 fix:
+    state.json was drifting stale because only risk_manager._save_state()
+    updated it — and that only fires on trade-close/day-reset)."""
     with transaction() as c:
         for k, v in updates.items():
             c.execute(
@@ -520,6 +525,8 @@ def update_state(updates: dict) -> dict:
             out[r["key"]] = json.loads(r["value"])
         except json.JSONDecodeError:
             out[r["key"]] = r["value"]
+    # ── Mirror to legacy state.json (2026-07-06) ──
+    _mirror_state_json(out)
     return out
 
 
@@ -549,7 +556,33 @@ def atomic_state(fn) -> dict:
             out[r["key"]] = json.loads(r["value"])
         except json.JSONDecodeError:
             out[r["key"]] = r["value"]
+    # ── Mirror to legacy state.json (2026-07-06) ──
+    _mirror_state_json(out)
     return out
+
+
+# ── state.json mirror (2026-07-06) ──────────────────────
+
+_STATE_JSON = settings.root / "data" / "state.json"
+
+
+def _mirror_state_json(state: dict) -> None:
+    """Write current kv_state to the legacy state.json file so GUI and
+    external scripts always see the latest state — even after
+    runtime_config.set_param() writes directly to DB without going
+    through risk_manager._save_state().
+
+    Atomic (tmp + os.replace): the scheduler and the web server both come
+    through here from separate processes — a plain write_text truncates
+    first, so a concurrent reader could catch a half-written file."""
+    try:
+        import os as _os
+        _STATE_JSON.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _STATE_JSON.with_suffix(f".tmp.{_os.getpid()}")
+        tmp.write_text(json.dumps(state, indent=2, default=str))
+        _os.replace(tmp, _STATE_JSON)
+    except Exception as e:
+        log.warning("state.json mirror failed: %s", e)
 
 
 # ---------- audit ----------
@@ -628,9 +661,21 @@ def closed_trade_insert(row: dict) -> None:
 
 
 def closed_trades(limit: int = 200) -> list[dict]:
+    """MOST RECENT `limit` closed trades, in chronological (oldest→newest) order.
+
+    P1 fix 2026-07-07: was `ORDER BY id ASC LIMIT ?` — the OLDEST N rows.
+    Every caller (trade_stats(50), autopilot rollback window, AI param check,
+    web /api/closed) treats this as "recent trades", so once the table grew
+    past `limit` the stats/autopilot would have been frozen on the earliest
+    trades forever. Inner DESC picks the newest N; outer ASC restores the
+    chronological order callers iterate in."""
     with conn() as c:
         rows = c.execute(
-            "SELECT * FROM closed_trades ORDER BY id ASC LIMIT ?",
+            """
+            SELECT * FROM (
+                SELECT * FROM closed_trades ORDER BY id DESC LIMIT ?
+            ) ORDER BY id ASC
+            """,
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]

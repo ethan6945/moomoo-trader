@@ -96,7 +96,7 @@ def evaluate(regime_block_new: bool, regime_label: str, regime_note: str,
     if state.get("halted"):
         return KillSwitchVerdict(
             can_trade=False,
-            reason="halted (loss-streak or drawdown — click 'Halted' label to reset)",
+            reason="halted (daily drawdown — click 'Halted' label to reset)",
             gate="halt",
         )
 

@@ -123,12 +123,20 @@ def expected_last_fire_daily(hour: int, minute: int,
     return candidate
 
 
-def expected_last_fire_weekly(weekday: int, hour: int, minute: int) -> datetime:
+def expected_last_fire_weekly(weekday: int, hour: int, minute: int,
+                              tz=None) -> datetime:
     """Most recent past fire for a weekly cron on (weekday) at HH:MM.
 
     `weekday`: 0=Mon ... 6=Sun.
+    `tz`: optional tzinfo the (weekday, HH:MM) is expressed in — e.g. the
+    Monday-evening KL jobs pass Asia/Kuala_Lumpur so the expected fire matches
+    the cron's own timezone-pinned schedule. Default None = NY (legacy).
+    The returned datetime is tz-aware either way; needs_catchup compares
+    aware-vs-aware correctly across zones.
     """
     now = clock.ny_now()
+    if tz is not None:
+        now = now.astimezone(tz)
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     days_back = (now.weekday() - weekday) % 7
     # If today IS the cron day but the candidate time is still in the future,

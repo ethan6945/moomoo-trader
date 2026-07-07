@@ -331,6 +331,15 @@ def _close_and_log(symbol: str, trade: dict, qty: int, exit_price: float, reason
         strategy=trade.get("strategy", "trend"),
         initial_risk=trade.get("init_risk_per_share"),
     )
+    # Defensive: if init_risk_per_share is missing (legacy trade or data loss),
+    # the R-multiple will be 0 because breakeven may have raised stop to entry.
+    # Log it so we can detect and fix — this should never fire for new trades.
+    if not trade.get("init_risk_per_share"):
+        log.warning(
+            "R-MULTIPLE MAY BE WRONG: %s close missing init_risk_per_share — "
+            "stop=%.2f entry=%.2f → R will fallback to entry-stop calculation. "
+            "If breakeven raised stop to entry, R will show 0.0.",
+            symbol, float(trade.get("stop_loss", 0)), float(trade.get("entry_price", 0)))
     return pnl
 
 
@@ -487,14 +496,18 @@ def _is_stalled(trade: dict, last_price: float, atr_ref: float) -> bool:
 
 def _force_close(client: MoomooClient, symbol: str, trade: dict,
                  last: float, reason: str) -> tuple[float, dict]:
-    """Cancel any bracket legs and market-sell the position. Returns (pnl, action)."""
+    """Cancel any bracket legs and market-sell the position. Returns (pnl, action).
+
+    2026-07-07: a bracket leg that FAILS to cancel may still be live — or may
+    already have filled — so selling on top of it risks a double sell. Same
+    defer-to-next-cycle policy the max-hold path adopted (2026-07-02 P2):
+    raise, let the per-symbol wrapper log it, retry next cycle."""
     for key in ("stop_order_id", "tp_order_id"):
         oid = trade.get(key)
-        if oid:
-            try:
-                client.cancel_order(oid)
-            except Exception as e:
-                log.warning("cancel %s %s failed: %s", symbol, key, e)
+        if oid and not client.cancel_order(oid):
+            raise RuntimeError(
+                f"{symbol}: cancel of bracket leg {key}={oid} failed — deferring "
+                f"{reason} close to next cycle (leg may be live or already filled)")
     # The SELL must actually be placed before the close is booked (2026-07-02
     # audit P1-1). The old version swallowed a failed order and booked the close
     # anyway — the broker still held the shares, the books said "realized", and
