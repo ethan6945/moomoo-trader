@@ -192,15 +192,16 @@ def run_backtest(ticker_count: int = 15) -> dict:
     code = (
         "import sys, json; sys.path.insert(0, '" + str(ROOT) + "'); "
         "from src.config import settings; "
+        "from src import runtime_config as rc; "   # runtime-EFFECTIVE values (db overrides win)
         "from src.backtest import BacktestConfig, run_backtest; "
         "cfg = BacktestConfig("
-        "days=180, threshold=settings.entry_threshold, "
+        "days=180, threshold=rc.entry_threshold(), "
         "account_usd=settings.account_usd, "
-        "risk_per_trade=settings.risk_per_trade, "
-        "sl_atr_mult=settings.sl_atr_mult, "
-        "tp_atr_mult=settings.tp_atr_mult, "
-        "max_hold_days=settings.max_hold_days, "
-        "max_position_pct=settings.max_position_pct, "
+        "risk_per_trade=rc.risk_per_trade(), "
+        "sl_atr_mult=rc.sl_atr_mult(), "
+        "tp_atr_mult=rc.tp_atr_mult(), "
+        "max_hold_days=rc.max_hold_days(), "
+        "max_position_pct=rc.max_position_pct(), "
         "apply_momentum_strategy=True, "
         "apply_mr_strategy=" + str(_bt_settings.mr_enabled) + ", "
         "use_breakeven_stop=" + str(_bt_settings.use_breakeven_stop) + ", "
@@ -237,6 +238,29 @@ def compare_backtests(before: dict, after: dict) -> dict:
 
 
 # ── APPLY ─────────────────────────────────────────────────
+# 2026-07-07 redesign: the effective config of the RUNNING bot is
+# runtime_config db-state overrides, NOT .env — an .env edit is masked by any
+# existing override and needs a scheduler restart anyway (the 2026-07-01 audit
+# found exactly this drift). So tunable params now route through
+# runtime_config.set_param(): hot-effective next scan, recorded in
+# param_history (autopilot rollback/cooldown see it), Telegram-notified (铁律).
+# Only non-tunable keys (feature flags etc.) still fall back to .env, loudly.
+
+# Hermes/env-style name → runtime_config key (ALLOWED_PARAMS whitelist).
+_RUNTIME_KEY_MAP = {
+    "ENTRY_THRESHOLD": "entry_threshold",
+    "ENTRY_SCORE_THRESHOLD": "entry_threshold",   # legacy alias in posture text
+    "TP_ATR_MULT": "tp_atr_mult",
+    "SL_ATR_MULT": "sl_atr_mult",
+    "RISK_PER_TRADE": "risk_per_trade",
+    "MAX_HOLD_DAYS": "max_hold_days",
+    "MAX_POSITION_PCT": "max_position_pct",
+    "UNIVERSE_TOP_N": "universe_top_n",
+    "BREAKEVEN_TRIGGER_R": "breakeven_trigger_r",
+}
+# runtime-style names map to themselves
+_RUNTIME_KEY_MAP.update({v: v for v in set(_RUNTIME_KEY_MAP.values())})
+
 
 def snapshot_before() -> Path:
     """Save current .env and account.json for rollback."""
@@ -254,57 +278,149 @@ def snapshot_before() -> Path:
 
 
 def apply_params(changes: dict, reason: str, pnl_estimate: str) -> dict:
-    """Apply parameter changes to .env. Returns applied changes."""
+    """Apply parameter changes. Tunable params → runtime_config (hot, validated,
+    history-recorded, Telegram-notified). Everything else → .env with a loud
+    restart-required warning. Returns what happened per key."""
+    sys.path.insert(0, str(ROOT))
+    from src import runtime_config
+
     snapshot = snapshot_before()
-    env_file = ROOT / ".env"
-    lines = env_file.read_text().splitlines()
-    new_lines = []
-    applied = {}
+    applied_runtime: dict = {}
+    applied_env: dict = {}
+    rejected: dict = {}
+    env_changes: dict = {}
 
-    for line in lines:
-        stripped = line.strip()
-        applied_this_line = False
-        for key, new_val in changes.items():
-            if stripped.startswith(f"{key}=") and not stripped.lstrip().startswith("#"):
-                # Preserve comment if present
-                comment = ""
-                if "#" in line:
-                    comment = " " + line[line.index("#"):]
-                new_lines.append(f"{key}={new_val}{comment}")
-                applied[key] = new_val
-                applied_this_line = True
-                break
-        if not applied_this_line:
-            new_lines.append(line)
+    for key, new_val in changes.items():
+        rk = _RUNTIME_KEY_MAP.get(key) or _RUNTIME_KEY_MAP.get(key.upper())
+        if rk:
+            try:
+                rec = runtime_config.set_param(rk, float(new_val), source="hermes_agent")
+                applied_runtime[rk] = {"old": rec["old"], "new": rec["new"]}
+            except (ValueError, TypeError) as e:
+                rejected[key] = f"out of ALLOWED_PARAMS bounds / not numeric: {e}"
+        else:
+            env_changes[key] = new_val
 
-    env_file.write_text("\n".join(new_lines) + "\n")
+    # Non-tunable keys (feature flags, etc.) — legacy .env edit, loudly flagged.
+    if env_changes:
+        env_file = ROOT / ".env"
+        lines = env_file.read_text().splitlines()
+        new_lines = []
+        for line in lines:
+            stripped = line.strip()
+            replaced = False
+            for key, new_val in env_changes.items():
+                if stripped.startswith(f"{key}=") and not stripped.lstrip().startswith("#"):
+                    comment = ""
+                    if "#" in line:
+                        comment = " " + line[line.index("#"):]
+                    new_lines.append(f"{key}={new_val}{comment}")
+                    applied_env[key] = new_val
+                    replaced = True
+                    break
+            if not replaced:
+                new_lines.append(line)
+        env_file.write_text("\n".join(new_lines) + "\n")
+        for key in env_changes:
+            if key not in applied_env:
+                rejected[key] = "key not found in .env (refusing to append blindly)"
 
-    # Log to changelog
+    # 铁律: parameter changes must never be silent.
+    if applied_runtime or applied_env:
+        try:
+            from src import notifier
+            lines = ["🤖 *Hermes agent 调参*"]
+            for k, v in applied_runtime.items():
+                lines.append(f"  • {k}: {v['old']} → {v['new']} (runtime, 下一次扫描生效)")
+            for k, v in applied_env.items():
+                lines.append(f"  • {k}={v} (.env — 需重启调度器生效)")
+            lines.append(f"  理由: {reason}")
+            notifier.send("\n".join(lines))
+        except Exception:
+            pass
+
     entry = {
         "ts": datetime.now().isoformat(),
         "snapshot": str(snapshot),
-        "changes": applied,
+        "applied_runtime": applied_runtime,
+        "applied_env": applied_env,
+        "rejected": rejected,
         "reason": reason,
         "pnl_estimate": pnl_estimate,
     }
     with open(CHANGELOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-    return {"applied": applied, "snapshot": str(snapshot), "changelog_entry": entry}
+    out = {"applied_runtime": applied_runtime, "applied_env": applied_env,
+           "rejected": rejected, "snapshot": str(snapshot)}
+    if applied_env:
+        out["warning"] = (".env keys need a scheduler restart AND are masked by "
+                          "any runtime db override — prefer runtime keys: "
+                          + ", ".join(sorted(set(_RUNTIME_KEY_MAP.values()))))
+    return out
 
 
 def rollback() -> dict:
-    """Revert to most recent snapshot."""
-    snaps = sorted(SNAPSHOT_DIR.glob("*"), reverse=True)
-    if not snaps:
-        return {"error": "no snapshots found"}
-    latest = snaps[0]
-    for f in latest.iterdir():
-        if f.name == ".env":
-            shutil.copy(f, ROOT / ".env")
-        elif f.name == "account.json":
-            shutil.copy(f, DATA / "account.json")
-    return {"rolled_back_to": str(latest)}
+    """Revert the LAST apply_params changelog entry.
+
+    Runtime params revert via runtime_config.revert_param (history-recorded);
+    .env keys are restored FROM the entry's snapshot — key-by-key, never a
+    whole-file copy (the old version clobbered every .env edit made since the
+    snapshot, e.g. a freshly-generated WEB_SECRET)."""
+    sys.path.insert(0, str(ROOT))
+    from src import runtime_config
+
+    entries = []
+    if CHANGELOG.exists():
+        for line in CHANGELOG.read_text().splitlines():
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if not entries:
+        return {"error": "no changelog entries to roll back"}
+    last = entries[-1]
+
+    reverted_runtime = {}
+    for rk in (last.get("applied_runtime") or {}):
+        rec = runtime_config.revert_param(rk, reason="hermes rollback")
+        if rec:
+            reverted_runtime[rk] = {"restored": rec.get("old")}
+
+    restored_env = {}
+    env_keys = list((last.get("applied_env") or {}).keys())
+    snap_env = Path(last.get("snapshot", "")) / ".env"
+    if env_keys and snap_env.exists():
+        old_vals = {}
+        for line in snap_env.read_text().splitlines():
+            s = line.strip()
+            for k in env_keys:
+                if s.startswith(f"{k}="):
+                    old_vals[k] = s.split("=", 1)[1]
+        if old_vals:
+            env_file = ROOT / ".env"
+            lines = env_file.read_text().splitlines()
+            out_lines = []
+            for line in lines:
+                s = line.strip()
+                hit = next((k for k in old_vals if s.startswith(f"{k}=")), None)
+                if hit:
+                    out_lines.append(f"{hit}={old_vals[hit]}")
+                    restored_env[hit] = old_vals[hit]
+                else:
+                    out_lines.append(line)
+            env_file.write_text("\n".join(out_lines) + "\n")
+
+    try:
+        from src import notifier
+        if reverted_runtime or restored_env:
+            notifier.send("↩️ Hermes agent 回滚: "
+                          + ", ".join(list(reverted_runtime) + list(restored_env)))
+    except Exception:
+        pass
+
+    return {"reverted_runtime": reverted_runtime, "restored_env": restored_env,
+            "entry_ts": last.get("ts")}
 
 
 # ── MAIN ──────────────────────────────────────────────────

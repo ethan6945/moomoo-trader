@@ -117,65 +117,83 @@ class SimFeed:
             cache_d = self.CACHE_DIR / f"{sym}_DAY.parquet"
             tag = f"[{i+1}/{len(all_syms)}] {sym}"
 
-            # Cache freshness (2026-07-07): a parquet written once was reused
-            # FOREVER — the weekly optimizer would replay ever-staler data and
-            # windows past the cache date would silently contain no bars.
-            # Reuse the cache only when its newest bar is within ~3 days of the
-            # requested end; otherwise refetch and overwrite.
-            def _fresh(df: pd.DataFrame) -> bool:
-                try:
-                    last = df.index.max()
-                    if getattr(last, "tzinfo", None) is not None:
-                        last = last.tz_localize(None)
-                    end_naive = (fetch_end.replace(tzinfo=None)
-                                 if fetch_end.tzinfo else fetch_end)
-                    return last >= end_naive - timedelta(days=3)
-                except Exception:
-                    return False
+            # Incremental cache (2026-07-07, owner request): the parquet cache
+            # is PERMANENT — each run only TOPS UP the bars added since the
+            # cache's newest bar and merges them in, so daily reruns fetch ~1
+            # day of data per symbol instead of the whole window.
+            #   fresh (≤3 trading-ish days behind) → use as-is
+            #   ≤15 days behind → fetch just the gap, merge, rewrite cache
+            #   older / missing / corrupt → full refetch (fallback)
+            def _staleness_days(df: pd.DataFrame) -> int:
+                last = df.index.max()
+                if getattr(last, "tzinfo", None) is not None:
+                    last = last.tz_localize(None)
+                end_naive = (fetch_end.replace(tzinfo=None)
+                             if fetch_end.tzinfo else fetch_end)
+                return (end_naive - last).days
 
-            df = None
-            if cache_h.exists():
-                cached = pd.read_parquet(cache_h)
-                if _fresh(cached):
-                    df = cached
-            if df is not None:
-                if _tz_aware(df):
-                    df.index = df.index.tz_convert("US/Eastern")
-                else:
-                    df.index = df.index.tz_localize("US/Eastern")
-                self._hourly[sym] = df
-                print(f"    {tag}: {len(self._hourly[sym])}h bars (cached)")
-            else:
-                try:
-                    df = client.get_kline(sym, bars=500, ktype=KLType.K_60M)
-                    if df is not None and not df.empty:
-                        self._hourly[sym] = df.sort_index()
-                        df.to_parquet(cache_h)
-                        print(f"    {tag}: {len(df)}h bars (fetched → cached)")
+            def _merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
+                out = pd.concat([cached, fresh])
+                out = out[~out.index.duplicated(keep="last")].sort_index()
+                return out
+
+            def _load_or_topup(cache_path, ktype, full_bars: int, bpd: int
+                               ) -> tuple[pd.DataFrame | None, str]:
+                cached = None
+                if cache_path.exists():
+                    try:
+                        cached = pd.read_parquet(cache_path)
+                        if cached.empty:
+                            cached = None
+                    except Exception:
+                        cached = None
+                if cached is not None:
+                    try:
+                        stale = _staleness_days(cached)
+                    except Exception:
+                        stale = 999
+                    if stale <= 3:
+                        return cached, "cached"
+                    if stale <= 15:
+                        need = min(full_bars, (stale + 3) * bpd + 5)
+                        fresh = client.get_kline(sym, bars=need, ktype=ktype)
+                        if fresh is not None and not fresh.empty:
+                            merged = _merge(cached, fresh).tail(full_bars * 2)
+                            merged.to_parquet(cache_path)
+                            return merged, f"topped-up +{stale}d"
+                        return cached, "cached (top-up failed)"
+                # full refetch
+                fresh = client.get_kline(sym, bars=full_bars, ktype=ktype)
+                if fresh is not None and not fresh.empty:
+                    fresh = fresh.sort_index()
+                    fresh.to_parquet(cache_path)
+                    return fresh, "full fetch"
+                return cached, "no data"
+
+            try:
+                df, how_h = _load_or_topup(cache_h, KLType.K_60M, 500, 7)
+                if df is not None:
+                    if _tz_aware(df):
+                        df.index = df.index.tz_convert("US/Eastern")
                     else:
-                        print(f"    {tag}: no hourly data")
-                except Exception as e:
-                    print(f"    {tag}: hourly ERROR — {e}")
-
-            df_d = None
-            if cache_d.exists():
-                cached_d = pd.read_parquet(cache_d)
-                if _fresh(cached_d):
-                    df_d = cached_d
-            if df_d is not None:
-                if _tz_aware(df_d):
-                    df_d.index = df_d.index.tz_convert("US/Eastern")
+                        df.index = df.index.tz_localize("US/Eastern")
+                    self._hourly[sym] = df
+                    print(f"    {tag}: {len(df)}h bars ({how_h})")
                 else:
-                    df_d.index = df_d.index.tz_localize("US/Eastern")
-                self._daily[sym] = df_d
-            else:
-                try:
-                    df_d = client.get_kline(sym, bars=250, ktype=KLType.K_DAY)
-                    if df_d is not None and not df_d.empty:
-                        self._daily[sym] = df_d.sort_index()
-                        df_d.to_parquet(cache_d)
-                except Exception:
-                    pass
+                    print(f"    {tag}: no hourly data")
+            except Exception as e:
+                print(f"    {tag}: hourly ERROR — {e}")
+
+            try:
+                df_d, _how_d = _load_or_topup(cache_d, KLType.K_DAY, 250, 1)
+                if df_d is not None:
+                    if _tz_aware(df_d):
+                        df_d.index = df_d.index.tz_convert("US/Eastern")
+                    else:
+                        df_d.index = df_d.index.tz_localize("US/Eastern")
+                    self._daily[sym] = df_d
+            except Exception:
+                pass
             n_d = len(self._daily.get(sym, pd.DataFrame()))
             n_h = len(self._hourly.get(sym, pd.DataFrame()))
             print(f"    {tag}: {n_h}h, {n_d}d bars")

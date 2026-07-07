@@ -65,6 +65,53 @@ MIN_VALID_WINDOWS = 2
 
 PARAM_KEYS = ("entry_threshold", "tp_atr_mult", "sl_atr_mult")
 
+# ── Daily mode (2026-07-07, owner request) ──────────────────────────────────
+# Every morning (09:00 MYT, market closed) the incremental cache tops up
+# yesterday's bars and a NEIGHBORHOOD walk re-validates the CURRENT params ±1
+# step per axis. This is deliberately NOT a daily full-grid re-pick — daily
+# global re-optimization on ~10-trade samples is noise-chasing. Hill-climb
+# with hysteresis instead: a challenger replaces the incumbent only when it
+# beats it by DAILY_HYSTERESIS on the aggregate score, and at most ONE param
+# moves per day (single best axis step). The weekly Monday full grid remains
+# the broad search that can escape local optima.
+DAILY_STEPS = {"entry_threshold": 5.0, "tp_atr_mult": 1.0, "sl_atr_mult": 0.3}
+DAILY_HYSTERESIS = 1.25          # challenger agg must be ≥ 1.25× baseline agg
+DAILY_LOG = ROOT / "data" / "optimizer_daily_log.jsonl"
+
+
+def _neighbor_combos(saved: dict) -> list[tuple[float, float, float]]:
+    """Axis-wise ±1-step neighbors of the current params (each differs from
+    the baseline in exactly ONE parameter), bounds-checked and deduped."""
+    th0, tp0, sl0 = (saved["entry_threshold"], saved["tp_atr_mult"],
+                     saved["sl_atr_mult"])
+    out: list[tuple[float, float, float]] = []
+    for key, step in DAILY_STEPS.items():
+        for sign in (-1.0, +1.0):
+            th, tp, sl = th0, tp0, sl0
+            if key == "entry_threshold":
+                th = round(th0 + sign * step)
+            elif key == "tp_atr_mult":
+                tp = round(tp0 + sign * step, 1)
+            else:
+                sl = round(sl0 + sign * step, 1)
+            c = (float(th), float(tp), float(sl))
+            if c == (th0, tp0, sl0) or c in out:
+                continue
+            if all(runtime_config.is_valid(k, v)
+                   for k, v in zip(PARAM_KEYS, c)):
+                out.append(c)
+    return out
+
+
+def _append_daily_log(record: dict) -> None:
+    """Permanent per-run archive (owner: 每天跑的数据都保留起来，不会忘记)."""
+    try:
+        DAILY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(DAILY_LOG, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception as e:
+        print(f"WARN: daily log append failed: {e}")
+
 
 # ── Scoring ─────────────────────────────────────────────
 
@@ -157,13 +204,35 @@ def _eval_combo(th: float, tp: float, sl: float,
 
 # ── Main ────────────────────────────────────────────────
 
-def optimize(quick: bool = False, quiet: bool = False) -> dict:
-    """Grid search with cross-window aggregation. quick: 27 combos on the 2
-    most recent windows (~2-4 min on a warm cache); full: 210 combos on all
-    windows (~20-40 min). The winner must beat the CURRENT live params run
-    through the identical pipeline, then it is auto-applied."""
-    grid = GRID_QUICK if quick else GRID_FULL
+def optimize(quick: bool = False, quiet: bool = False,
+             daily: bool = False, force: bool = False) -> dict:
+    """Grid search with cross-window aggregation.
+
+    quick: 27-combo grid on the 2 most recent windows (~20 min cold cache).
+    daily: NEIGHBORHOOD walk (current params ±1 step per axis, ≤7 combos, 2
+           windows, ~2-3 min warm cache) with 1.25× hysteresis and at most
+           one param change — the every-morning re-validation.
+    full (default): 210 combos on all windows.
+    The winner must beat the CURRENT live params run through the identical
+    pipeline, then it is auto-applied (owner directive 2026-07-07)."""
     now = datetime.now(ET)
+
+    # ── Safety interlock: the sweep INJECTS grid params into live db-state.
+    # A concurrently-scanning scheduler would trade on them. Only run when
+    # the US market is closed (all crons are scheduled accordingly).
+    if not force:
+        try:
+            from src import clock
+            sess = clock.market_session(clock.ny_now())
+        except Exception:
+            sess = "unknown"
+        if sess == "open":
+            msg = ("REFUSED: US market is OPEN — the sweep injects live params "
+                   "and a scanning scheduler would trade on grid values. "
+                   "Run while closed, or --force after stopping the scheduler.")
+            print(msg)
+            return {"refused": "market_open", "note": msg}
+
     end_date = now.replace(hour=16, minute=0, second=0, microsecond=0)
 
     try:
@@ -174,25 +243,30 @@ def optimize(quick: bool = False, quiet: bool = False) -> dict:
 
     windows = [_snap_weekdays(a, b) for a, b in _windows(end_date)]
     windows = [(a, b) for a, b in windows if a < b]
-    if quick:
+    if quick or daily:
         windows = windows[:2]   # two most recent windows
 
     saved = {k: float(runtime_config.current(k)) for k in PARAM_KEYS}
     baseline_combo = (saved["entry_threshold"], saved["tp_atr_mult"], saved["sl_atr_mult"])
 
     combos: list[tuple[float, float, float]] = [baseline_combo]
-    for th in grid["entry_threshold"]:
-        for tp in grid["tp_atr_mult"]:
-            for sl in grid["sl_atr_mult"]:
-                c = (float(th), float(tp), float(sl))
-                if c != baseline_combo and all(
-                    runtime_config.is_valid(k, v)
-                    for k, v in zip(PARAM_KEYS, c)
-                ):
-                    combos.append(c)
+    if daily:
+        combos += _neighbor_combos(saved)
+    else:
+        grid = GRID_QUICK if quick else GRID_FULL
+        for th in grid["entry_threshold"]:
+            for tp in grid["tp_atr_mult"]:
+                for sl in grid["sl_atr_mult"]:
+                    c = (float(th), float(tp), float(sl))
+                    if c != baseline_combo and all(
+                        runtime_config.is_valid(k, v)
+                        for k, v in zip(PARAM_KEYS, c)
+                    ):
+                        combos.append(c)
 
+    mode_name = "daily" if daily else ("quick" if quick else "full")
     if not quiet:
-        print(f"Optimizer v2: {len(combos)} combos (incl. baseline) × {len(windows)} windows")
+        print(f"Optimizer v2 [{mode_name}]: {len(combos)} combos (incl. baseline) × {len(windows)} windows")
         print(f"Pool: {len(pool)} tickers | Baseline: th={saved['entry_threshold']} "
               f"tp={saved['tp_atr_mult']} sl={saved['sl_atr_mult']}")
 
@@ -222,8 +296,13 @@ def optimize(quick: bool = False, quiet: bool = False) -> dict:
                    if not r.get("is_baseline") and r["eligible"] and r["mean_pnl"] > 0]
     best = max(challengers, key=lambda r: r["agg_score"], default=None)
 
+    # Apply bar: weekly/full modes require a strict beat; DAILY mode requires
+    # the 1.25× hysteresis margin so one new day of data can't thrash params.
+    required = (max(baseline_score, 0.0) * DAILY_HYSTERESIS
+                if daily and baseline_score > 0 else max(baseline_score, 0.0))
+
     applied = False
-    if best and best["agg_score"] > max(baseline_score, 0.0):
+    if best and best["agg_score"] > required:
         # Winner beats the incumbent on the identical pipeline → APPLY.
         # (Owner directive 2026-07-07: validated best is applied directly,
         # no approval step.) set_param records param_history + bounds-checks.
@@ -234,10 +313,12 @@ def optimize(quick: bool = False, quiet: bool = False) -> dict:
                 changes.append(f"{key}: {saved[key]:g} → {val:g}")
         applied = bool(changes)
         if applied:
-            msg = ("🔧 *Weekly optimizer AUTO-APPLIED*\n"
+            title = "每日优化器" if daily else "Weekly optimizer"
+            msg = (f"🔧 *{title} AUTO-APPLIED*\n"
                    + "\n".join(f"  • {c}" for c in changes)
                    + f"\n  agg score {best['agg_score']:.1f} vs baseline {baseline_score:.1f}"
-                   f" | mean PnL ${best['mean_pnl']:.0f}"
+                   + (f" (需 ≥{required:.1f})" if daily else "")
+                   + f" | mean PnL ${best['mean_pnl']:.0f}"
                    f" ({best['valid_windows']}/{len(windows)} windows)"
                    "\n  下一次扫描生效（runtime 覆盖，无需重启）")
             try:
@@ -257,7 +338,7 @@ def optimize(quick: bool = False, quiet: bool = False) -> dict:
     output = {
         "generated_at": now.isoformat(),
         "version": "v2-aggregated",
-        "mode": "quick" if quick else "full",
+        "mode": mode_name,
         "lookback_days": LOOKBACK_DAYS,
         "windows": [f"{a.date()}→{b.date()}" for a, b in windows],
         "combos_tested": len(results),
@@ -271,6 +352,23 @@ def optimize(quick: bool = False, quiet: bool = False) -> dict:
     out_path = ROOT / "data" / "optimized_params.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(output, indent=2, default=str))
+
+    # Permanent per-run archive (compact — no window detail; the full detail
+    # lives in optimized_params.json until the next run overwrites it).
+    _append_daily_log({
+        "ts": now.isoformat(timespec="seconds"),
+        "mode": mode_name,
+        "baseline": {k: saved[k] for k in PARAM_KEYS} | {
+            "agg": baseline_score,
+            "mean_pnl": (baseline or {}).get("mean_pnl")},
+        "best": ({"th": best["th"], "tp": best["tp"], "sl": best["sl"],
+                  "agg": best["agg_score"], "mean_pnl": best["mean_pnl"]}
+                 if best else None),
+        "applied": applied,
+        "combos": len(results),
+        "windows": len(windows),
+        "elapsed_sec": round(elapsed, 1),
+    })
 
     if not quiet:
         print(f"\n{'='*60}")
@@ -289,6 +387,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true",
                     help="27-combo grid on the 2 most recent windows")
+    ap.add_argument("--daily", action="store_true",
+                    help="neighborhood walk around current params (±1 step, "
+                         "1.25x hysteresis, ≤1 param change) — the 09:00 cron")
+    ap.add_argument("--force", action="store_true",
+                    help="override the market-open safety interlock (make "
+                         "sure the scheduler is STOPPED first)")
     ap.add_argument("--quiet", action="store_true", help="Less console output")
     args = ap.parse_args()
-    optimize(quick=args.quick, quiet=args.quiet)
+    optimize(quick=args.quick, quiet=args.quiet, daily=args.daily, force=args.force)
