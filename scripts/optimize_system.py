@@ -103,12 +103,23 @@ def _neighbor_combos(saved: dict) -> list[tuple[float, float, float]]:
     return out
 
 
+DAILY_LOG_MAX_RECORDS = 1000   # ≈3 years of daily+weekly runs (~350 B each)
+
+
 def _append_daily_log(record: dict) -> None:
-    """Permanent per-run archive (owner: 每天跑的数据都保留起来，不会忘记)."""
+    """Per-run archive (owner: 每天跑的数据都保留起来，不会忘记).
+
+    Self-bounding: keeps the most recent DAILY_LOG_MAX_RECORDS lines
+    (~350 KB ceiling) so the archive can never grow without limit."""
     try:
         DAILY_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(DAILY_LOG, "a") as f:
             f.write(json.dumps(record, default=str) + "\n")
+        lines = DAILY_LOG.read_text().splitlines()
+        if len(lines) > DAILY_LOG_MAX_RECORDS:
+            tmp = DAILY_LOG.with_suffix(".tmp")
+            tmp.write_text("\n".join(lines[-DAILY_LOG_MAX_RECORDS:]) + "\n")
+            tmp.replace(DAILY_LOG)
     except Exception as e:
         print(f"WARN: daily log append failed: {e}")
 

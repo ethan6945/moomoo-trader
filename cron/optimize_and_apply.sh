@@ -105,4 +105,18 @@ else
     log "Step 3: daily mode — Telegram only fires on an applied change (see Step 1 log)"
 fi
 
+# ── 4. Housekeeping: bound every growing artifact this pipeline creates ──
+#   • per-run tee logs (the real disk eater: ~200 KB × 6/week) → keep 30 days
+#   • cron_optimize.log → keep the last 2000 lines once it passes ~5 MB
+#   • hermes .env snapshots → keep 60 days
+log "Step 4: Housekeeping"
+find "$LOG_DIR" -name "optimize_*.log" -mtime +30 -delete 2>/dev/null || true
+CRON_LOG="$LOG_DIR/cron_optimize.log"
+if [ -f "$CRON_LOG" ] && [ "$(stat -f%z "$CRON_LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+    tail -n 2000 "$CRON_LOG" > "$CRON_LOG.tmp" && mv "$CRON_LOG.tmp" "$CRON_LOG"
+    log "cron_optimize.log trimmed to last 2000 lines"
+fi
+find "$ROOT/data/hermes_snapshots" -mindepth 1 -maxdepth 1 -type d -mtime +60 \
+    -exec rm -rf {} + 2>/dev/null || true
+
 log "DONE"
