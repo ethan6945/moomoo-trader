@@ -87,9 +87,6 @@ CURRENT MARKET ENVIRONMENT:
 RECENT BACKTEST (health check):
 {backtest_health}
 
-ML SCORER STATUS:
-{ml_status}
-
 INSTRUCTIONS:
 1. Look at the real-fill data FIRST. If a strategy is losing money over
    15+ trades, propose pausing it. If all strategies are healthy, do nothing.
@@ -232,19 +229,6 @@ def weekly_autopilot() -> dict:
     except Exception as e:
         log.warning("backtest health check failed: %s", e)
 
-    # ML scorer status
-    ml_status = "model not trained"
-    try:
-        from . import ml_scorer
-        if ml_scorer.model_exists():
-            n_trades = ml_scorer._trade_count()
-            w = ml_scorer._current_ml_weight()
-            ml_status = f"model active | {n_trades} labeled trades | ML weight {w:.0%}"
-        else:
-            ml_status = f"not trained yet ({ml_scorer._trade_count()} trades)"
-    except Exception:
-        pass
-
     # Strategy status
     strategy_status_lines = []
     for strat, data in sorted(strat_perf.items(), key=lambda kv: kv[1].get("expectancy", 0)):
@@ -276,7 +260,6 @@ def weekly_autopilot() -> dict:
         if isinstance(report, dict) else str(report),
         market_context=market_ctx,
         backtest_health=bt_health,
-        ml_status=ml_status,
         strategy_status=strategy_status,
         budget=risk_manager.budget_usd(),
         **_current_params(),

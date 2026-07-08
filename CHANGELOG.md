@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## 2026-07-08 — 网页面板：净值曲线移入历史 + 美国板块总览（Live）
+
+仪表盘右下角的「净值曲线 · 累计已实现」面板移到**历史**标签页顶部（月度图上方，图表/悬浮提示行为不变），原位置换成**美国板块总览 · Live**。
+
+- 新后端接口 `GET /api/sectors`（`web/server.py`）：yfinance 批量拉 11 只 SPDR 板块 ETF + SMH 半导体 + SPY/QQQ/IWM 三大指数，日线 last/prev close 算当日涨跌%（盘中即实时价）；服务端缓存 60s + 锁防并发打穿，拉取失败回退旧缓存（`stale:true`）。返回 `clock.market_session()` 的盘中/盘前/盘后/休市状态。
+- 前端：板块面板与「持仓」互换位置——板块进左上大格子，渲染为 **4×3 热力图色块**（按涨跌排序、色深随幅度共享一个比例尺，块内显示板块名/ETF/涨跌%/现价）；指数为顶部 pill；标题栏显示 🟢盘中/🌅盘前 等状态 + 数据日期；每 60s 刷新（仅仪表盘标签激活时），中英文跟随语言切换。持仓表进右下窄格后隐藏 入场/止损/止盈 三列（区间条已编码：▏入场刻度 · ●现价，悬浮显示 SL/TP 具体价）；手机端持仓仍排最前、色块降为 2 列。
+- 注意：web 服务需重启加载新接口（已重启；交易调度器不受影响）。
+
 ## 2026-06-26 — 更聪明的 regime 感知（VIX 感知 + 防抖滞回）
 
 升级 `src/regime.py`：在不动原始 `label`/`block_new_entries`（回测一致性是硬约束，两个引擎都用 `assess()` 重算入场日 regime）的前提下，新增**始终计算**的咨询字段——`vix`（让 regime 知道波动环境）、`strength`（−1..+1 距 200MA 的强弱）、`sub_label`（STRONG_BULL/HIGH_VOL_BULL/DEEP_BEAR/HIGH_VOL_BEAR…）、`confirmed_label`（**滞回平滑**后的标签）、`risk_mult`（咨询用，**不自动施加**——VIX 已在 calc_position_size 减仓，避免重复扣）。

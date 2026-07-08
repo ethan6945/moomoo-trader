@@ -11,7 +11,7 @@ the job once (catchup), then resume the normal schedule.
 
 Coalesce policy: missed runs are coalesced — we never fire a job multiple
 times in a row to "catch up the backlog". One catchup per missed schedule
-cycle is enough (monthly ML retrain runs once even if 3 months were missed).
+cycle is enough (a monthly job runs once even if 3 months were missed).
 
 Fresh-install policy: an empty state file is initialised to NOW for every
 known job, so the first boot doesn't trigger every job at once.
@@ -34,7 +34,6 @@ STATE_FILE = settings.root / "data" / "cron_state.json"
 # Every named job that participates in the catchup system. Adding a new
 # scheduled job? Append it here and call `record_run(name)` on success.
 KNOWN_JOBS: tuple[str, ...] = (
-    "ml_retrain",
     "watchlist_refresh",
     "weekly_backtest",
     "monthly_optuna",

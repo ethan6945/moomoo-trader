@@ -28,7 +28,7 @@ from . import (
 )
 from .config import settings
 from .earnings import earnings_block
-from .moomoo_client import client
+from .moomoo_client import client, real_unlock_confirmed
 from .reconcile import log_reconcile, reconcile
 
 SPREAD_MAX_PCT = 0.5   # refuse entry if bid-ask spread > 0.5% of mid
@@ -181,6 +181,9 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "max_hold_days": runtime_config.max_hold_days(),      # 2026-07-06: use runtime override, not static .env
             "timeframe": settings.timeframe,
             "trade_env": settings.moomoo_trade_env,
+            # REAL unlock proof for the web badge: True only after a gated order
+            # op succeeded this session. Always False on SIMULATE (no unlock).
+            "real_unlock_confirmed": real_unlock_confirmed(),
             "vix": round(vix or 0, 1),
             "regime": regime.label,
             "regime_sub": regime.sub_label,
@@ -448,6 +451,7 @@ def scan_once() -> None:
                 "max_hold_days": runtime_config.max_hold_days(),      # 2026-07-06: use runtime override, not static .env
                 "timeframe": settings.timeframe,
                 "trade_env": settings.moomoo_trade_env,
+                "real_unlock_confirmed": real_unlock_confirmed(),
                 "vix": round(vix, 1),
                 "regime": regime.label,
                 "regime_sub": regime.sub_label,
@@ -715,40 +719,10 @@ def scan_once() -> None:
             except Exception:
                 pass
 
-            # Position conviction (ML removed 2026-06-03; with the hard
-            # threshold, setup_conviction is 1.0 — kept for the VIX/DD sizing path).
-            #
-            # P1-2 (2026-06-26): ML scorer (XGBoost) blends with hand-written
-            # score. Starts at 30% weight, graduates to 85% after 150 trades.
-            # The blended_score replaces the raw indicator score for threshold
-            # comparison and sizing, while the original sig.score is preserved
-            # for audit. When the model isn't trained yet, ml_weight=0 →
-            # blended = hand-written (identical to old behaviour).
+            # Position conviction (ML subsystem fully removed 2026-07-08; with
+            # the hard threshold, setup_conviction is 1.0 — kept for the
+            # VIX/DD sizing path).
             conviction = setup_conviction
-            ml_proba = None
-            # Save original score before ML blend modifies it
-            _orig_score = sig.score
-            _candidate_df = all_dfs.get(sig.symbol)
-            _ml_features = None   # P1-2: persisted in audit → ML retraining
-            if not is_stack_candidate:
-                try:
-                    from . import ml_scorer
-                    ml = ml_scorer.score(
-                        sig, opendf=_candidate_df,
-                        dailydf=df_d,
-                        regime_label=effective_label,
-                        vix=vix,
-                    )
-                    _ml_features = ml.get("ml_features")
-                    if ml["weight"] > 0:
-                        ml_proba = ml["ml_proba"]
-                        sig.score = ml["blended_score"]
-                        log.info("%s ML blend: rule=%.1f ml=%.1f(w=%.0f%%) → %.1f",
-                                 sig.symbol, _orig_score,
-                                 ml["ml_score"], ml["weight"] * 100,
-                                 sig.score)
-                except Exception as e:
-                    log.debug("ML scorer skipped for %s: %s", sig.symbol, e)
 
             # --- AI verdict (Gemini + Tavily news, independent advisory) ---
             # Stacking add-ons skip AI consult — we've already done the diligence
@@ -850,9 +824,7 @@ def scan_once() -> None:
                     pass  # structural stop is optional — never block on it
 
             try:
-                opened = executor.open_position(c, sig, qty,
-                                                  ml_proba=ml_proba,
-                                                  ml_features=_ml_features)
+                opened = executor.open_position(c, sig, qty)
                 if opened is None:
                     # Market ran past the signal price — same no-fill the
                     # backtest's open-only model books. Not an error.
@@ -903,12 +875,7 @@ def scan_once() -> None:
                                         "vision_confidence": vision_conf,
                                         "vision_label": vision_label,
                                         "vision_reason": vision_reason}
-                                       if sig.strategy == "pattern" else {}),
-                                    # P1-2: persist feature vector so the ML
-                                    # model can retrain on this trade when it
-                                    # closes (label = pnl>0)
-                                    **({"ml_features": _ml_features}
-                                       if _ml_features else {})})
+                                       if sig.strategy == "pattern" else {})})
                 notifier.send(notifier.signal_msg(sig, ai_reason, qty))
                 cash -= qty * sig.price
                 pending_value += qty * sig.price
@@ -1169,29 +1136,6 @@ def _weekly_autopilot_job() -> None:
         notifier.send(f"⚠ Weekly autopilot failed: {e}")
 
 
-def _weekly_ml_retrain_job() -> None:
-    """Monday 20:20 KL (timezone-pinned) — re-train XGBoost on all closed trades.
-    Runs AFTER autopilot+backtest so the model trains on the freshest data.
-    No-op if xgboost is not installed or <20 labeled trades exist.
-    """
-    log.info("weekly ML retrain: starting")
-    try:
-        from . import ml_scorer
-        result = ml_scorer.train(force=True)
-        status = result.get("status", "unknown")
-        if status == "trained":
-            log.info(
-                "ML retrain done: %d trades, %.1f%% train-acc, model saved",
-                result.get("n_labeled", 0),
-                result.get("train_accuracy_pct", 0),
-            )
-        else:
-            log.info("ML retrain: %s — %s", status, result.get("reason", ""))
-        cron_state.record_run("ml_retrain")
-    except Exception as e:
-        log.warning("weekly ML retrain failed: %s", e)
-
-
 def _weekly_self_review_job() -> None:
     """Sunday 23:00 ET — review the past week's REAL fills and emit suggestions
     (analyze→notify→approve). Never changes live behavior on its own. Each
@@ -1299,9 +1243,6 @@ def _run_catchup_on_startup() -> None:
         ("self_review",
          cron_state.expected_last_fire_weekly(0, 20, 15, tz=KL),   # Mon 20:15 KL
          _weekly_self_review_job, "Weekly self-review"),
-        ("ml_retrain",
-         cron_state.expected_last_fire_weekly(0, 20, 20, tz=KL),   # Mon 20:20 KL
-         _weekly_ml_retrain_job, "Weekly ML retrain"),
         ("monthly_optuna",
          cron_state.expected_last_fire_monthly(1, 3, 0),
          _monthly_optuna_job, "Monthly Optuna optimization"),
@@ -1552,16 +1493,7 @@ def run_loop() -> None:
                   day_of_week="mon", hour=20, minute=15, timezone=KL,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
-    # Weekly ML retrain: Monday 20:20 KL. Re-trains the XGBoost model on all
-    # closed trades. Runs last in the Monday chain so it trains on the
-    # freshest data (autopilot may have applied param changes that affect the
-    # next week's trades).
-    sched.add_job(_weekly_ml_retrain_job, "cron",
-                  day_of_week="mon", hour=20, minute=20, timezone=KL,
-                  coalesce=True, misfire_grace_time=1800, max_instances=1)
-
-    # Monthly Optuna re-optimization: 1st of each month at 03:00 ET. Runs
-    # AFTER the ML retrain at 02:00 so the search uses the freshest model.
+    # Monthly Optuna re-optimization: 1st of each month at 03:00 ET.
     # Telegrams suggested params; user reviews before editing .env.
     sched.add_job(_monthly_optuna_job, "cron", day=1, hour=3, minute=0,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)

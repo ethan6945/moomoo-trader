@@ -178,6 +178,47 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
         for g in ghosts:
             sym = g["symbol"]
             trade = our_trades.get(sym)
+
+            # 2026-07-09 phantom guard: a "ghost" whose BUY order never filled
+            # is NOT a manual close — the position never existed. (Root cause
+            # incident: the OpenD-rs gateway accepted place_order but returned
+            # order_id=0 and silently dropped the order, so every buy became a
+            # fake MANUAL_SELL loss + instant re-buy loop.) Verify the buy
+            # actually filled before booking any P&L.
+            buy_oid = str((trade or {}).get("buy_order_id") or "").strip()
+            buy_status = ""
+            if trade is not None and client is not None and buy_oid not in ("", "0", "None"):
+                buy_status = client.get_order_status(buy_oid)
+            if buy_status in ("SUBMITTED", "SUBMITTING", "WAITING_SUBMIT"):
+                # Buy order still live at the broker — not a ghost, the fill
+                # just hasn't happened yet. Leave the record; the stale-order
+                # canceller owns unfilled buys.
+                log.info("reconcile: %s buy order %s still pending — skipping "
+                         "ghost handling this round", sym, buy_oid)
+                continue
+            if trade is not None and buy_status not in ("FILLED_ALL", "FILLED_PART"):
+                # Can't confirm the buy ever filled. For a RECENT entry the
+                # order id would still be in the day's order list, so unknown/
+                # unfilled status means a phantom: drop the record WITHOUT
+                # booking a fake manual sell. Older entries fall through to
+                # normal booking — their ids have rolled out of the order-list
+                # window, and a position held across days must have filled.
+                age_h = None
+                try:
+                    opened_dt = datetime.fromisoformat(
+                        str(trade.get("opened_at") or "").replace("Z", ""))
+                    age_h = (datetime.utcnow() - opened_dt).total_seconds() / 3600
+                except ValueError:
+                    pass
+                if age_h is not None and age_h < 24:
+                    our_trades.pop(sym, None)
+                    fixes_applied.append({"type": "GHOST_DROPPED", "symbol": sym,
+                                          "phantom": True})
+                    log.warning("Reconcile auto-fix: dropped phantom %s — buy "
+                                "order %s never filled, no P&L booked",
+                                sym, buy_oid or "?")
+                    continue
+
             booked = None
             if trade and client is not None:
                 exit_price = None

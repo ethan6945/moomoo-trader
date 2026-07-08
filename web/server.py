@@ -11,6 +11,7 @@ Endpoints (JSON):
   GET  /api/approvals        → approval queue (pending first)
   POST /api/approvals/<id>/<approve|reject>
   GET  /api/closed?n=        → recent closed trades (History + Equity)
+  GET  /api/sectors          → live US sector ETF overview (60s cache)
   GET  /api/log?n=           → tail of logs/trader.log (compact activity)
   GET  /api/signal-log?n=    → tail of logs/signal_reporter.log
   POST /api/budget           → {value} set runtime budget (no restart)
@@ -252,95 +253,31 @@ def _opend_running() -> bool:
         return False
 
 
-def _opend_password() -> str:
-    """OpenD login password — macOS Keychain first (service "moomoo-opend",
-    2026-07-07 hardening), legacy .env/env-var fallback for fresh installs."""
-    try:
-        out = subprocess.run(
-            ["/usr/bin/security", "find-generic-password",
-             "-s", "moomoo-opend", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
-    except Exception:
-        pass
-    return ((_read_env().get("OPEND_LOGIN_PWD") or "").strip()
-            or os.getenv("OPEND_LOGIN_PWD", "").strip())
-
-
 def _start_opend() -> str | None:
-    """Start OpenD-rs if not already running. Returns error message or None on success."""
+    """Ensure OpenD is reachable, launching the OFFICIAL moomoo_OpenD.app if not.
+    Returns error message or None on success.
+
+    2026-07-09: reverted from the headless OpenD-rs gateway — its v1.4.122
+    silently dropped every order (need_op_confirm stub with order_id=0, purged
+    after ~30s with no broker push), which turned each buy into a fake
+    MANUAL_SELL ghost + re-buy loop. The official app keeps its own login
+    session; we just launch it and wait for port 11111."""
     if _opend_running():
         return None  # already up
 
-    opend_bin = "/opt/homebrew/bin/futu-opend"
-    futucli_bin = "/opt/homebrew/bin/futucli"
-
-    account = ((_read_env().get("OPEND_LOGIN_ACCOUNT") or "").strip()
-               or os.getenv("OPEND_LOGIN_ACCOUNT", "").strip())
-    pwd = _opend_password()
-
-    if not account or not pwd:
-        return ("OpenD 凭证未配置 — .env 设置 OPEND_LOGIN_ACCOUNT，密码存入 Keychain: "
-                "security add-generic-password -U -a <账号> -s moomoo-opend -w '<密码>'")
-    if not Path(opend_bin).is_file():
-        return f"futu-opend 未安装 — 运行: brew install futuleaf/tap/futu-opend-rs"
-
-    # --login-pwd-file: argv shows only a path (never the password in `ps`).
-    # 600-perm temp file, removed right after the ready-wait (OpenD reads it
-    # once at startup).
-    import tempfile
-    pwd_file = None
     try:
-        fd, pwd_file = tempfile.mkstemp(prefix="opend_pwd.")
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(pwd)
-        log_f = (ROOT / "logs" / "opend.log").open("a")
-        proc = subprocess.Popen(
-            [opend_bin,
-             "--login-account", account,
-             "--login-pwd-file", pwd_file,
-             "--platform", "moomoo",
-             "--rest-port", "22222",
-             "--grpc-port", "33333"],
-            cwd=str(ROOT), stdout=log_f, stderr=log_f,
-            start_new_session=True,
-        )
-        OPEND_PID.write_text(str(proc.pid))
+        subprocess.run(["/usr/bin/open", "-a", "moomoo_OpenD"],
+                       capture_output=True, text=True, timeout=10, check=True)
     except Exception as e:
-        if pwd_file:
-            try:
-                os.unlink(pwd_file)
-            except OSError:
-                pass
-        return f"启动 OpenD 失败: {e}"
+        return f"启动 moomoo_OpenD.app 失败: {e}"
 
-    # Wait up to 15s for port 11111
-    try:
-        for i in range(1, 16):
-            if _opend_running():
-                break
-            time.sleep(1)
-        else:
-            return "OpenD 启动后端口 11111 未就绪（查阅 logs/opend.log）"
-    finally:
-        try:
-            os.unlink(pwd_file)
-        except OSError:
-            pass
-
-    # Unlock US trading
-    try:
-        subprocess.run(
-            [futucli_bin, "unlock-trade", "--security-firm", "us"],
-            capture_output=True, timeout=10,
-        )
-    except Exception:
-        pass  # non-fatal; may already be unlocked
-
-    return None  # success
+    # GUI login can take a while (saved session usually auto-logs-in).
+    for _ in range(60):
+        if _opend_running():
+            return None  # success
+        time.sleep(1)
+    return ("moomoo_OpenD.app 已启动但端口 11111 未就绪 — 请到 OpenD 窗口完成"
+            "登录（账号/密码/验证码），登录成功后再点 ▶ 启动")
 
 
 def _stop_opend() -> bool:
@@ -434,21 +371,25 @@ def _stop_pid(pid_file: Path) -> bool:
 def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
     """OpenD light, inferred WITHOUT opening a second broker connection (a fresh
     connection has its own unlock state and wouldn't reflect the scheduler's).
-    Evidence that OpenD is unlocked = the scheduler has written an account
-    snapshot with a real cash figure, since the writer only persists after a
-    successful accinfo query and that requires an unlocked trade context.
+
+    2026-07-09 honesty rewrite: the old badge claimed 已解锁 whenever an accinfo
+    query had succeeded — WRONG premise: queries never require unlock (moomoo's
+    trade unlock only gates order ops on REAL accounts) and SIMULATE has no
+    unlock concept at all, so the badge lit green with the trade lock untouched.
+    Now the unlock claim is env-aware:
+      · SIMULATE — never mentions 解锁. A fresh snapshot proves the pipeline
+        (OpenD + scheduler + account query) works, and simulate orders need no
+        unlock → "模拟盘 · 可交易".
+      · REAL — 已解锁 only after a gated order op actually succeeded this
+        scheduler session (`real_unlock_confirmed` in the snapshot, written by
+        src/main.py from moomoo_client). Until then the badge warns 解锁未确认
+        — a fresh REAL session that hasn't traded yet shows the warning even if
+        the user did unlock; erring on the safe side is the point.
 
       red    — OpenD socket unreachable (not started)
-      green  — unlocked + market open + snapshot fresh → live & trading
-      blue   — unlocked but market closed → the scheduler stops scanning off-hours
-               so the snapshot ages out BY DESIGN; this is normal rest, not a lock
-               problem (this is the state that used to mislead as 未解锁/未确认)
-      yellow — reachable but worth a look; the label says which of three, and only
-               claims 未解锁 when we genuinely never confirmed an unlock:
-                 · 已连接 · 未解锁/未确认 — no successful accinfo ever (no cash written)
-                 · 已解锁 · 调度器已停    — was unlocked but the scheduler isn't running
-                 · 已解锁 · 连接中…       — scheduler up but snapshot stale (just
-                                            restarted / catching up / stalled)
+      green  — pipeline OK + market open + snapshot fresh (+ REAL: unlock proven)
+      blue   — pipeline OK but market closed → snapshot ages out BY DESIGN
+      yellow — reachable but worth a look (label says why)
     """
     try:
         with socket.create_connection((settings.moomoo_host, settings.moomoo_port), timeout=0.6):
@@ -456,10 +397,13 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
     except Exception:
         return "red", "OpenD 未启动"
 
-    # A written snapshot always reflects a SUCCESSFUL accinfo query (the writer
-    # bails before writing if the query raises), so a present cash figure — even
-    # 0.0 on a fully-invested account — proves the context was unlocked.
-    unlocked_ever = acct.get("cash") is not None
+    # A written snapshot proves a SUCCESSFUL accinfo query (the writer bails
+    # before writing if the query raises) — i.e. the data pipeline works. It
+    # says NOTHING about the trade unlock (queries don't need it).
+    snapshot_ok = acct.get("cash") is not None
+    is_real = ((acct.get("trade_env") or settings.moomoo_trade_env or "SIMULATE")
+               .upper() == "REAL")
+    unlock_ok = bool(acct.get("real_unlock_confirmed"))
     interval = (acct.get("scan_interval_min") or 30) * 60
     try:
         age = time.time() - ACCOUNT_FILE.stat().st_mtime
@@ -470,30 +414,40 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
     session = clock.market_session()   # plain system NY time — no network/drift cost
     market_open = session == "open"
 
-    if sched_running and unlocked_ever and market_open and fresh:
-        return "green", "已解锁 · 可交易"
+    # Label prefix: what we can honestly claim about trading capability.
+    #   SIMULATE        → 模拟盘 (no unlock exists; orders always work)
+    #   REAL, proven    → 已解锁
+    #   REAL, unproven  → handled separately below (warning state)
+    prefix = "模拟盘" if not is_real else "已解锁"
+
+    if sched_running and snapshot_ok and market_open and fresh:
+        if is_real and not unlock_ok:
+            return "yellow", "已连接 · 解锁未确认 — 请在 OpenD 窗口点击解锁"
+        return "green", f"{prefix} · 可交易"
 
     # Off-hours: scanning intentionally pauses, so a stale snapshot is expected.
-    # As long as the last session proved unlock and the snapshot isn't ancient
-    # (tolerate a Fri-close→Mon-open weekend plus an adjacent holiday), report
-    # unlocked-but-resting instead of the alarming 未解锁.
+    # Tolerate a Fri-close→Mon-open weekend plus an adjacent holiday.
     OFF_HOURS_GRACE = 4 * 24 * 3600   # 4 days
-    if sched_running and unlocked_ever and not market_open and age < OFF_HOURS_GRACE:
-        label = {
-            "premarket":  "已解锁 · 待开盘",
-            "afterhours": "已解锁 · 已收盘",
-            "weekend":    "已解锁 · 周末休市",
-            "holiday":    "已解锁 · 假期休市",
-        }.get(session, "已解锁 · 休市")
-        return "blue", label
+    if sched_running and snapshot_ok and not market_open and age < OFF_HOURS_GRACE:
+        rest = {
+            "premarket":  "待开盘",
+            "afterhours": "已收盘",
+            "weekend":    "周末休市",
+            "holiday":    "假期休市",
+        }.get(session, "休市")
+        if is_real and not unlock_ok:
+            # Nothing trades off-hours, so blue (not alarming) — but flag that
+            # the unlock still needs doing before the next open.
+            return "blue", f"{rest} · 解锁未确认(开盘前请解锁)"
+        return "blue", f"{prefix} · {rest}"
 
-    # 走到这里 = 既非绿(可交易)也非蓝(休市)。快照里写过 cash 就证明 OpenD 曾被
-    # 成功解锁,这类情况别再谎报 未解锁 —— 真正的问题在调度器/快照,不在锁本身。
-    if unlocked_ever:
+    # 走到这里 = 既非绿(可交易)也非蓝(休市)。真正的问题在调度器/快照管道,
+    # 不在锁本身 —— 前缀只报能证实的事。
+    if snapshot_ok:
         if not sched_running:
-            return "yellow", "已解锁 · 调度器已停"     # OpenD 正常;调度器没跑 → 去重启调度器
-        return "yellow", "已解锁 · 连接中…"            # 调度器在跑但快照不新鲜:刚重启/追赶中/卡住
-    return "yellow", "已连接 · 未解锁/未确认"            # 从没成功取过资金 → 确实无法确认已解锁
+            return "yellow", f"{prefix if unlock_ok or not is_real else '已连接'} · 调度器已停"
+        return "yellow", f"{prefix if unlock_ok or not is_real else '已连接'} · 连接中…"
+    return "yellow", "已连接 · 等待首次账户查询"
 
 
 def _trade_summary() -> dict:
@@ -618,6 +572,87 @@ def api_log():
 def api_signal_log():
     n = int(request.args.get("n", 120))
     return jsonify(_tail(SIGNAL_LOG, n))
+
+
+# ── live US sector overview (dashboard panel) ─────────────────────────────────
+# 11 SPDR sector ETFs + SMH (semis — this bot's home turf) + broad indices.
+# yfinance daily bars: today's Close row tracks the live price intraday, so
+# last-vs-prev close = today's % change during RTH and yesterday's after close.
+_SECTOR_ETFS = [
+    ("XLK", "科技", "Tech"),
+    ("SMH", "半导体", "Semis"),
+    ("XLC", "通讯服务", "Comm Svcs"),
+    ("XLY", "可选消费", "Cons Disc"),
+    ("XLP", "必需消费", "Staples"),
+    ("XLV", "医疗保健", "Health Care"),
+    ("XLF", "金融", "Financials"),
+    ("XLI", "工业", "Industrials"),
+    ("XLE", "能源", "Energy"),
+    ("XLB", "材料", "Materials"),
+    ("XLRE", "房地产", "Real Estate"),
+    ("XLU", "公用事业", "Utilities"),
+]
+_INDEX_ETFS = [
+    ("SPY", "标普500", "S&P 500"),
+    ("QQQ", "纳指100", "Nasdaq 100"),
+    ("IWM", "罗素2000", "Russell 2000"),
+]
+_sector_cache: dict = {"ts": 0.0, "data": None}
+_sector_lock = threading.Lock()
+_SECTOR_TTL = 60.0  # one upstream fetch per minute, shared by every open browser
+
+
+def _fetch_sectors() -> dict:
+    import yfinance as yf
+
+    syms = [r[0] for r in _SECTOR_ETFS + _INDEX_ETFS]
+    df = yf.download(syms, period="5d", interval="1d",
+                     progress=False, auto_adjust=False, threads=True)
+    closes = df["Close"]
+
+    def pack(spec):
+        out = []
+        for sym, zh, en in spec:
+            try:
+                s = closes[sym].dropna()
+                last, prev = float(s.iloc[-1]), float(s.iloc[-2])
+                out.append({"sym": sym, "zh": zh, "en": en, "price": round(last, 2),
+                            "pct": round((last / prev - 1) * 100, 2)})
+            except Exception:
+                continue  # one bad ticker shouldn't blank the whole panel
+        return out
+
+    sectors, indices = pack(_SECTOR_ETFS), pack(_INDEX_ETFS)
+    if not sectors:
+        raise RuntimeError("yfinance returned no sector data")
+    session = clock.market_session()
+    try:
+        asof = str(closes.dropna(how="all").index[-1].date())
+    except Exception:
+        asof = None
+    return {"sectors": sectors, "indices": indices, "session": session,
+            "live": session == "open", "asof": asof}
+
+
+@app.route("/api/sectors")
+def api_sectors():
+    cached = _sector_cache["data"]
+    if cached is not None and time.time() - _sector_cache["ts"] < _SECTOR_TTL:
+        return jsonify(cached)
+    with _sector_lock:
+        # another request may have refreshed while we waited on the lock
+        cached = _sector_cache["data"]
+        if cached is not None and time.time() - _sector_cache["ts"] < _SECTOR_TTL:
+            return jsonify(cached)
+        try:
+            data = _fetch_sectors()
+        except Exception as e:
+            if cached is not None:  # serve stale rather than a broken panel
+                return jsonify({**cached, "stale": True})
+            return jsonify({"error": str(e)}), 502
+        _sector_cache["ts"] = time.time()
+        _sector_cache["data"] = data
+        return jsonify(data)
 
 
 # ── action API ───────────────────────────────────────────────────────────────

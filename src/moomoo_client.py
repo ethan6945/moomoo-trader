@@ -57,6 +57,27 @@ _kline_lock = threading.Lock()
 # triggers the same warning. Log it once per process instead of spamming.
 _OPEND_UNLOCK_WARNED = False
 
+# 2026-07-09: REAL-unlock proof. moomoo's trade unlock only gates order ops
+# (place/modify/cancel) on REAL accounts — queries never need it and SIMULATE
+# has no unlock concept at all. So the ONLY hard evidence that the user really
+# clicked Unlock in the OpenD GUI is a gated operation succeeding in REAL env.
+# The account snapshot persists this for the web badge (which previously
+# inferred "已解锁" from a successful accinfo query — a wrong premise).
+_REAL_GATED_OP_OK = False
+
+
+def real_unlock_confirmed() -> bool:
+    """True once a gated trade op (place/cancel) has succeeded in REAL env
+    during this process's lifetime. Always False on SIMULATE."""
+    return _REAL_GATED_OP_OK
+
+
+def _note_gated_op_ok() -> None:
+    global _REAL_GATED_OP_OK
+    if not _REAL_GATED_OP_OK and settings.moomoo_trade_env == "REAL":
+        _REAL_GATED_OP_OK = True
+        log.info("REAL trade unlock confirmed (a gated order op succeeded)")
+
 
 def _kline_rate_acquire() -> None:
     """Block until making one more call would fit in the past-30s window.
@@ -122,14 +143,22 @@ class MoomooClient:
             if ret != RET_OK:
                 msg = str(data)
                 if "GUI version" in msg or "Unlock button" in msg:
-                    # Not an error — OpenD GUI version disables programmatic unlock
-                    # by design. The user has already clicked Unlock in the OpenD
-                    # window; the trade context will work fine. Log at INFO level
-                    # once per process so it doesn't look alarming in the logs.
+                    # OpenD GUI version disables programmatic unlock BY DESIGN —
+                    # this error only proves "GUI build", NOT "unlocked". Queries
+                    # work either way; SIMULATE never needs unlock; REAL order ops
+                    # fail until the user clicks Unlock in the OpenD window. Log
+                    # once per process, env-appropriately.
                     global _OPEND_UNLOCK_WARNED
                     if not _OPEND_UNLOCK_WARNED:
-                        log.info("OpenD connected (GUI-version unlock detected — "
-                                 "using your manual Unlock click, this is the normal flow)")
+                        if settings.moomoo_trade_env == "REAL":
+                            log.warning(
+                                "OpenD connected (GUI version, API unlock disabled) "
+                                "— REAL unlock NOT confirmed: order ops will fail "
+                                "unless you clicked Unlock in the OpenD window")
+                        else:
+                            log.info(
+                                "OpenD connected (GUI version, API unlock disabled "
+                                "— SIMULATE needs no unlock, this is normal)")
                         _OPEND_UNLOCK_WARNED = True
                 else:
                     raise RuntimeError(f"unlock_trade failed: {data}")
@@ -305,6 +334,8 @@ class MoomooClient:
                 price=0,
                 trd_env=_env_enum(),
             )
+            if ret == RET_OK:
+                _note_gated_op_ok()
             return ret == RET_OK
         except Exception as e:
             log.warning("cancel_order(%s) failed: %s", order_id, e)
@@ -437,7 +468,18 @@ class MoomooClient:
         )
         if ret != RET_OK:
             raise RuntimeError(f"place_order failed for {symbol}: {data}")
-        order_id = str(data.iloc[0]["order_id"])
+        order_id = str(data.iloc[0]["order_id"]).strip()
+        # 2026-07-09: an order_id of 0/empty means the broker never actually
+        # accepted the order (the OpenD-rs gateway returned a need_op_confirm
+        # stub with order_id=0, then silently purged it — every "buy" became a
+        # phantom entry that reconcile later booked as a fake MANUAL_SELL).
+        # Treat it as a placement failure so no position is ever recorded.
+        if order_id in ("", "0", "None", "nan"):
+            raise RuntimeError(
+                f"place_order for {symbol} returned invalid order_id={order_id!r} "
+                "— order not accepted by broker/gateway, treating as failed"
+            )
+        _note_gated_op_ok()
         log.info("Placed %s %s qty=%s price=%.2f order_id=%s", side, symbol, qty, price, order_id)
         return order_id
 
@@ -455,7 +497,14 @@ class MoomooClient:
         )
         if ret != RET_OK:
             raise RuntimeError(f"stop-loss failed for {symbol}: {data}")
-        return str(data.iloc[0]["order_id"])
+        order_id = str(data.iloc[0]["order_id"]).strip()
+        if order_id in ("", "0", "None", "nan"):
+            raise RuntimeError(
+                f"stop-loss for {symbol} returned invalid order_id={order_id!r} "
+                "— order not accepted by broker/gateway, treating as failed"
+            )
+        _note_gated_op_ok()
+        return order_id
 
     # ---------- helpers ----------
     @staticmethod

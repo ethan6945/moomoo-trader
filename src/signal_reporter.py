@@ -44,7 +44,7 @@ import pandas as pd
 from moomoo import KLType
 
 from .config import settings
-from . import ai, news_fetcher, notifier  # P0-5: finbert_sentiment removed — noise > signal
+from . import ai, news_fetcher, notifier
 from .moomoo_client import client as _moomoo_client
 
 
@@ -639,24 +639,7 @@ def _ai_num(ai: dict, key: str, default: float = 0.0) -> float:
     return float(v) if v is not None else default
 
 
-_FINBERT_LABEL_EMOJI = {"positive": "🟢", "neutral": "⚪️", "negative": "🔴"}
-
-
-def _finbert_line(sentiment: Optional[dict]) -> str:
-    """One-liner for the premarket card. Empty string if FinBERT unavailable."""
-    if not sentiment or sentiment.get("n_headlines", 0) == 0:
-        return ""
-    emoji = _FINBERT_LABEL_EMOJI.get(sentiment["label"], "⚪️")
-    n = sentiment["n_headlines"]
-    return (
-        f"🧪 FinBERT {emoji} *{sentiment['label']}* "
-        f"net={sentiment['score_net']:+.2f}  "
-        f"(P{sentiment['n_pos']}/N{sentiment['n_neu']}/M{sentiment['n_neg']} of {n})\n"
-    )
-
-
 def _build_premarket_card(tech: dict, ai: dict,
-                          sentiment: Optional[dict] = None,
                           context_block: str = "") -> str:
     score  = int(ai.get("score") or 5)
     act_e  = ACTION_EMOJI.get(ai.get("action", "观望"), "🟡")
@@ -669,7 +652,6 @@ def _build_premarket_card(tech: dict, ai: dict,
     # last_price is stale and we fall back to pre_price.
     src    = tech.get("price_src", "last")
     src_tag = " 🕓盘前" if src == "pre" else ""
-    finbert_line = _finbert_line(sentiment)
     # Context block is optional — empty string when nothing was fetchable.
     context_section = f"\n{context_block}\n" if context_block else ""
 
@@ -696,7 +678,6 @@ def _build_premarket_card(tech: dict, ai: dict,
         f"   支撑${tech['sr']['support']} · 压力${tech['sr']['resistance']} · ATR={tech['atr']}\n"
         f"   ⚡ {' · '.join(tech['alerts']) if tech['alerts'] else '无警报'}\n"
         f"\n"
-        f"{finbert_line}"
         f"📰 {ai.get('news_impact') or '-'}\n"
         f"🔮 {ai.get('catalyst') or '-'}\n"
         f"💡 {ai.get('summary') or '-'}\n"
@@ -1131,10 +1112,6 @@ def run_premarket() -> None:
     results    = []
     df_d_cache: dict = {}
 
-    finbert_on = False   # P0-5: FinBERT removed — AI validator handles sentiment
-    if finbert_on:
-        log.info("signal_reporter premarket: FinBERT enabled — will score news headlines")
-
     with _moomoo_client() as c:
         # Fetch macro context ONCE per premarket — SPY snapshot + VIX. These
         # are shared across every ticker card so each one shows the same
@@ -1154,13 +1131,6 @@ def run_premarket() -> None:
                 log.warning("signal_reporter: skip %s (data insufficient)", sym)
                 continue
             ticker_news = news_fetcher.fetch_ticker_news(sym)
-            # FinBERT — score the same headlines Gemini sees. Optional layer:
-            # if the import isn't available we silently skip (UI just omits the
-            # line). FinBERT is offline-only after first model download.
-            sentiment = None
-            if finbert_on and ticker_news:
-                headlines = [n.get("title", "") for n in ticker_news[:8]]
-                sentiment = None  # P0-5: FinBERT removed
             # Macro & per-ticker context. yfinance fetches (pre-market, insider)
             # add ~1-2s/ticker; acceptable since premarket runs once/day.
             sector_data = _sector_snap(c, sym)
@@ -1184,7 +1154,7 @@ def run_premarket() -> None:
             )
             ai = _gemini_signal(tech, ticker_news, macro_news)
             results.append({
-                "tech": tech, "ai": ai, "sentiment": sentiment,
+                "tech": tech, "ai": ai,
                 "context_block": context_block,
             })
             time.sleep(0.3)
@@ -1196,7 +1166,7 @@ def run_premarket() -> None:
     results.sort(key=lambda r: -int(r["ai"].get("score", 5)))
     for r in results:
         notifier.send(_build_premarket_card(
-            r["tech"], r["ai"], r.get("sentiment"),
+            r["tech"], r["ai"],
             context_block=r.get("context_block", "")))
     notifier.send(_build_premarket_summary(results))
     log.info("signal_reporter premarket done — %d cards", len(results))

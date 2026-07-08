@@ -148,9 +148,7 @@ def _save_open_trades(trades: dict) -> None:
         log.warning("legacy JSON mirror write failed: %s", e)
 
 
-def open_position(client: MoomooClient, signal: Signal, qty: int,
-                  ml_proba: float | None = None,
-                  ml_features: list[float] | None = None) -> dict | None:
+def open_position(client: MoomooClient, signal: Signal, qty: int) -> dict | None:
     """Buy at limit. REAL → attach OCO bracket (STOP + TP); SIMULATE → soft-track.
 
     Returns None when the entry is SKIPPED (market ran past the signal price —
@@ -161,15 +159,13 @@ def open_position(client: MoomooClient, signal: Signal, qty: int,
     entry, raise stop/TP to the new signal's levels, and re-place OCO so the
     bracket protects the full combined qty.
 
-    Captures `ml_proba` and `strategy` at entry so they can be matched against
-    actual outcome (R-multiple, MFE/MAE) at close-time → enables calibration."""
+    Captures `strategy` at entry so it can be matched against actual outcome
+    (R-multiple, MFE/MAE) at close-time → enables calibration."""
     with _TRADES_LOCK:
-        return _open_position_locked(client, signal, qty, ml_proba, ml_features)
+        return _open_position_locked(client, signal, qty)
 
 
-def _open_position_locked(client: MoomooClient, signal: Signal, qty: int,
-                          ml_proba: float | None = None,
-                          ml_features: list[float] | None = None) -> dict | None:
+def _open_position_locked(client: MoomooClient, signal: Signal, qty: int) -> dict | None:
     trades = _load_open_trades()
     existing = trades.get(signal.symbol)
     is_stack = existing is not None and int(existing.get("qty", 0)) > 0
@@ -286,14 +282,11 @@ def _open_position_locked(client: MoomooClient, signal: Signal, qty: int,
             # Water-marks start at the entry price — updated each manage tick.
             "high_water": limit_px,
             "low_water": limit_px,
-            "ml_proba_entry": ml_proba,
             "strategy": getattr(signal, "strategy", "trend"),
             # Pattern strategy: remember which chart pattern triggered the entry
             # so the dashboard/GUI can badge it (None for the other strategies).
             "pattern": (getattr(signal, "meta", {}) or {}).get("pattern_type"),
             "stacks": 1,
-            # P1-2: persist ML feature vector for retraining on close
-            "ml_features": ml_features,
         }
 
     trades[signal.symbol] = trade
@@ -326,8 +319,6 @@ def _close_and_log(symbol: str, trade: dict, qty: int, exit_price: float, reason
         opened_at=trade.get("opened_at", ""),
         mfe_pct=mfe_pct,
         mae_pct=mae_pct,
-        ml_proba_entry=trade.get("ml_proba_entry"),
-        ml_features=trade.get("ml_features"),
         strategy=trade.get("strategy", "trend"),
         initial_risk=trade.get("init_risk_per_share"),
     )

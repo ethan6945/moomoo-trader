@@ -120,11 +120,28 @@
   .ring{position:absolute;right:11px;top:50%;transform:translateY(-50%);width:36px;height:36px;border-radius:50%}
   .ring::before{content:"";position:absolute;inset:4px;border-radius:50%;background:var(--card-solid)}
   #recentTbl td{padding:5px 6px;font-size:12px}
-  #posTbl th:nth-child(1){width:9%}
-  #posTbl th:nth-child(2){width:6%}
-  #posTbl th:nth-child(7){width:12%}
-  #posTbl th:nth-child(8){width:17%}
-  #posTbl th:nth-child(9){width:16%}
+  /* positions now live in the narrow bottom-right cell: 入场/止损/止盈 columns are
+     hidden — the range bar encodes all three (▏entry · ● last, hover = SL/TP $) */
+  #posTbl th:nth-child(3),#posTbl td:nth-child(3),
+  #posTbl th:nth-child(5),#posTbl td:nth-child(5),
+  #posTbl th:nth-child(6),#posTbl td:nth-child(6){display:none}
+  #posTbl th:nth-child(1){width:14%}
+  #posTbl th:nth-child(2){width:9%}
+  #posTbl th:nth-child(4){width:14%}
+  #posTbl th:nth-child(7){width:20%}
+  #posTbl th:nth-child(8){width:22%}
+  #posTbl th:nth-child(9){width:21%}
+
+  /* ── sector overview (dashboard) — heatmap tiles filling the big cell ── */
+  .p-sec{--accent:var(--purple)}
+  .sec-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;grid-auto-rows:minmax(54px,1fr);align-content:stretch}
+  .sectile{border:1px solid;border-radius:11px;padding:7px 11px;display:flex;flex-direction:column;justify-content:space-between;min-width:0}
+  .sectile .st{display:flex;align-items:baseline;gap:6px;min-width:0;font-size:12px}
+  .sectile .st .sn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sectile .st i{font-style:normal;color:var(--muted);font-size:10px;flex:0 0 auto}
+  .sectile .sb{display:flex;align-items:baseline;justify-content:space-between;gap:6px;margin-top:2px}
+  .sectile .sb b{font-size:15.5px;font-weight:800;color:var(--strong);font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .sectile .sb .sp{color:var(--muted);font-size:10.5px;font-variant-numeric:tabular-nums}
 
   /* ── equity chart ── */
   .eqwrap{position:relative;flex:1 1 auto;min-height:70px}
@@ -171,7 +188,9 @@
     /* release the viewport-height lock so panels stack full-size and the page scrolls */
     #tab-dash{min-height:auto!important}
     .dash-lower{display:flex;flex-direction:column;min-height:auto}
+    .dash-lower .cell:nth-child(4){order:-1}  /* phone: positions back on top */
     .cell{min-height:auto}
+    .sec-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
     .panel.grow{min-height:200px}
     .log{max-height:220px}
     .eqwrap{min-height:150px}
@@ -232,11 +251,12 @@
     <div class="statbar"><div class="statline" id="statline"></div></div>
 
     <div class="dash-lower">
-      <!-- A: positions (top-left, enlarged — fills the cell now that equity moved out) -->
+      <!-- A: live US sector overview (top-left, the big cell — heatmap tiles) -->
       <div class="cell">
-        <div class="panel p-pos grow"><h3 data-i18n="positions">持仓</h3><div id="posWrap" class="scroll"><table id="posTbl"><thead><tr>
-          <th data-i18n="c_sym">代码</th><th data-i18n="c_qty">数量</th><th data-i18n="c_entry">入场</th><th data-i18n="c_last">现价</th><th data-i18n="c_stop">止损</th><th data-i18n="c_tp">止盈</th><th data-i18n="c_range">区间</th><th data-i18n="c_strat">策略</th><th>P&amp;L</th></tr></thead><tbody></tbody></table></div>
-          <div class="empty hidden" id="posEmpty" data-i18n="no_pos">🌙 当前无持仓</div></div>
+        <div class="panel p-sec grow"><h3><span data-i18n="sectors">美国板块总览 · Live</span>
+            <span id="secAsof" style="margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400">—</span></h3>
+          <div id="secIdx" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;flex:0 0 auto"></div>
+          <div id="secGrid" class="scroll sec-tiles"></div></div>
       </div>
       <!-- B: trade record (top-right) -->
       <div class="cell">
@@ -249,16 +269,22 @@
       <div class="cell">
         <div class="panel p-act grow"><h3 data-i18n="activity">近期动态</h3><div class="log" id="log"></div></div>
       </div>
-      <!-- D: equity curve (bottom-right, moved here from A) -->
+      <!-- D: positions (bottom-right; swapped with sectors — 入场/SL/TP fold into the range bar) -->
       <div class="cell">
-        <div class="panel p-eq grow"><h3 data-i18n="equity">净值曲线 · 累计已实现</h3>
-          <div class="eqwrap"><canvas id="eqDash"></canvas><div id="eqTip" class="eqtip hidden"></div></div></div>
+        <div class="panel p-pos grow"><h3 data-i18n="positions">持仓</h3><div id="posWrap" class="scroll"><table id="posTbl"><thead><tr>
+          <th data-i18n="c_sym">代码</th><th data-i18n="c_qty">数量</th><th data-i18n="c_entry">入场</th><th data-i18n="c_last">现价</th><th data-i18n="c_stop">止损</th><th data-i18n="c_tp">止盈</th><th data-i18n="c_range">区间</th><th data-i18n="c_strat">策略</th><th>P&amp;L</th></tr></thead><tbody></tbody></table></div>
+          <div class="empty hidden" id="posEmpty" data-i18n="no_pos">🌙 当前无持仓</div></div>
       </div>
     </div>
   </div>
 
   <!-- HISTORY -->
   <div id="tab-hist" class="hidden" style="display:flex;flex-direction:column;flex:1 1 auto;min-height:0">
+    <!-- cumulative realized equity curve (moved here from the dashboard) -->
+    <div class="panel p-eq" style="flex:0 0 auto;margin-bottom:12px">
+      <h3 data-i18n="equity">净值曲线 · 累计已实现</h3>
+      <div class="eqwrap" style="height:150px;flex:none"><canvas id="eqDash"></canvas><div id="eqTip" class="eqtip hidden"></div></div>
+    </div>
     <div class="panel p-eq" style="flex:0 0 auto">
       <h3 style="justify-content:space-between"><span>净值曲线 · <span id="histMonthLbl">本月</span></span>
         <select id="histMonth" style="background:var(--card2);border:1px solid var(--border);color:var(--text);padding:4px 9px;border-radius:8px;font-size:12px"></select></h3>
@@ -410,7 +436,7 @@ function setTab(t){
   CURTAB=t;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
   ['dash','hist','sig','bt'].forEach(x=>$('#tab-'+x).classList.toggle('hidden',x!==t));
-  if(t==='hist')loadHistory(); if(t==='sig')loadSignal(); if(t==='bt')loadBt();
+  if(t==='dash')refreshSectors(); if(t==='hist')loadHistory(); if(t==='sig')loadSignal(); if(t==='bt')loadBt();
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
 
@@ -538,6 +564,33 @@ async function refreshLog(){
   }).join('');
   if(atBottom)box.scrollTop=box.scrollHeight;
 }
+// ── live US sector overview (SPDR ETFs via /api/sectors — server caches 60s) ──
+let SECTORS=null;
+async function refreshSectors(){
+  let d; try{d=await api('/api/sectors');}catch(e){return;}
+  if(d&&d.sectors&&d.sectors.length){SECTORS=d;renderSectors();}
+}
+function renderSectors(){
+  if(!SECTORS)return;
+  const zh=LANG==='zh';
+  const pctTxt=v=>((v>=0?'+':'')+Number(v).toFixed(2)+'%');
+  const sess={open:zh?'🟢 盘中':'🟢 live',premarket:zh?'🌅 盘前':'🌅 pre-mkt',afterhours:zh?'🌙 盘后':'🌙 after-hrs',
+              weekend:zh?'⚪ 周末':'⚪ weekend',holiday:zh?'⚪ 休市':'⚪ holiday'}[SECTORS.session]||'';
+  $('#secAsof').textContent=sess+(SECTORS.asof?` · ${SECTORS.asof.slice(5)}`:'')+(SECTORS.stale?(zh?' · 延迟':' · stale'):'');
+  $('#secIdx').innerHTML=SECTORS.indices.map(x=>
+    `<span class="pill" title="${x.sym} $${x.price}">${zh?x.zh:x.en}<b class="${cls(x.pct)}" style="margin-left:5px">${pctTxt(x.pct)}</b></span>`).join('');
+  // heatmap tiles sorted strongest→weakest; tint intensity shares one scale
+  const rows=SECTORS.sectors.slice().sort((a,b)=>b.pct-a.pct);
+  const mx=Math.max(0.5,...rows.map(r=>Math.abs(r.pct)));
+  $('#secGrid').innerHTML=rows.map(r=>{
+    const col=r.pct>=0?'63,185,80':'248,81,73';
+    const a=(0.09+0.28*Math.min(1,Math.abs(r.pct)/mx)).toFixed(2);
+    return `<div class="sectile" style="background:rgba(${col},${a});border-color:rgba(${col},.38)" title="${r.sym} $${r.price} · ${pctTxt(r.pct)}">`+
+      `<div class="st"><span class="sn">${zh?r.zh:r.en}</span><i>${r.sym}</i></div>`+
+      `<div class="sb"><b>${pctTxt(r.pct)}</b><span class="sp">$${r.price}</span></div></div>`;
+  }).join('');
+}
+
 // Pending approvals are no longer a permanent panel — checked once when you open
 // the web UI; if anything is waiting, it pops up in a modal. Approving/rejecting
 // re-renders the list and auto-closes when nothing is left.
@@ -776,14 +829,14 @@ $('#btnStop').onclick=async()=>{if(!confirm('Stop the trading bot?'))return;cons
 
 // ── i18n ──
 const I18N={
-  zh:{t_dash:'仪表盘',t_hist:'历史',t_sig:'信号',t_bt:'回测',positions:'持仓',equity:'净值曲线 · 累计已实现',
+  zh:{t_dash:'仪表盘',t_hist:'历史',t_sig:'信号',t_bt:'回测',positions:'持仓',equity:'净值曲线 · 累计已实现',sectors:'美国板块总览 · Live',
       activity:'近期动态',record:'交易统计',approvals:'待批准建议',deployed:'已部署 / 预算',today:'今日盈亏 · 已实现',total:'总盈亏 · 累计已实现',
       unreal:'浮动盈亏 · 持仓',pos_unit:'笔持仓',
       trades:'总交易笔数',winrate:'胜率',pf:'盈利因子',net:'净盈亏',cash:'现金',openrisk:'敞口风险 / 上限',lastscan:'上次扫描',
       c_sym:'代码',c_qty:'数量',c_entry:'入场',c_last:'现价',c_stop:'止损',c_tp:'止盈',c_range:'区间',c_strat:'策略',
       no_pos:'🌙 当前无持仓',notrades:'暂无平仓记录',noappr:'暂无待批准建议',appr_note:'✅ 批准后约 5 分钟内自动执行(后台每 5 分钟同步一次;盘中扫描也会触发)',
       sig_desc:'独立信号 watchlist — 🌅盘前简报@08:30 · 🔄开盘1小时复盘@10:30 · 🏁收盘对账@16:10 (ET)。',sig_stopped:'已停止',sig_brief:'盘前简报',sig_review:'盘中复盘',sig_close:'收盘对账',sig_wl:'信号 Watchlist',sig_add:'添加',sig_save:'保存',sig_reload:'刷新日志'},
-  en:{t_dash:'Dashboard',t_hist:'History',t_sig:'Signal',t_bt:'Backtest',positions:'Open Positions',equity:'Equity · cumulative realized',
+  en:{t_dash:'Dashboard',t_hist:'History',t_sig:'Signal',t_bt:'Backtest',positions:'Open Positions',equity:'Equity · cumulative realized',sectors:'US Sectors · Live',
       activity:'Recent Activity',record:'Trade Record',approvals:'Pending Approvals',deployed:'Deployed / Budget',today:"Today P&L · realized",total:'Total P&L · cum. realized',
       unreal:'Unrealized P&L · open',pos_unit:'position(s)',
       trades:'Total Trades',winrate:'Win rate',pf:'Profit factor',net:'Net P&L',cash:'Cash',openrisk:'Open risk / cap',lastscan:'Last scan',
@@ -792,7 +845,7 @@ const I18N={
       sig_desc:'Independent signal watchlist — 🌅Premarket brief@08:30 · 🔄Open+1h review@10:30 · 🏁Close recap@16:10 (ET).',sig_stopped:'Stopped',sig_brief:'Premarket brief',sig_review:'Open+1h review',sig_close:'Close recap',sig_wl:'Signal Watchlist',sig_add:'Add',sig_save:'Save',sig_reload:'Reload log'}
 };
 let LANG=localStorage.getItem('lang')||'zh';
-function applyLang(l){LANG=l;document.querySelectorAll('[data-i18n]').forEach(e=>{const m=I18N[l]&&I18N[l][e.dataset.i18n];if(m)e.textContent=m;});localStorage.setItem('lang',l);refresh();}
+function applyLang(l){LANG=l;document.querySelectorAll('[data-i18n]').forEach(e=>{const m=I18N[l]&&I18N[l][e.dataset.i18n];if(m)e.textContent=m;});localStorage.setItem('lang',l);refresh();renderSectors();}
 function applyTheme(t){document.body.classList.toggle('light',t==='light');localStorage.setItem('theme',t);drawEqDash();}
 
 // ── settings ──
@@ -978,6 +1031,7 @@ async function loadHistory(){
   sel.value=months[0]||'all';
   sel.onchange=renderHist;
   renderHist();
+  drawEqDash();   // cumulative curve lives here now — size it once the tab is visible
 }
 function renderHist(){
   const m=$('#histMonth').value||'all';
@@ -1060,6 +1114,7 @@ $('#btnBt').onclick=async()=>{await api('/api/backtest',{method:'POST',headers:{
   document.body.classList.toggle('light',t==='light');
   document.querySelectorAll('[data-i18n]').forEach(e=>{const m=I18N[LANG]&&I18N[LANG][e.dataset.i18n];if(m)e.textContent=m;});})();
 refresh();setInterval(refresh,4000);
+refreshSectors();setInterval(()=>{if(CURTAB==='dash')refreshSectors();},60000);   // 板块总览每分钟刷新（服务端也缓存 60s）
 checkApprovals();   // one-time pending-approvals popup on page open
 // 信号日志在 Signal 标签打开时每 4s 自动 tail 跟随最新（终端 tail -f 体验）
 setInterval(()=>{if(CURTAB==='sig')refreshSigLog(false);},4000);
