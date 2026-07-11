@@ -73,6 +73,24 @@ def skip_msg(symbol: str, reason: str) -> str:
     return t("tg_skip", symbol=symbol, reason=reason)
 
 
+def exec_fail_msg(symbols: list[str]) -> str:
+    return t("tg_exec_fail", symbols=", ".join(symbols))
+
+
+def clock_check_msg(st: dict, session: str) -> str:
+    """Daily pre-open time check. `st` is clock.status() taken right after a
+    force_refresh; source containing 'system' means every network time source
+    failed and the drift figure is meaningless. Returns "" when nothing should
+    push (owner request 2026-07-11: OK / drift-corrected results are log-only;
+    only unverifiable time or a holiday warrants a Telegram)."""
+    if session == "holiday":
+        return t("tg_clock_holiday")
+    source = st.get("source") or "system"
+    if "system" in source:
+        return t("tg_clock_fail")
+    return ""
+
+
 def trade_action_msg(action: dict) -> str:
     kind = action.get("type")
     if kind == "tp_half":

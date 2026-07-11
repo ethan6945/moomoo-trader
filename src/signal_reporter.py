@@ -1,16 +1,23 @@
 """
-Signal Reporter — 短线信号推送模块
+Signal Reporter — 盯盘信号推送模块
 ====================================
 
-两种推送模式:
+设计对齐市面盯盘工具（TradingView Alerts / 券商到价提醒）：
+定时简报给"全景"，盘中监控给"异动"——没有异动就完全静默。
 
-  run_premarket()   08:30 ET，盘前一次
-                    15-min K线 + 完整技术指标 + Gemini AI
-                    每只股票一张完整信号卡片
+每个交易日的推送节奏:
 
-  run_intraday()    09:30 / 10:00 / 10:30 / 11:00 / 11:30 ET（每 30 min）
-                    5-min K线 + 快速技术指标，无 AI（频率太高会超配额）
-                    全 watchlist 合并成一条压缩消息，快速扫读
+  run_daily_brief("premarket")   08:30 ET  盘前简报（AI+搜索+支撑阶梯+TP）
+  run_monitor()                  09:30-16:00 每 5 分钟盯盘扫描（事件驱动）
+                                 突破/放量/VWAP翻转/RSI极值/评分转向 → 即时推送
+                                 每类事件带冷却期，同一信号不重复轰炸
+  run_daily_brief("open1h")      10:30 ET  开盘1小时复盘（修正盘前预判）
+  run_daily_brief("close")       16:10 ET  收盘对账（预测 vs 实际 + 归因）
+
+旧模式（保留，手动可用）:
+
+  run_premarket()   盘前完整信号卡片（15-min K线 + 技术指标 + AI 评分）
+  run_intraday()    全 watchlist 合并一条压缩快讯（纯技术，无 AI）
 
 Watchlist 管理（独立于交易 watchlist）:
   add_ticker(sym)      加入信号 watchlist
@@ -736,6 +743,27 @@ def _build_intraday_msg(lines: list[str], ts: str) -> str:
 
 # ─── FETCH HELPERS ────────────────────────────────────────────────────────────
 
+def _today_session_hl(df: pd.DataFrame) -> dict:
+    """今天已完成 bars 的最高/最低（排除最后一根可能未收完的 bar）。
+
+    盯盘监控用它判定「突破日内高点 / 跌破日内低点」。要求今天至少 4 根已完成
+    bar 才给出高低点——开盘头几分钟只有一两根 bar 时，价格越过它们太容易，
+    会造成假突破轰炸。
+    """
+    try:
+        if "time_key" not in df.columns:
+            return {}
+        today = _ny_now().strftime("%Y-%m-%d")
+        day = df[df["time_key"].astype(str).str.startswith(today)]
+        if len(day) < 5:
+            return {}
+        prior = day.iloc[:-1]
+        return {"high": round(float(prior["high"].max()), 2),
+                "low":  round(float(prior["low"].min()), 2)}
+    except Exception:
+        return {}
+
+
 def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
                 df_daily_cache: dict) -> Optional[dict]:
     """Fetch klines and compute all technical indicators. Returns tech dict or None."""
@@ -824,6 +852,7 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
         "mom":        mom_v,
         "sr":         sr_v,
         "isr":        isr_v,   # intraday swing S/R (tight) — used by the brief card
+        "day_hl":     _today_session_hl(df),  # 今日已完成 bars 高低 — 盯盘突破判定
         "buy_score":  buy_s,
         "sell_score": sell_s,
         "alerts":     alerts,
@@ -1208,6 +1237,258 @@ def run_intraday() -> None:
     log.info("signal_reporter intraday done — %d tickers", len(lines))
 
 
+# ─── 盘中盯盘监控（事件驱动，只在异动时提醒）──────────────────────────────────
+# 概念对齐市面盯盘工具：scheduler 每 5 分钟扫一遍 watchlist → 检测事件（突破/
+# 放量/VWAP 翻转/RSI 极值/技术面转向）→ 有事件才推 Telegram，无事件完全静默。
+# 每类事件独立冷却期，冷却内同类信号不重复。产出两个文件供 Web 盯盘面板读取:
+#   data/signal_monitor_state.json  每支股票最新 tick 快照（价格/RSI/量比/评分…）
+#   data/signal_alerts.json         警报流（web 全量展示；Telegram 只推 push 级）
+
+_MONITOR_STATE_FILE = settings.root / "data" / "signal_monitor_state.json"
+_ALERTS_FILE        = settings.root / "data" / "signal_alerts.json"
+_ALERTS_KEEP        = 400          # 警报流上限 — 防止文件无限增长
+MONITOR_INTERVAL_MIN = 5
+
+# type → (emoji, 冷却分钟, 默认级别)   push=推 Telegram / info=仅 web 警报流+日志
+_EVENT_SPEC: dict[str, tuple[str, int, str]] = {
+    "high_break": ("🚀", 45, "push"),
+    "low_break":  ("🧨", 45, "push"),
+    "vol_spike":  ("⚡", 45, "push"),
+    "vwap_up":    ("📈", 30, "info"),   # 放量确认（≥1.3x）时升级为 push
+    "vwap_down":  ("📉", 30, "info"),
+    "rsi_hot":    ("🔥", 60, "push"),
+    "rsi_cold":   ("🧊", 60, "push"),
+    "score_bull": ("🟢", 60, "push"),
+    "score_bear": ("🔴", 60, "push"),
+    "macd_up":    ("〽️", 45, "info"),
+    "macd_down":  ("〰️", 45, "info"),
+    "bb_break":   ("🎯", 45, "info"),
+}
+
+
+def _load_monitor_state() -> dict:
+    """读取盯盘状态；跨交易日自动重置（日内高低点/冷却/计数都只属于当天）。"""
+    today = _ny_now().strftime("%Y-%m-%d")
+    try:
+        st = json.loads(_MONITOR_STATE_FILE.read_text())
+        if st.get("date") == today and isinstance(st.get("symbols"), dict):
+            return st
+    except Exception:
+        pass
+    return {"date": today, "symbols": {}}
+
+
+def _save_monitor_state(st: dict) -> None:
+    _MONITOR_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _MONITOR_STATE_FILE.write_text(json.dumps(st, ensure_ascii=False))
+
+
+def _append_alerts(alerts: list[dict]) -> None:
+    try:
+        feed = json.loads(_ALERTS_FILE.read_text())
+        if not isinstance(feed, list):
+            feed = []
+    except Exception:
+        feed = []
+    feed.extend(alerts)
+    _ALERTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _ALERTS_FILE.write_text(json.dumps(feed[-_ALERTS_KEEP:], ensure_ascii=False))
+
+
+def _cooled_down(prev: dict, etype: str, now) -> bool:
+    last = (prev.get("alert_ts") or {}).get(etype)
+    if not last:
+        return True
+    try:
+        from datetime import datetime
+        return (now - datetime.fromisoformat(last)).total_seconds() \
+            >= _EVENT_SPEC[etype][1] * 60
+    except Exception:
+        return True
+
+
+def _detect_events(sym: str, tech: dict, prev: dict, now) -> list[dict]:
+    """对比当前 tick 与上一 tick，返回触发的事件列表（已按冷却期过滤）。
+
+    噪音控制三原则:
+      • 区域进入型事件（RSI 极值/评分转向/VWAP 翻转）需要上一 tick 做对比——
+        当天第一次扫描只建立基线不触发，避免开盘一上来就刷屏。
+      • 每类事件独立冷却（30-60 min），冷却期内同类不重复。
+      • info 级只进 web 警报流；push 级才发 Telegram。
+    """
+    events: list[dict] = []
+    price  = tech["price"]
+    chg    = tech["chg1"]
+    rsi    = tech["rsi"]
+    mom    = tech["mom"]
+    vol_r  = tech["vol"]["ratio"]
+    vwap   = tech["vwap"]
+    buy_s, sell_s = tech["buy_score"], tech["sell_score"]
+    net    = buy_s - sell_s
+    vwap_pct = (price / vwap - 1) * 100 if vwap else 0.0
+    detail = (f"RSI {rsi:.0f} · Vol {vol_r:.1f}x · VWAP{vwap_pct:+.1f}% · "
+              f"买{buy_s}/卖{sell_s}")
+
+    def fire(etype: str, title: str, level: str | None = None) -> None:
+        if not _cooled_down(prev, etype, now):
+            return
+        emoji, _cd, default_level = _EVENT_SPEC[etype]
+        events.append({
+            "ts_iso": now.isoformat(timespec="seconds"),
+            "sym": sym, "type": etype, "level": level or default_level,
+            "emoji": emoji, "title": title, "detail": detail,
+            "price": price, "chg": chg,
+        })
+
+    # ① 日内高/低点突破（day_hl 要求当天 ≥4 根完成 bar，见 _today_session_hl）
+    hl = tech.get("day_hl") or {}
+    if hl.get("high") and price > hl["high"]:
+        fire("high_break", f"突破日内高点 ${hl['high']:.2f}")
+    elif hl.get("low") and price < hl["low"]:
+        fire("low_break", f"跌破日内低点 ${hl['low']:.2f}")
+
+    # ② 放量异动 — 量比 ≥2.5 且带方向（30min 动能 ≥0.5%）
+    if vol_r >= 2.5 and abs(mom) >= 0.5:
+        fire("vol_spike",
+             f"放量{'拉升' if mom > 0 else '杀跌'} {vol_r:.1f}x（30min {mom:+.1f}%）")
+
+    # ③ VWAP 翻转（±0.1% 缓冲防贴线抖动；放量 ≥1.3x 时升级为 push）
+    prev_above = prev.get("above_vwap")
+    if prev_above is not None and vwap:
+        if price > vwap * 1.001 and prev_above is False:
+            fire("vwap_up", f"上穿 VWAP ${vwap:.2f}",
+                 level="push" if vol_r >= 1.3 else "info")
+        elif price < vwap * 0.999 and prev_above is True:
+            fire("vwap_down", f"跌破 VWAP ${vwap:.2f}",
+                 level="push" if vol_r >= 1.3 else "info")
+
+    # ④ RSI(7) 极值 — 进入极值区那一刻提醒一次
+    prev_rsi = prev.get("rsi")
+    if prev_rsi is not None:
+        if rsi >= 82 and prev_rsi < 82:
+            fire("rsi_hot", f"RSI(7)={rsi:.0f} 严重超买 — 追高谨慎")
+        elif rsi <= 18 and prev_rsi > 18:
+            fire("rsi_cold", f"RSI(7)={rsi:.0f} 严重超卖 — 关注反弹")
+
+    # ⑤ 技术面评分转向（净分跨过 ±5 = 进入强烈买/卖档位）
+    prev_net = prev.get("net")
+    if prev_net is not None:
+        why = f" · {' · '.join(tech['alerts'][:2])}" if tech["alerts"] else ""
+        if net >= 5 and prev_net < 5:
+            fire("score_bull", f"技术面转强 买{buy_s}/卖{sell_s}{why}")
+        elif net <= -5 and prev_net > -5:
+            fire("score_bear", f"技术面转弱 买{buy_s}/卖{sell_s}{why}")
+
+    # ⑥ 次级事件 — 只进 web 警报流，不打扰 Telegram
+    if tech["macd"]["cross_up"]:
+        fire("macd_up", "MACD(5/13/5) 金叉")
+    elif tech["macd"]["cross_down"]:
+        fire("macd_down", "MACD(5/13/5) 死叉")
+    if tech["boll"]["breakout"] == "up":
+        fire("bb_break", "突破布林带上轨")
+    elif tech["boll"]["breakout"] == "down":
+        fire("bb_break", "跌破布林带下轨")
+
+    return events
+
+
+def _tick_snapshot(tech: dict, prev: dict, events: list[dict],
+                   now_iso: str) -> dict:
+    """本 tick 的持久化快照 — 既是下一 tick 的对比基线，也是 Web 盯盘磁贴的数据源。"""
+    alert_ts = dict(prev.get("alert_ts") or {})
+    for e in events:
+        alert_ts[e["type"]] = now_iso
+    price, vwap = tech["price"], tech["vwap"]
+    above = prev.get("above_vwap")
+    if vwap:
+        if price > vwap * 1.001:
+            above = True
+        elif price < vwap * 0.999:
+            above = False
+    hl = tech.get("day_hl") or {}
+    pushes = [e for e in events if e["level"] == "push"]
+    last = pushes[-1] if pushes else (events[-1] if events else None)
+    return {
+        "ts": now_iso,
+        "price": price, "chg": tech["chg1"], "rsi": tech["rsi"],
+        "vol": tech["vol"]["ratio"], "vwap": vwap, "above_vwap": above,
+        "buy": tech["buy_score"], "sell": tech["sell_score"],
+        "net": tech["buy_score"] - tech["sell_score"], "mom": tech["mom"],
+        "day_high": hl.get("high"), "day_low": hl.get("low"),
+        "alerts_today": int(prev.get("alerts_today") or 0) + len(events),
+        "last_alert": (f"{last['emoji']} {last['title']}" if last
+                       else prev.get("last_alert")),
+        "alert_ts": alert_ts,
+    }
+
+
+def _build_alert_msg(alerts: list[dict], ts: str) -> str:
+    """盯盘警报卡 — 一个 tick 内所有 push 级事件合并成一条消息。
+
+    按股票分组：同一支股票多个事件共用一行价格头 + 一行指标尾，
+    避免"5 个事件重复 5 遍价格"的刷屏感。
+    """
+    by_sym: dict[str, list[dict]] = {}
+    for a in alerts:
+        by_sym.setdefault(a["sym"], []).append(a)
+    head = f"🔔 *盯盘警报* | {ts}"
+    if len(alerts) > 1:
+        head += f" · {len(alerts)} 条"
+    lines = [head, "━━━━━━━━━━━━━━━━━━━━━━"]
+    for sym, evs in by_sym.items():
+        first = evs[0]
+        arrow = "📈" if (first.get("chg") or 0) >= 0 else "📉"
+        lines.append(f"*{sym}* ${first['price']:.2f} {arrow}{first['chg']:+.2f}%")
+        for e in evs:
+            lines.append(f"  {e['emoji']} {e['title']}")
+        lines.append(f"  `{first['detail']}`")
+    return "\n".join(lines)
+
+
+def run_monitor() -> None:
+    """盯盘扫描一个 tick。scheduler 盘中每 5 分钟调用；Web「立即扫描」也走这里。
+
+    无论有没有事件都会刷新 monitor state（Web 磁贴数据）；
+    只有触发 push 级事件时才发 Telegram —— 静默是常态，推送是异动。
+    """
+    watchlist = load_watchlist()
+    if not watchlist:
+        log.info("monitor: watchlist empty")
+        return
+    now = _ny_now()
+    now_iso = now.isoformat(timespec="seconds")
+    ts = now.strftime("%H:%M ET")
+    state = _load_monitor_state()
+    symbols = state.setdefault("symbols", {})
+    fired: list[dict] = []
+    df_d_cache: dict = {}
+    with _moomoo_client() as c:
+        for sym in watchlist:
+            try:
+                tech = _fetch_tech(c, sym, KLType.K_5M, 80, df_d_cache)
+            except Exception as e:
+                log.warning("monitor: %s failed: %s", sym, e)
+                continue
+            if not tech:
+                continue
+            prev = symbols.get(sym) or {}
+            events = _detect_events(sym, tech, prev, now)
+            symbols[sym] = _tick_snapshot(tech, prev, events, now_iso)
+            fired.extend(events)
+            time.sleep(0.2)
+    state["last_tick"] = now_iso
+    _save_monitor_state(state)
+    if not fired:
+        log.info("monitor %s — %d tickers scanned, quiet", ts, len(symbols))
+        return
+    _append_alerts(fired)
+    push = [a for a in fired if a["level"] == "push"]
+    if push:
+        notifier.send(_build_alert_msg(push, ts))
+    log.info("monitor %s — %d events (%d pushed to Telegram)",
+             ts, len(fired), len(push))
+
+
 # ─── STANDALONE SCHEDULER ────────────────────────────────────────────────────
 
 def _nyse_holidays(year: int) -> set:
@@ -1267,7 +1548,7 @@ def _is_trading_day() -> bool:
 def run_loop() -> None:
     """Start the signal reporter as a standalone scheduler.
 
-    Premarket full analysis:  08:30 ET (15-min + AI, once daily)
+    08:30 brief · 09:30-16:00 monitor every 5 min · 10:30 open1h · 16:10 close (ET)
     """
     import pytz
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -1310,6 +1591,19 @@ def run_loop() -> None:
         except Exception as e:
             log.exception("close review job failed: %s", e)
 
+    def _monitor_tick():
+        # 盯盘扫描只在常规交易时段内跑；时段外静默跳过（不进日志，避免刷屏）。
+        if not _is_trading_day():
+            return
+        m = _ny_now()
+        mins = m.hour * 60 + m.minute
+        if not (9 * 60 + 30 <= mins < 16 * 60):
+            return
+        try:
+            run_monitor()
+        except Exception as e:
+            log.exception("monitor tick failed: %s", e)
+
     sched.add_job(_premarket, "cron",
                   day_of_week="mon-fri", hour=8, minute=30,
                   coalesce=True, misfire_grace_time=300, max_instances=1)
@@ -1324,13 +1618,23 @@ def run_loop() -> None:
                   day_of_week="mon-fri", hour=16, minute=10,
                   coalesce=True, misfire_grace_time=600, max_instances=1)
 
+    # 盘中盯盘（09:30-16:00 ET，每 5 分钟）— 事件驱动，有异动才推 Telegram。
+    sched.add_job(_monitor_tick, "cron",
+                  day_of_week="mon-fri", minute=f"*/{MONITOR_INTERVAL_MIN}",
+                  coalesce=True, misfire_grace_time=120, max_instances=1)
+
     wl = load_watchlist()
     log.info("signal_reporter started | watchlist: %s", wl)
-    log.info("schedule: brief@08:30, open1h@10:30, close@16:10 ET")
+    log.info("schedule: brief@08:30, monitor */%dmin 09:30-16:00, "
+             "open1h@10:30, close@16:10 ET", MONITOR_INTERVAL_MIN)
     notifier.send(
         f"📡 *Signal Reporter 已启动*\n"
-        f"watchlist: {', '.join(wl)}\n"
-        f"盘前简报@08:30 · 🔄开盘1小时复盘@10:30 · 🏁收盘对账@16:10"
+        f"👀 盯盘 {len(wl)} 支: {', '.join(wl)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌅 08:30 盘前简报（AI+新闻+支撑阶梯）\n"
+        f"🔔 09:30-16:00 每 {MONITOR_INTERVAL_MIN} 分钟盯盘扫描\n"
+        f"      突破 / 放量 / VWAP / RSI 异动即时提醒，无事件不打扰\n"
+        f"🔄 10:30 开盘复盘 · 🏁 16:10 收盘对账"
     )
     sched.start()
 
@@ -1346,6 +1650,7 @@ def main() -> None:
     python -m src.signal_reporter brief           # 手动触发盘前简报（新版）
     python -m src.signal_reporter review          # 手动触发开盘1小时复盘
     python -m src.signal_reporter close           # 手动触发收盘对账
+    python -m src.signal_reporter monitor         # 手动触发一次盯盘扫描
     python -m src.signal_reporter premarket       # 旧版盘前完整卡片
     python -m src.signal_reporter intraday        # 手动触发盘中快讯
     """
@@ -1354,11 +1659,17 @@ def main() -> None:
 
     # For direct one-shot calls (premarket/intraday) the scheduler's basicConfig
     # is never called, so we set up logging here so warnings have timestamps.
-    if cmd in ("premarket", "intraday", "brief", "review", "close"):
+    if cmd in ("premarket", "intraday", "brief", "review", "close", "monitor"):
+        # FileHandler too — web 端「立即扫描/简报」按钮是独立进程一次性触发，
+        # 写进 signal_reporter.log 后网页日志面板才能看到执行过程。
+        (settings.root / "logs").mkdir(parents=True, exist_ok=True)
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s | %(message)s",
-            handlers=[logging.StreamHandler()],
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(settings.root / "logs" / "signal_reporter.log"),
+            ],
         )
 
     if cmd == "run":
@@ -1375,6 +1686,8 @@ def main() -> None:
         run_daily_brief("open1h")
     elif cmd == "close":
         run_daily_brief("close")
+    elif cmd == "monitor":
+        run_monitor()
     elif cmd == "premarket":
         run_premarket()
     elif cmd == "intraday":

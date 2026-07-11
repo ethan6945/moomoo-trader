@@ -883,18 +883,22 @@ def scan_once() -> None:
             except Exception as e:
                 log.exception("open_position failed for %s: %s", sig.symbol, e)
                 audit.record("error", symbol=sig.symbol, reason=str(e))
-                # Buffer into the end-of-scan summary (line ~545) instead of
-                # firing one Telegram per failure — keeps the chat readable
-                # when several executions trip the same broker-side issue.
+                # Buffer into the end-of-scan summary so several failures on
+                # the same broker-side issue collapse into one notification.
                 scan_skips.append((sig.symbol, "exec_error"))
 
-    # Send one skip-summary per scan instead of one message per candidate.
+    # Skip summaries are routine, not actionable — log only, no Telegram
+    # (owner request 2026-07-11). Exception: exec_error means an order
+    # failed at the broker, which needs eyes, so that alone still pushes.
     if scan_skips:
         by_gate: dict[str, list[str]] = {}
         for sym, gate in scan_skips:
             by_gate.setdefault(gate, []).append(sym)
-        lines = [f"  • {gate}: {', '.join(syms)}" for gate, syms in sorted(by_gate.items())]
-        notifier.send(f"📋 *Scan skips* ({len(scan_skips)} total)\n" + "\n".join(lines))
+        summary = "; ".join(f"{gate}: {', '.join(syms)}"
+                            for gate, syms in sorted(by_gate.items()))
+        log.info("Scan skips (%d): %s", len(scan_skips), summary)
+        if "exec_error" in by_gate:
+            notifier.send(notifier.exec_fail_msg(by_gate["exec_error"]))
 
     audit.record("scan_end")
     log.info("=== scan end ===")
@@ -1198,6 +1202,56 @@ def _weekly_self_review_job() -> None:
         log.warning("self-review bookkeeping failed: %s", e)
 
 
+def _weekly_sandbox_diff_job() -> None:
+    """Monday 20:25 KL — trade-level differential between the sandbox replay and
+    the backtest_v3 live-fidelity engine (scripts/sandbox_vs_backtest.py).
+
+    Catches silent drift between the two INDEPENDENT strategy implementations at
+    the individual-trade level (engine_compare only cross-checks the two fast
+    engines). Runs as a SUBPROCESS so a crash/hang can never touch the trading
+    loop. Telegram ONLY on breach or on the check itself failing (owner
+    preference: actionable events only) — a clean pass is logged + audited.
+    """
+    log.info("weekly sandbox diff: starting")
+    try:
+        import subprocess
+        root = Path(__file__).resolve().parent.parent
+        proc = subprocess.run(
+            [sys.executable, str(root / "scripts" / "sandbox_vs_backtest.py"),
+             "--days", "30"],
+            cwd=str(root), capture_output=True, text=True, timeout=1800)
+        if proc.returncode == 0:
+            log.info("weekly sandbox diff: OK — within tolerance")
+            db.audit_insert("sandbox_diff", reason="OK — within tolerance")
+        elif proc.returncode == 2:
+            s, detail = {}, ""
+            try:
+                rep = json.loads((root / "data" / "sandbox_vs_backtest.json").read_text())
+                s = rep.get("summary", {})
+                detail = "\n".join(f"  ✗ {b}" for b in rep.get("breaches", []))
+            except Exception:
+                detail = "  (report unreadable — see data/sandbox_vs_backtest.json)"
+            notifier.send(
+                "⚠ *Sandbox↔backtest 分歧超容差* (30d)\n"
+                f"{detail}\n"
+                f"  matched {s.get('n_matched', '?')} | sandbox {s.get('n_sandbox', '?')} "
+                f"vs v3 {s.get('n_v3', '?')} 笔\n"
+                f"  net: sb ${s.get('net_pnl_sandbox', 0):+,.0f} vs v3 "
+                f"${s.get('net_pnl_v3', 0):+,.0f}\n"
+                "  详见 data/sandbox_vs_backtest.json — 两个引擎有一个漂了")
+            db.audit_insert("sandbox_diff", reason=f"BREACH: {detail[:200]}")
+        else:
+            tail = (proc.stderr or proc.stdout or "no output").strip()[-300:]
+            notifier.send(f"⚠ Weekly sandbox diff 运行失败 (exit {proc.returncode}):\n{tail}")
+        cron_state.record_run("sandbox_diff")
+    except Exception as e:
+        log.exception("weekly sandbox diff failed: %s", e)
+        try:
+            notifier.send(f"⚠ Weekly sandbox diff failed: {e}")
+        except Exception:
+            pass
+
+
 def _run_catchup_on_startup() -> None:
     """Detect and run any scheduled jobs that were missed while the laptop was off.
 
@@ -1227,7 +1281,7 @@ def _run_catchup_on_startup() -> None:
         # universe_refresh (Phase 1) is different: it's a RULE the owner enabled
         # explicitly via DYNAMIC_UNIVERSE_ENABLED, and every change telegrams.
         # ⚠ These expected-fire times MUST match the run_loop cron schedule
-        # below (Mon 20:00-20:20 KL, timezone-pinned). If they drift apart,
+        # below (Mon 20:00-20:25 KL, timezone-pinned). If they drift apart,
         # every restart after the real run sees last_run < expected and
         # re-fires the whole Monday chain — double autopilot param applies,
         # duplicate Telegram storms. (P1 fix 2026-07-07.)
@@ -1243,6 +1297,9 @@ def _run_catchup_on_startup() -> None:
         ("self_review",
          cron_state.expected_last_fire_weekly(0, 20, 15, tz=KL),   # Mon 20:15 KL
          _weekly_self_review_job, "Weekly self-review"),
+        ("sandbox_diff",
+         cron_state.expected_last_fire_weekly(0, 20, 25, tz=KL),   # Mon 20:25 KL
+         _weekly_sandbox_diff_job, "Weekly sandbox↔backtest diff"),
         ("monthly_optuna",
          cron_state.expected_last_fire_monthly(1, 3, 0),
          _monthly_optuna_job, "Monthly Optuna optimization"),
@@ -1282,6 +1339,26 @@ def _run_catchup_on_startup() -> None:
         notifier.send(f"✓ Catchup complete — ran {len(missed)} missed job(s)")
     except Exception:
         pass
+
+
+def _preopen_clock_check_job() -> None:
+    """PRE-OPEN (08:30 ET, one hour before the bell): force a network time
+    re-check so the trading day starts on verified time. Quiet by design
+    (owner request 2026-07-11): OK and drift-corrected results are log-only;
+    Telegram fires only when the time can't be verified (all network sources
+    down) or the market is closed for a NYSE holiday."""
+    try:
+        st = clock.force_refresh()
+        session = clock.market_session(clock.ny_now())
+        log.info("preopen clock check: session=%s drift=%+.1fs source=%s offset=%s",
+                 session, st.get("last_drift_sec", 0.0), st.get("source"),
+                 st.get("offset_sec"))
+        msg = notifier.clock_check_msg(st, session)
+        if msg:
+            notifier.send(msg)
+        cron_state.record_run("preopen_clock_check")
+    except Exception as e:
+        log.exception("preopen clock check failed: %s", e)
 
 
 def _premarket_gap_sentinel_job() -> None:
@@ -1453,6 +1530,13 @@ def run_loop() -> None:
     # (09:31 ET), weekdays. Analyze overnight catalysts on holdings BEFORE the
     # open, then sell the flagged names at the open against real liquidity (a
     # stop can't catch a gap). No-op unless GAP_SENTINEL_ENABLED.
+    # Pre-open clock check — 08:30 ET, one hour before the bell (owner request
+    # 2026-07-11): force-refresh network time before the trading day. Quiet —
+    # Telegram only on unverifiable time or NYSE holiday.
+    sched.add_job(_preopen_clock_check_job, "cron",
+                  day_of_week="mon-fri", hour=8, minute=30,
+                  coalesce=True, misfire_grace_time=1200, max_instances=1)
+
     sched.add_job(_premarket_gap_sentinel_job, "cron",
                   day_of_week="mon-fri", hour=9, minute=0,
                   coalesce=True, misfire_grace_time=1200, max_instances=1)
@@ -1491,6 +1575,14 @@ def run_loop() -> None:
     # actually did (not a backtest), emits suggestions for owner approval.
     sched.add_job(_weekly_self_review_job, "cron",
                   day_of_week="mon", hour=20, minute=15, timezone=KL,
+                  coalesce=True, misfire_grace_time=1800, max_instances=1)
+
+    # Weekly sandbox↔backtest trade-level diff: Monday 20:25 KL, LAST in the
+    # Monday chain (after autopilot/universe/backtest/self-review so it measures
+    # the config the week will actually run). Subprocess-isolated; Telegram only
+    # on breach.
+    sched.add_job(_weekly_sandbox_diff_job, "cron",
+                  day_of_week="mon", hour=20, minute=25, timezone=KL,
                   coalesce=True, misfire_grace_time=1800, max_instances=1)
 
     # Monthly Optuna re-optimization: 1st of each month at 03:00 ET.

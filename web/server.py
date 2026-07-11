@@ -14,6 +14,8 @@ Endpoints (JSON):
   GET  /api/sectors          → live US sector ETF overview (60s cache)
   GET  /api/log?n=           → tail of logs/trader.log (compact activity)
   GET  /api/signal-log?n=    → tail of logs/signal_reporter.log
+  GET  /api/signal-monitor   → per-symbol latest monitor tick (盯盘磁贴数据)
+  GET  /api/signal-alerts?n= → alert feed, newest first (盯盘警报流)
   POST /api/budget           → {value} set runtime budget (no restart)
   POST /api/scheduler/<start|stop>
   POST /api/signal-run       → fire the signal reporter once (background)
@@ -53,6 +55,8 @@ TRADER_LOG = ROOT / "logs" / "trader.log"
 SIGNAL_LOG = ROOT / "logs" / "signal_reporter.log"
 SIGNAL_PID = ROOT / "logs" / "signal_reporter.pid"
 SIGNAL_WL_FILE = ROOT / "config" / "signal_watchlist.json"
+SIGNAL_MONITOR_FILE = ROOT / "data" / "signal_monitor_state.json"
+SIGNAL_ALERTS_FILE = ROOT / "data" / "signal_alerts.json"
 SELF_REVIEW_FILE = ROOT / "data" / "self_review_last.json"
 SCHED_PID = ROOT / "logs" / "scheduler.pid"
 MENUBAR_PID = ROOT / "logs" / "menubar.pid"
@@ -1108,12 +1112,29 @@ def api_web_access():
 
 @app.route("/api/signal-run/<mode>", methods=["POST"])
 def api_signal_run(mode):
-    if mode not in ("brief", "review", "close", "premarket", "intraday"):
+    if mode not in ("brief", "review", "close", "premarket", "intraday", "monitor"):
         return jsonify({"ok": False,
-                        "error": "mode must be brief|review|close|premarket|intraday"}), 400
+                        "error": "mode must be brief|review|close|premarket|intraday|monitor"}), 400
     subprocess.Popen([str(VENV_PY), "-m", "src.signal_reporter", mode],
                      cwd=str(ROOT), start_new_session=True)
     return jsonify({"ok": True, "mode": mode})
+
+
+# ── 盯盘监控数据（由 src.signal_reporter.run_monitor 每 5 分钟写盘）────────────
+@app.route("/api/signal-monitor")
+def api_signal_monitor():
+    """每支股票最新 tick 快照（价格/RSI/量比/评分/日内高低/最近警报）。"""
+    return jsonify(_read_json(SIGNAL_MONITOR_FILE, {}))
+
+
+@app.route("/api/signal-alerts")
+def api_signal_alerts():
+    """警报流，最新在前。web 展示全量（push+info）；Telegram 只推 push 级。"""
+    n = max(1, min(int(request.args.get("n", 80)), 400))
+    feed = _read_json(SIGNAL_ALERTS_FILE, [])
+    if not isinstance(feed, list):
+        feed = []
+    return jsonify(feed[-n:][::-1])
 
 
 # ── signal reporter scheduler (persistent loop) — mirrors the desktop GUI ──────

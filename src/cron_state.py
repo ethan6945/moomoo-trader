@@ -45,6 +45,7 @@ KNOWN_JOBS: tuple[str, ...] = (
     "monthly_lever_recheck",   # monthly TP/SL drift revalidation
     "premarket_gap_sentinel",  # pre-open overnight gap check
     "open_gap_exit",           # at-open gap-risk execution
+    "preopen_clock_check",     # daily 08:30 ET time sync + session confirmation
 )
 
 

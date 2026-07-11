@@ -52,6 +52,12 @@ class SandboxConfig:
     enable_ai: bool = False
     scan_interval_min: int = 30
     data_lookback_days: int = 120
+    # Starting capital. 0 → resolved at run time to risk_manager.budget_usd()
+    # (db-state budget override, else .env ACCOUNT_USD) — the same deployable
+    # capital live sizing uses. Parity fix 2026-07-11: the frozen
+    # settings.account_usd ignored the GUI/db budget override, so sandbox and
+    # the Web backtest could silently replay two different account sizes.
+    account_usd: float = 0.0
 
 
 # ── SimClock ───────────────────────────────────────────────
@@ -105,8 +111,10 @@ class SimFeed:
         self._daily: dict[str, pd.DataFrame] = {}
         self._tickers = tickers
         self.clock = clock
+        self._vix: pd.Series | None = None   # real ^VIX daily closes (shifted +1d)
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._fetch_all(start - timedelta(days=lookback_days), end)
+        self._load_vix(start - timedelta(days=lookback_days), end)
 
     def _fetch_all(self, fetch_start: datetime, fetch_end: datetime):
         client = MoomooClient()
@@ -223,7 +231,66 @@ class SimFeed:
         df = df[df.index <= cutoff]
         return df.tail(bars) if not df.empty else None
 
+    def _load_vix(self, fetch_start: datetime, fetch_end: datetime):
+        """Real ^VIX daily closes via yfinance, parquet-cached like the bars.
+
+        Parity 2026-07-11: the fast engines (backtest.prefetch_data) read REAL
+        VIX history; the sandbox used a SPY-ATR×15 proxy that is structurally
+        different (wrong level AND wrong dynamics), so the VIX size-halving and
+        regime layers fired on noise — polluting any sandbox-vs-backtest diff.
+        Same series + same 1-day forward shift as prefetch_data (a bar reads
+        YESTERDAY's close — no lookahead). On any failure self._vix stays None
+        and get_vix() falls back to the old proxy, so a dead network or missing
+        yfinance can't kill a replay."""
+        cache_v = self.CACHE_DIR / "VIX_DAY.parquet"
+        end_naive = fetch_end.replace(tzinfo=None) if fetch_end.tzinfo else fetch_end
+        df = None
+        if cache_v.exists():
+            try:
+                cached = pd.read_parquet(cache_v)
+                if not cached.empty and (end_naive - cached.index.max()).days <= 3 \
+                        and cached.index.min() <= pd.Timestamp(fetch_start.date()) + pd.Timedelta(days=7):
+                    df = cached
+            except Exception:
+                df = None
+        if df is None:
+            try:
+                import yfinance as yf
+                start_naive = (fetch_start.replace(tzinfo=None)
+                               if fetch_start.tzinfo else fetch_start)
+                raw = yf.download("^VIX", start=(start_naive - timedelta(days=10)).date(),
+                                  end=(end_naive + timedelta(days=1)).date(),
+                                  interval="1d", progress=False, auto_adjust=True)
+                if raw is not None and not raw.empty:
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        raw.columns = [c[0] for c in raw.columns]
+                    df = pd.DataFrame({"vix": raw["Close"].astype(float)})
+                    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+                    df.to_parquet(cache_v)
+            except Exception as e:
+                print(f"  VIX history fetch failed: {e} — falling back to SPY-ATR proxy")
+        if df is not None and not df.empty:
+            s = df["vix"].copy()
+            # Shift forward 1 day → sim date D reads the close of D-1.
+            s.index = pd.to_datetime(s.index).normalize() + pd.Timedelta(days=1)
+            self._vix = s.sort_index()
+            print(f"  VIX history: {len(s)} real daily closes "
+                  f"({s.index.min().date()} → {s.index.max().date()})")
+
+    @property
+    def vix_is_real(self) -> bool:
+        return self._vix is not None and not self._vix.empty
+
     def get_vix(self) -> float:
+        if self.vix_is_real:
+            cutoff = pd.Timestamp(self.clock.ny_now().date())
+            s = self._vix[self._vix.index <= cutoff]
+            if not s.empty:
+                return round(float(s.iloc[-1]), 1)
+        return self._vix_proxy()
+
+    def _vix_proxy(self) -> float:
+        """Legacy fallback only: SPY ATR×15 — structurally NOT real VIX."""
         df = self._daily.get("SPY")
         if df is None or len(df) < 20:
             return 15.0
@@ -302,7 +369,9 @@ class SimBroker:
         self.feed = feed; self.clock = clock; self.cfg = cfg
         self.positions: dict[str, SimPos] = {}
         self.trades: list[SimTrade] = []
-        self.cash = settings.account_usd
+        # cfg.account_usd is resolved by run_sandbox (risk_manager.budget_usd());
+        # the settings fallback only covers a directly-constructed broker.
+        self.cash = cfg.account_usd or settings.account_usd
         self._pending: list[dict] = []
         self.last_sl_time: dict[str, datetime] = {}  # SL cooldown tracker
 
@@ -396,7 +465,8 @@ def _load_universe(config: SandboxConfig, feed: SimFeed | None = None) -> list[s
             if feed is not None:
                 daily = feed.daily_dict()
                 asof = config.start.date()  # point-in-time for historical replay
-                tickers = select_universe(daily, asof=asof, top_n=settings.universe_top_n)
+                tickers = select_universe(daily, asof=asof,
+                                          top_n=runtime_config.universe_top_n())
                 print(f"  Universe (dynamic): {len(tickers)} tickers from pool of {len(pool)}")
                 return tickers
         except Exception as e:
@@ -415,7 +485,8 @@ def _refresh_universe(config: SandboxConfig, feed: SimFeed) -> list[str]:
     today_date = today_ts.date()
     daily = feed.daily_dict()
     daily_by_sym = {sym: feed._daily.get(sym) for sym in pool}
-    return select_universe(daily_by_sym, asof=today_date, top_n=settings.universe_top_n)
+    return select_universe(daily_by_sym, asof=today_date,
+                           top_n=runtime_config.universe_top_n())
 
 
 # ── Regime ─────────────────────────────────────────────────
@@ -532,6 +603,11 @@ def _is_cooldown_active(symbol: str, broker, sim_now: datetime) -> bool:
 def run_sandbox(config: SandboxConfig) -> dict:
     t0 = _time.time()
 
+    # 0. Resolve starting capital to the runtime-effective budget (db-state
+    # override beats frozen .env) — the same base live sizing/slot math uses.
+    if config.account_usd <= 0:
+        config.account_usd = risk_manager.budget_usd()
+
     # 1. Initial universe
     tickers = _load_universe(config)
     if not tickers:
@@ -549,9 +625,9 @@ def run_sandbox(config: SandboxConfig) -> dict:
 
     print(f"Sandbox v3: {config.start.date()} → {config.end.date()}")
     print(f"Universe: {config.universe_mode} | AI: {'ADVISORY' if config.enable_ai else 'OFF'}")
-    print(f"Tickers: {len(pool_tickers)} (scan top {settings.universe_top_n})")
-    print(f"Params: THR={settings.entry_threshold} SL={settings.sl_atr_mult} "
-          f"TP={settings.tp_atr_mult} | ${settings.account_usd:,.0f}")
+    print(f"Tickers: {len(pool_tickers)} (scan top {runtime_config.universe_top_n()})")
+    print(f"Params: THR={runtime_config.entry_threshold()} SL={runtime_config.sl_atr_mult()} "
+          f"TP={runtime_config.tp_atr_mult()} | ${config.account_usd:,.0f}")
     print(f"{'='*60}")
 
     # 2. Init infrastructure
@@ -569,13 +645,19 @@ def run_sandbox(config: SandboxConfig) -> dict:
 
     scans = eval_scans = signals_found = 0
     skip_counts = defaultdict(int)
+    # Per-signal skip log so scripts/sandbox_vs_backtest.py can attribute a
+    # trade missing on the sandbox side to the exact gate that blocked it.
+    # Bounded (owner concern: no unbounded growing artifacts).
+    _SKIP_EVENTS_MAX = 10_000
+    skip_events: list[dict] = []
     max_seen = 0.0
     week_refreshes = 0
     # Parity 2026-07-07: live derives the slot cap from capital
     # (risk_manager.max_positions → derive_max_positions); the static
-    # settings.max_positions ignored capital scaling.
+    # settings.max_positions ignored capital scaling. 2026-07-11: derive from
+    # the RESOLVED budget, not frozen .env — mirrors risk_manager.max_positions().
     from src.config import derive_max_positions
-    _max_positions_cap = derive_max_positions(settings.account_usd)
+    _max_positions_cap = derive_max_positions(config.account_usd)
 
     # ── Preload historical earnings calendar (no lookahead) ──
     print(f"  Pre-loading earnings calendar …")
@@ -616,8 +698,9 @@ def run_sandbox(config: SandboxConfig) -> dict:
         # breadth.assess(client, vix) requires Moomoo OpenQuoteContext.request_history_kline.
         # SimFeed provides get_kline(sym, bars, ktype) — a different interface.
         # Solution: replicate the breadth logic directly against SimFeed SPY dailies.
-        # VIX is NOT passed — the sandbox VIX proxy (SPY ATR × 15) is structurally
-        # different from real VIX and would falsely trigger VIX_PANIC=30.
+        # VIX overlay 2026-07-11: SimFeed now carries REAL ^VIX history, so the
+        # live VIX_PANIC check applies too. Skipped when the feed fell back to
+        # the SPY-ATR proxy (structurally different — would false-trigger).
         try:
             spy_50 = feed.get_kline("SPY", bars=55, ktype=KLType.K_DAY)
             if spy_50 is not None and len(spy_50) >= 50:
@@ -631,8 +714,10 @@ def run_sandbox(config: SandboxConfig) -> dict:
                     if i + n >= 0 and close_ser.iloc[i] > open_ser.iloc[i]
                 )
                 ad_ratio = days_up / 10
-                breadth_ok = (ad_ratio >= 0.55) and ((price / sma50 - 1) * 100 > -10)
-                breadth_note = f"AD={ad_ratio:.2f} SPYvs50MA={(price/sma50-1)*100:.1f}%"
+                vix_ok = (vix < breadth.VIX_PANIC) if (feed.vix_is_real and vix > 0) else True
+                breadth_ok = (ad_ratio >= 0.55) and ((price / sma50 - 1) * 100 > -10) and vix_ok
+                breadth_note = (f"AD={ad_ratio:.2f} SPYvs50MA={(price/sma50-1)*100:.1f}%"
+                                + ("" if vix_ok else f" VIX {vix:.0f}≥{breadth.VIX_PANIC}"))
             else:
                 breadth_ok, breadth_note = True, "insufficient SPY bars — passing"
         except Exception as e:
@@ -703,6 +788,13 @@ def run_sandbox(config: SandboxConfig) -> dict:
 
         def _skip(gate, reason):
             skip_counts[gate] += 1
+            try:
+                _sym = sig.symbol  # current signal in the funnel loop below
+            except NameError:
+                _sym = None
+            if len(skip_events) < _SKIP_EVENTS_MAX:
+                skip_events.append({"t": now.isoformat(), "symbol": _sym,
+                                    "gate": gate, "reason": reason})
 
         for sig in ranked:
             if sig.score < threshold_floor:
@@ -840,7 +932,7 @@ def run_sandbox(config: SandboxConfig) -> dict:
             "entry_threshold": runtime_config.entry_threshold(),   # 2026-07-06: use runtime override, not static .env
             "sl_atr_mult": runtime_config.sl_atr_mult(),
             "tp_atr_mult": runtime_config.tp_atr_mult(),
-            "account_usd": settings.account_usd,
+            "account_usd": config.account_usd,
             "ai_enabled": config.enable_ai,
         },
         "summary": {
@@ -849,7 +941,7 @@ def run_sandbox(config: SandboxConfig) -> dict:
             "win_rate_pct": round(len(wins) / max(len(closed), 1) * 100, 1),
             "net_pnl_usd": round(total_net, 2),
             "gross_pnl_usd": round(total_gross, 2),
-            "total_return_pct": round(total_net / settings.account_usd * 100, 2),
+            "total_return_pct": round(total_net / config.account_usd * 100, 2),
             "avg_win_usd": round(sum(t.net_pnl for t in wins) / max(len(wins), 1), 2),
             "avg_loss_usd": round(sum(t.net_pnl for t in losses) / max(len(losses), 1), 2),
             "profit_factor": round(
@@ -882,8 +974,11 @@ def run_sandbox(config: SandboxConfig) -> dict:
             for s, d in by_strat.items()
         },
         "skip_reasons": dict(skip_counts),
+        "skip_events": skip_events,
         "trades": [{
             "symbol": t.symbol, "entry": round(t.entry, 2), "exit": round(t.exit, 2),
+            "entry_t": t.entry_t.isoformat(), "exit_t": t.exit_t.isoformat(),
+            "qty": t.qty,
             "pnl": round(t.pnl, 2), "net_pnl": round(t.net_pnl, 2),
             "commission": round(t.commission, 2), "slippage": round(t.slippage, 2),
             "pnl_pct": round(t.pnl_pct, 2),

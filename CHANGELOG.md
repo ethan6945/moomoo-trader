@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-07-11 — Sandbox 配置对齐 + 真实 VIX + sandbox↔backtest 交易级差分
+
+三件事把 sandbox 从"独立但配置漂移"修成可信的差分基准（快引擎 engine_compare 只互查 V3 与冻结 oracle，此前**没有任何东西**把快引擎和 sandbox 对过账）：
+
+- **配置对齐**（`src/sandbox.py`）：启动资金改用 `risk_manager.budget_usd()`（db 预算覆盖 > 冻结 .env），仓位槽数从解析后的预算推导（对齐 `risk_manager.max_positions()`），动态 universe 的 top_n 改走 `runtime_config.universe_top_n()`。`SandboxConfig` 新增 `account_usd`（0=自动解析），供差分脚本注入同一资本。启动打印/结果 JSON 同步改为运行时生效值。
+- **真实 VIX**（`SimFeed._load_vix`）：^VIX 日线经 yfinance 拉取 + parquet 缓存（`data/sandbox_cache/VIX_DAY.parquet`），与 `backtest.prefetch_data` 同一序列、同一 +1 天前移（读昨收，无前视）。旧 SPY-ATR×15 代理降级为网络故障 fallback（`_vix_proxy`）。有真 VIX 后 breadth 补上 live 同款 `VIX_PANIC≥30` 检查（fallback 时跳过）。VIX 减仓/regime 层不再吃代理噪音。
+- **交易级差分**（`scripts/sandbox_vs_backtest.py`）：同窗口同运行时配置跑 sandbox + `_run_live_engine`(V3 live-fidelity)，按 (symbol, 入场日 ±1 交易日) 对齐每笔交易；单边交易给出 sandbox gate 归因（run_sandbox 新增有界 `skip_events` 日志，上限 1 万条）；配对交易报入/出场 bps 差。**只比较两引擎共同覆盖窗口**（V3 的 `days` 是 bar 数预算,实际跨度更宽——首跑 20 笔"only in v3"里 14 笔是窗口外假差异）。超容差退出码 2,可挂 cron/health check(符合"只推可操作事件")。原始引擎输出落盘 `data/sandbox_vs_backtest_raw_*.json` 供免重跑调参。
+- **基线（2026-07-11,30 天窗）**：sandbox 27 vs v3 15 笔（窗口内）、9 笔配对；同日配对入场差中位 ~6bps（成交模型吻合）,±1 天配对含周末跳空属诚实非信号 → 容差只读同日配对。缺口主因：sandbox 的 regime 自适应阈值（BULL 60 vs v3 固定 65）+ v3 的 17 次 cash-limited。默认容差按基线+余量校准（match≥25%、同日中位≤25bps、净利差≤60%）。
+- 环境修复：uv venv 缺 parquet 引擎（`pd.read_parquet` 全挂,sandbox 缓存实际不可用）→ 装 `pyarrow` 并补进 `requirements.txt`。
+- **周检接线**（`main.py`）：新增 `_weekly_sandbox_diff_job`,周一 20:25 KL（周一链最后一个,量测的是本周实际要跑的配置）,subprocess 隔离跑差分脚本;**exit 0 只记 log+audit,exit 2（分歧超容差）才 Telegram**,脚本自身挂掉也通知。含启动 catch-up 注册（`sandbox_diff`）。已实跑验证全链路。
+- **第 4 层脚手架**（`scripts/calibrate_fill_model.py`）：从 moomoo `history_order_list_query` 量测真实成交 vs 模型假设（5bps/边、触价即成）。**只测量不改常数**,改动被双闸门挡住：SIMULATE 环境（纸面撮合无微观结构信号,只有撤单率是真的）+ 样本 <30 笔。排除 SGOV（现金生息仓）。首测 90 天：BUY 177 单仅 45 成交（**成交率 25.4%**,132 单 5 分钟 TTL 撤单——对照引擎"一根 bar 内触价即成"的假设,这是最值得跟踪的真信号）;bot 账本记录的卖出价与实际 dealt 中位差仅 2.2bps（记账诚实）;SL 软止损中位越价 −12.6bps（n=6）。
+- 发现：closed_trades 里 bot 的 `entry_price` 记的是**下单限价**而非 `dealt_avg_price`（代码只读过 `dealt_qty`）——真实成交价只能从券商订单历史拿,校准脚本因此直接查 API。
+
 ## 2026-07-08 — 网页面板：净值曲线移入历史 + 美国板块总览（Live）
 
 仪表盘右下角的「净值曲线 · 累计已实现」面板移到**历史**标签页顶部（月度图上方，图表/悬浮提示行为不变），原位置换成**美国板块总览 · Live**。

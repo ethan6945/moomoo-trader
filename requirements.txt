@@ -1,6 +1,7 @@
 moomoo-api>=9.3.5308
 pandas>=2.2.0
 numpy>=1.26.0
+pyarrow>=16.0.0          # parquet engine — sandbox kline/VIX cache (data/sandbox_cache)
 pandas-ta-classic>=0.3.0
 google-genai>=1.0.0      # Gemini SDK — src/ai.py `from google import genai`
 optuna>=4.0.0            # nightly optimizer (src/optimizer.py)

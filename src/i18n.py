@@ -175,6 +175,10 @@ STRINGS: dict[str, dict[str, str]] = {
                         "age={age_days}d PnL ${pnl:+.2f}"),
         "tg_started": "🤖 *moomoo-trader started* env=`{env}`",
         "tg_regime_block": "⚠ Regime {label}: {note} — skipping all entries",
+        "tg_exec_fail": "⚠ *Order execution failed*: {symbols} — check broker/logs",
+        "tg_clock_fail": ("⚠ *Pre-open clock check* — no network time source reachable; "
+                          "running on the uncorrected system clock. Verify the OS time manually."),
+        "tg_clock_holiday": "🕐 Pre-open check: US market is closed today (NYSE holiday) — no trading.",
 
         # --- ML calibration window ---
         "ml_tab_overview": "Overview",
@@ -328,6 +332,10 @@ STRINGS: dict[str, dict[str, str]] = {
                         "持仓 {age_days} 天  PnL ${pnl:+.2f}"),
         "tg_started": "🤖 *moomoo-trader 已启动* 环境=`{env}`",
         "tg_regime_block": "⚠ 市场体制 {label}：{note} — 暂停所有新入场",
+        "tg_exec_fail": "⚠ *下单执行失败*: {symbols} — 请检查券商端/日志",
+        "tg_clock_fail": ("⚠ *盘前校时失败* — 所有网络时间源不可达，暂用未校验的系统时钟运行，"
+                          "请手动确认系统时间。"),
+        "tg_clock_holiday": "🕐 盘前校时：今日美股休市（NYSE 假期），不交易。",
 
         "ml_tab_overview": "概览",
         "ml_tab_calibration": "校准曲线",

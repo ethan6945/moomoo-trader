@@ -181,8 +181,36 @@
   .cfgchips{display:flex;flex-wrap:wrap;gap:8px}
   .cfgchips .pill b{color:var(--strong);margin-left:5px;font-weight:600}
 
+  /* ── signal tab (盯盘信号台) ── */
+  .p-sig{--accent:var(--amber)} .p-alert{--accent:var(--red)}
+  .sig-cols{display:grid;grid-template-columns:1.45fr 1fr;gap:12px;align-items:stretch}
+  .sig-sched{display:flex;gap:8px;flex-wrap:wrap}
+  .schchip{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border:1px solid var(--border);border-radius:999px;font-size:11.5px;color:var(--muted);background:rgba(255,255,255,.03);box-shadow:var(--inset);white-space:nowrap}
+  .schchip b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}
+  .schchip.done{opacity:.45}
+  .schchip.next{border-color:rgba(88,166,255,.55);color:var(--primary)} .schchip.next b{color:var(--primary)}
+  .schchip.live{border-color:rgba(63,185,80,.55);color:var(--green)} .schchip.live b{color:var(--green)}
+  .sig-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:8px;align-content:start}
+  .sigtile{border:1px solid var(--border);border-radius:11px;padding:8px 11px;background:rgba(255,255,255,.03);box-shadow:var(--inset);min-width:0}
+  .sigtile.hot{border-color:rgba(210,153,34,.5);background:rgba(210,153,34,.05)}
+  .sigtile .r1{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
+  .sigtile .sym{font-weight:800;color:var(--strong);font-size:13px}
+  .sigtile .chg{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}
+  .sigtile .px{font-size:16.5px;font-weight:800;color:var(--strong);font-variant-numeric:tabular-nums;letter-spacing:-.01em;margin-top:1px}
+  .sigtile .meta{font-size:10.5px;color:var(--muted);margin-top:4px;display:flex;gap:7px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+  .sigtile .lastal{font-size:10.5px;margin-top:5px;color:var(--amber);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sig-feed{max-height:430px;min-height:120px;overflow:auto}
+  .alrow{display:flex;gap:9px;padding:7px 4px;border-bottom:1px solid rgba(148,163,184,.07);font-size:12.5px;align-items:flex-start}
+  .alrow:last-child{border-bottom:none}
+  .alrow .t{color:var(--muted);font-size:10.5px;flex:0 0 auto;padding-top:2px;font-variant-numeric:tabular-nums}
+  .alrow .body{min-width:0;flex:1}
+  .alrow .ttl{color:var(--text)} .alrow.push .ttl{color:var(--strong);font-weight:600}
+  .alrow .det{color:var(--muted);font-size:11px;margin-top:1px}
+  .alrow.push{background:linear-gradient(90deg,rgba(210,153,34,.08),transparent 65%);border-radius:6px}
+
   /* ── responsive (phone / narrow window) ── */
   @media (max-width:980px){
+    .sig-cols{grid-template-columns:1fr}
     .grid{grid-template-columns:repeat(2,1fr)}
     .card .val{font-size:clamp(16px,5.2vw,24px)}
     /* release the viewport-height lock so panels stack full-size and the page scrolls */
@@ -296,21 +324,40 @@
     </div>
   </div>
 
-  <!-- SIGNAL -->
+  <!-- SIGNAL (盯盘信号台) -->
   <div id="tab-sig" class="hidden">
-    <div class="panel"><h3>Signal Reporter</h3>
-      <div class="mut" style="margin-bottom:10px;font-size:12px" data-i18n="sig_desc">独立信号 watchlist — 高峰时段每 30 分钟推 Telegram 信号卡。</div>
-      <!-- scheduler controls + run-once -->
-      <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
+    <!-- status + schedule + triggers -->
+    <div class="panel p-sig" style="margin-bottom:12px">
+      <h3><span data-i18n="sig_title">盯盘信号台</span></h3>
+      <div class="mut" style="margin-bottom:10px;font-size:12px" data-i18n="sig_desc">像盯盘助手一样工作：盘中每 5 分钟扫描 watchlist，突破 / 放量 / VWAP 翻转 / RSI 极值即时推 Telegram；无事件保持静默。</div>
+      <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
         <span id="sigStatus" class="pill">⚪ <span data-i18n="sig_stopped">已停止</span></span>
         <button class="primary sm" id="btnSigStart">▶ Start</button>
         <button class="danger sm" id="btnSigStop">■ Stop</button>
         <span style="flex:1 1 auto"></span>
+        <button class="sm" id="btnScan">📡 <span data-i18n="sig_scan">立即扫描</span></button>
         <button class="sm" id="btnBrief">🌅 <span data-i18n="sig_brief">盘前简报</span></button>
         <button class="sm" id="btnReview">🔄 <span data-i18n="sig_review">盘中复盘</span></button>
         <button class="sm" id="btnClose">🏁 <span data-i18n="sig_close">收盘对账</span></button>
       </div>
-      <!-- watchlist editor -->
+      <div class="sig-sched" id="sigSched"></div>
+    </div>
+
+    <!-- watch grid + alert feed -->
+    <div class="sig-cols" style="margin-bottom:12px">
+      <div class="panel p-sig">
+        <h3 style="justify-content:space-between"><span data-i18n="sig_grid">盯盘行情</span>
+          <span class="mut" id="sigTickTs" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
+        <div id="sigGrid" class="sig-tiles"></div>
+      </div>
+      <div class="panel p-alert">
+        <h3>🔔 <span data-i18n="sig_feed">警报流</span></h3>
+        <div id="sigFeed" class="sig-feed"></div>
+      </div>
+    </div>
+
+    <!-- watchlist editor + log -->
+    <div class="panel">
       <div style="margin-bottom:12px">
         <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
           <strong data-i18n="sig_wl">信号 Watchlist</strong>
@@ -323,7 +370,6 @@
         <div id="sigWlChips" style="display:flex;gap:6px;flex-wrap:wrap;min-height:24px"></div>
         <div class="mut" id="sigWlMsg" style="font-size:11px;margin-top:6px"></div>
       </div>
-      <!-- log -->
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
         <strong>Log</strong><span style="flex:1 1 auto"></span>
         <button class="sm" id="btnSigReload">🔄 <span data-i18n="sig_reload">刷新日志</span></button>
@@ -835,14 +881,16 @@ const I18N={
       trades:'总交易笔数',winrate:'胜率',pf:'盈利因子',net:'净盈亏',cash:'现金',openrisk:'敞口风险 / 上限',lastscan:'上次扫描',
       c_sym:'代码',c_qty:'数量',c_entry:'入场',c_last:'现价',c_stop:'止损',c_tp:'止盈',c_range:'区间',c_strat:'策略',
       no_pos:'🌙 当前无持仓',notrades:'暂无平仓记录',noappr:'暂无待批准建议',appr_note:'✅ 批准后约 5 分钟内自动执行(后台每 5 分钟同步一次;盘中扫描也会触发)',
-      sig_desc:'独立信号 watchlist — 🌅盘前简报@08:30 · 🔄开盘1小时复盘@10:30 · 🏁收盘对账@16:10 (ET)。',sig_stopped:'已停止',sig_brief:'盘前简报',sig_review:'盘中复盘',sig_close:'收盘对账',sig_wl:'信号 Watchlist',sig_add:'添加',sig_save:'保存',sig_reload:'刷新日志'},
+      sig_title:'盯盘信号台',sig_desc:'像盯盘助手一样工作：盘中每 5 分钟扫描信号 watchlist，突破 / 放量 / VWAP 翻转 / RSI 极值 / 技术面转向即时推 Telegram，无事件保持静默（同类信号有冷却期，不轰炸）。',
+      sig_stopped:'已停止',sig_scan:'立即扫描',sig_grid:'盯盘行情',sig_feed:'警报流',sig_brief:'盘前简报',sig_review:'盘中复盘',sig_close:'收盘对账',sig_wl:'信号 Watchlist',sig_add:'添加',sig_save:'保存',sig_reload:'刷新日志'},
   en:{t_dash:'Dashboard',t_hist:'History',t_sig:'Signal',t_bt:'Backtest',positions:'Open Positions',equity:'Equity · cumulative realized',sectors:'US Sectors · Live',
       activity:'Recent Activity',record:'Trade Record',approvals:'Pending Approvals',deployed:'Deployed / Budget',today:"Today P&L · realized",total:'Total P&L · cum. realized',
       unreal:'Unrealized P&L · open',pos_unit:'position(s)',
       trades:'Total Trades',winrate:'Win rate',pf:'Profit factor',net:'Net P&L',cash:'Cash',openrisk:'Open risk / cap',lastscan:'Last scan',
       c_sym:'Symbol',c_qty:'Qty',c_entry:'Entry',c_last:'Last',c_stop:'Stop',c_tp:'TP',c_range:'Range',c_strat:'Strategy',
       no_pos:'🌙 No open positions',notrades:'No closed trades',noappr:'No pending suggestions',appr_note:'✅ Approved items run within ~5 min (backend syncs every 5 min; market scans also apply them)',
-      sig_desc:'Independent signal watchlist — 🌅Premarket brief@08:30 · 🔄Open+1h review@10:30 · 🏁Close recap@16:10 (ET).',sig_stopped:'Stopped',sig_brief:'Premarket brief',sig_review:'Open+1h review',sig_close:'Close recap',sig_wl:'Signal Watchlist',sig_add:'Add',sig_save:'Save',sig_reload:'Reload log'}
+      sig_title:'Watch Station',sig_desc:'Works like a market-watch assistant: scans the signal watchlist every 5 min intraday — breakouts / volume spikes / VWAP flips / RSI extremes push to Telegram instantly, silence otherwise (per-signal cooldowns, no spam).',
+      sig_stopped:'Stopped',sig_scan:'Scan now',sig_grid:'Watch Grid',sig_feed:'Alert Feed',sig_brief:'Premarket brief',sig_review:'Open+1h review',sig_close:'Close recap',sig_wl:'Signal Watchlist',sig_add:'Add',sig_save:'Save',sig_reload:'Reload log'}
 };
 let LANG=localStorage.getItem('lang')||'zh';
 function applyLang(l){LANG=l;document.querySelectorAll('[data-i18n]').forEach(e=>{const m=I18N[l]&&I18N[l][e.dataset.i18n];if(m)e.textContent=m;});localStorage.setItem('lang',l);refresh();renderSectors();}
@@ -1062,14 +1110,80 @@ async function refreshSigLog(forceBottom){
 }
 async function loadSignal(){
   await refreshSigLog(true);   // 主动打开/刷新 → 直接跳到最新
-  refreshSigStatus(); loadSigWatchlist();
+  refreshSigStatus(); loadSigWatchlist(); refreshSigMonitor(); refreshSigFeed();
 }
+let SIG_RUNNING=false;
 async function refreshSigStatus(){
   let s; try{s=await api('/api/signal-status');}catch(e){return;}
+  SIG_RUNNING=!!s.running;
   const el=$('#sigStatus');
-  el.innerHTML = s.running ? `🟢 ${LANG==='zh'?'运行中':'Running'} (PID ${s.pid})` : `⚪ ${LANG==='zh'?'已停止':'Stopped'}`;
+  el.innerHTML = s.running ? `🟢 ${LANG==='zh'?'盯盘中':'Watching'} (PID ${s.pid})` : `⚪ ${LANG==='zh'?'已停止':'Stopped'}`;
   el.style.color = s.running ? '#3fb950' : 'var(--muted)';
   $('#btnSigStart').disabled=s.running; $('#btnSigStop').disabled=!s.running;
+  renderSigSched();
+}
+// ── 日程时间线：高亮下一个任务；盘中扫描窗口内且 scheduler 在跑 → live ──
+function nyClock(){try{return new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));}catch(e){return new Date();}}
+function renderSigSched(){
+  const box=$('#sigSched'); if(!box)return;
+  const zh=LANG==='zh', ny=nyClock(), mins=ny.getHours()*60+ny.getMinutes();
+  const inMkt=mins>=570&&mins<960;
+  const items=[
+    {t:510,html:`🌅 <b>08:30</b> ${zh?'盘前简报':'Premarket brief'}`},
+    {t:630,html:`🔄 <b>10:30</b> ${zh?'开盘复盘':'Open+1h review'}`},
+    {t:970,html:`🏁 <b>16:10</b> ${zh?'收盘对账':'Close recap'}`},
+  ];
+  const nextIdx=items.findIndex(i=>i.t>mins);
+  const chips=items.map((i,ix)=>`<span class="schchip ${ix===nextIdx?'next':(i.t<=mins?'done':'')}">${i.html}</span>`);
+  const monCls=inMkt&&SIG_RUNNING?'live':(inMkt?'next':(mins>=960?'done':''));
+  const monTag=inMkt&&SIG_RUNNING?(zh?' · 进行中':' · live'):'';
+  chips.splice(1,0,`<span class="schchip ${monCls}">📡 <b>09:30–16:00</b> ${zh?'每 5 分钟盯盘扫描':'scan every 5 min'}${monTag}</span>`);
+  chips.push(`<span class="schchip">🕒 <b>${String(ny.getHours()).padStart(2,'0')}:${String(ny.getMinutes()).padStart(2,'0')}</b> ET</span>`);
+  box.innerHTML=chips.join('');
+}
+// ── 盯盘行情磁贴（数据来自 monitor tick 的快照，按 |涨跌| 排序）──
+async function refreshSigMonitor(){
+  const box=$('#sigGrid'); if(!box)return;
+  let d; try{d=await api('/api/signal-monitor');}catch(e){return;}
+  const zh=LANG==='zh';
+  $('#sigTickTs').textContent = d&&d.last_tick ? (zh?'上次扫描 ':'last scan ')+d.last_tick.slice(11,16)+' ET' : '';
+  const syms=Object.entries((d&&d.symbols)||{});
+  if(!syms.length){
+    box.innerHTML=`<div class="empty" style="grid-column:1/-1">${zh
+      ?'还没有盯盘数据 — 点「📡 立即扫描」试一次；▶ Start 后开盘时段每 5 分钟自动刷新。'
+      :'No monitor data yet — hit “📡 Scan now” once; after ▶ Start it auto-scans every 5 min during market hours.'}</div>`;
+    return;
+  }
+  syms.sort((a,b)=>Math.abs(b[1].chg||0)-Math.abs(a[1].chg||0));
+  box.innerHTML=syms.map(([s,v])=>{
+    const vw=(v.vwap&&v.price)?((v.price/v.vwap-1)*100):null;
+    const meta=[`RSI ${Math.round(v.rsi||0)}`,`Vol ${(v.vol||0).toFixed(1)}x`,
+      vw!==null?`VWAP${vw>=0?'+':''}${vw.toFixed(1)}%`:'',
+      `<span class="pos">${zh?'买':'B'}${v.buy??0}</span>/<span class="neg">${zh?'卖':'S'}${v.sell??0}</span>`]
+      .filter(Boolean).map(x=>`<span>${x}</span>`).join('');
+    return `<div class="sigtile${v.alerts_today?' hot':''}" title="${zh?'日内':'Day'} ${v.day_low??'—'} ~ ${v.day_high??'—'}">
+      <div class="r1"><span class="sym">${s}</span><span class="chg ${cls(v.chg)}">${v.chg>=0?'+':''}${(v.chg??0).toFixed(2)}%</span></div>
+      <div class="px">$${(v.price??0).toFixed(2)}</div>
+      <div class="meta">${meta}</div>
+      ${v.last_alert?`<div class="lastal">${v.last_alert}</div>`:''}
+    </div>`;}).join('');
+}
+// ── 警报流（web 全量：push+info；Telegram 只收 push 级）──
+async function refreshSigFeed(){
+  const box=$('#sigFeed'); if(!box)return;
+  let list; try{list=await api('/api/signal-alerts?n=60');}catch(e){return;}
+  const zh=LANG==='zh';
+  if(!list||!list.length){
+    box.innerHTML=`<div class="empty">${zh
+      ?'暂无警报 — 盘中触发突破 / 放量 / VWAP 等事件时会出现在这里，强信号同步推 Telegram。'
+      :'No alerts yet — breakout / volume / VWAP events show up here; strong ones also push to Telegram.'}</div>`;
+    return;
+  }
+  box.innerHTML=list.map(a=>`<div class="alrow ${a.level==='push'?'push':''}">
+    <span class="t">${(a.ts_iso||'').slice(5,16).replace('T',' ')}</span>
+    <div class="body"><div class="ttl">${a.emoji||'🔔'} <b>${a.sym||''}</b> ${a.title||''}
+      <span class="${cls(a.chg)}">${a.chg!=null?(a.chg>=0?'+':'')+(+a.chg).toFixed(2)+'%':''}</span></div>
+      ${a.detail?`<div class="det">${a.detail}</div>`:''}</div></div>`).join('');
 }
 function pollSig(times=6,gap=600){let i=0;const t=setInterval(()=>{refreshSigStatus();if(++i>=times)clearInterval(t);},gap);refreshSigStatus();}
 $('#btnSigStart').onclick=async()=>{const b=$('#btnSigStart');b.disabled=true;b.textContent='▶ Starting…';try{await api('/api/signal-scheduler/start',{method:'POST'});}catch(e){}pollSig();setTimeout(()=>{b.textContent='▶ Start';},2000);};
@@ -1078,6 +1192,10 @@ const sigRun=(mode,note)=>async()=>{await api('/api/signal-run/'+mode,{method:'P
 $('#btnBrief').onclick=sigRun('brief',   LANG==='zh'?'🌅 盘前简报生成中（含 AI+搜索）… 每只约 30-60s，稍后点「🔄 刷新日志」看结果。':'🌅 Premarket brief running (AI+search)… ~30-60s per symbol, reload the log shortly.');
 $('#btnReview').onclick=sigRun('review', LANG==='zh'?'🔄 开盘1小时复盘生成中（需当天已有盘前简报）… ~30-60s/只，稍后刷新日志。':'🔄 Open+1h review running (needs today\'s brief)… ~30-60s per symbol, reload the log shortly.');
 $('#btnClose').onclick=sigRun('close',   LANG==='zh'?'🏁 收盘对账生成中（对比盘前/盘中预测 vs 实际）… ~30-60s/只，稍后刷新日志。':'🏁 Close recap running (predictions vs actual)… ~30-60s per symbol, reload the log shortly.');
+$('#btnScan').onclick=async()=>{const b=$('#btnScan');b.disabled=true;
+  try{await api('/api/signal-run/monitor',{method:'POST'});}catch(e){b.disabled=false;return;}
+  $('#sigLog').textContent=LANG==='zh'?'📡 盯盘扫描中… 每支约 2-3s，完成后行情磁贴与警报流自动刷新。':'📡 Scanning… ~2-3s per symbol; tiles & alert feed refresh when done.';
+  let n=0;const t=setInterval(()=>{refreshSigMonitor();refreshSigFeed();refreshSigLog(false);if(++n>=6){clearInterval(t);b.disabled=false;}},5000);};
 $('#btnSigReload').onclick=loadSignal;
 
 // ── signal watchlist editor ──
@@ -1117,7 +1235,9 @@ refresh();setInterval(refresh,4000);
 refreshSectors();setInterval(()=>{if(CURTAB==='dash')refreshSectors();},60000);   // 板块总览每分钟刷新（服务端也缓存 60s）
 checkApprovals();   // one-time pending-approvals popup on page open
 // 信号日志在 Signal 标签打开时每 4s 自动 tail 跟随最新（终端 tail -f 体验）
-setInterval(()=>{if(CURTAB==='sig')refreshSigLog(false);},4000);
+let SIGPOLL=0;
+setInterval(()=>{if(CURTAB!=='sig')return;refreshSigLog(false);
+  if(++SIGPOLL%3===0){refreshSigMonitor();refreshSigFeed();refreshSigStatus();}},4000);
 {const t=(location.hash||'').slice(1); if(['dash','hist','sig','bt'].includes(t))setTab(t);
  if(t==='settings'||t==='access'){loadSettings().then(()=>{$('#settingsModal').classList.remove('hidden');
    if(t==='access')setTimeout(()=>$('#secAccess').scrollIntoView({block:'start'}),150);});}}
