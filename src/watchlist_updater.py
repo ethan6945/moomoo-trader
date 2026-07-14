@@ -210,7 +210,7 @@ def build_watchlist(ranked: pd.DataFrame) -> list[str]:
     the blacklist reflects this account's real PnL history.
     """
     # Lazy import: keeps the watchlist module standalone-runnable for tests
-    # that don't have the moomoo DB schema bootstrapped.
+    # that don't have the app DB schema bootstrapped.
     try:
         from . import blacklist as _bl
         banned = set(_bl.get_blacklist().keys())

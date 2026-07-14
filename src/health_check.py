@@ -3,7 +3,7 @@
 Two silent dependencies can lapse WITHOUT crashing the bot — so the owner would
 never know until trades quietly degrade:
 
-  • moomoo options market-data subscription — if it lapses (or OpenD hasn't
+  • broker options market-data subscription — if it lapses (or OpenD hasn't
     refreshed the entitlement), options_flow can't fetch chains/snapshots; the
     API returns "No permission ...".
   • Gemini API balance/quota — if the key is exhausted, every AI layer (smart
@@ -123,7 +123,7 @@ def run(client=None) -> None:
         if client is not None:
             opt_status, opt_detail = check_options(client)
         else:
-            from .moomoo_client import client as _client
+            from .moo_client import client as _client
             with _client() as c:
                 opt_status, opt_detail = check_options(c)
     except Exception as e:
@@ -131,7 +131,7 @@ def run(client=None) -> None:
     log.info("health: options=%s (%s)", opt_status, opt_detail)
     _edge(_K_OPT, opt_status,
           fail_msg=("⚠️ *期权数据抓取失败*\n" + opt_detail +
-                    "\n可能原因：moomoo 美股期权/正股行情订阅已过期，或 OpenD 未刷新权限"
+                    "\n可能原因：券商美股期权/正股行情订阅已过期，或 OpenD 未刷新权限"
                     "（新订阅常需退出 OpenD 重新登录）。请检查/续订后重启 OpenD。"),
           recover_msg="✅ 期权数据已恢复，可正常抓取（volume + 未平仓量可用）。")
 

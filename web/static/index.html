@@ -5,8 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta name="theme-color" content="#070a12"/>
 <meta name="color-scheme" content="dark"/>
-<title>MooMoo Trader</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%88%3C/text%3E%3C/svg%3E"/>
+<title>Moo Trader</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg"/>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png"/>
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png"/>
 <style>
   :root{
     --bg:#070a12; --card:rgba(17,23,38,.78); --card-solid:#111726; --card2:#1a2234;
@@ -242,7 +244,7 @@
 </head>
 <body>
   <div class="topbar">
-    <div class="logo">MooMoo<span class="b">Trader</span></div>
+    <div class="logo">Moo<span class="b">Trader</span></div>
     <span class="pill" id="sched"><span class="dot" style="background:#8b949e"></span>scheduler …</span>
     <span class="pill" id="opend"><span class="dot" style="background:#8b949e"></span>OpenD …</span>
     <span class="pill" id="env">—</span>
@@ -445,6 +447,12 @@
           <button class="danger sm" id="btnResetSet">重设</button></div>
       </div>
 
+      <div class="set-sec" id="secLicense"><h3>授权 License</h3>
+        <div class="set-row"><div style="flex:1"><b>License 状态</b>
+          <div class="setdesc" id="licInfo">—</div></div>
+          <button class="sm" onclick="location.href='/activate'">管理</button></div>
+      </div>
+
       <div class="set-sec" id="secAccess"><h3>访问 Access</h3>
         <div class="set-row"><div style="flex:1"><b>手机 / 局域网访问</b><div class="setdesc">开启后，同一 WiFi 或 Tailscale 下的设备可访问本面板（需先设好访问密码）。切换会重启网页服务几秒，页面自动刷新。你的交易程序不受影响。</div>
           <div id="lanUrls" class="setdesc hidden" style="margin-top:6px;line-height:1.7"></div></div>
@@ -562,7 +570,7 @@ async function refresh(){
     // Pattern strategy: append the detected chart pattern (e.g. double_bottom).
     if(p.pattern){strat+=` <span class="tag" title="AI 形态识别" style="background:#8957e533;border:1px solid #8957e5">📐 ${p.pattern}</span>`;}
     if(p.manual_adopted){
-      // YOUR own moomoo-app buy, adopted by the bot. user_managed = HIGH-risk,
+      // YOUR own broker-app buy, adopted by the bot. user_managed = HIGH-risk,
       // awaiting your takeover approval (you're watching it); else bot took over.
       const self=p.user_managed;
       strat=`<span class="tag" title="${self?'你手动买入 · 高风险 · 等你确认是否接管（你自己盯盘）':'你手动买入 · 已被机器人接管止损/止盈'}" style="background:${self?'#d2992233':'#1f6feb33'};border:1px solid ${self?'#d29922':'#1f6feb'}">🖐 ${self?'手动·自管':'手动·接管'}</span>`;
@@ -916,6 +924,18 @@ async function loadSettings(){
   loadWebAccess();
   loadTradeEnv();
   loadAiEngine();
+  loadLicense();
+}
+
+async function loadLicense(){
+  try{const d=await api('/api/license/status');
+    $('#licInfo').innerHTML = !d.enforced
+      ? '开发模式（未强制 license）'
+      : d.activated
+        ? `${d.valid?'✅ 订阅有效':'⚠️ 订阅失效'} · ${d.key_masked||''}${d.email?' · '+d.email:''}`
+          +`${d.expires_at?' · 本期至 '+new Date(d.expires_at*1000).toLocaleDateString():''} · 本机 ${d.machine||''}`
+        : '❌ 未激活 — 点「管理」输入 license key';
+  }catch(e){ $('#licInfo').textContent='—'; }
 }
 
 // ── AI engine (Gemini ⟷ DeepSeek) + live model dropdown ──

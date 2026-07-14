@@ -1,5 +1,5 @@
 #!/bin/bash
-# Double-click to (re)launch the web dashboard + official moomoo OpenD app.
+# Double-click to (re)launch the web dashboard + official OpenD app.
 # - Starts moomoo_OpenD.app automatically if not already running
 # - Unlocks US stock trading
 # - RESTARTS cleanly so the latest backend code is always loaded (Flask doesn't
@@ -36,7 +36,7 @@ else
             break
         fi
         if [ $i -eq 60 ]; then
-            echo "✘ OpenD 端口 11111 未就绪 — 请到 moomoo OpenD 窗口完成登录后重试"
+            echo "✘ OpenD 端口 11111 未就绪 — 请到 OpenD 窗口完成登录后重试"
         fi
         sleep 1
     done

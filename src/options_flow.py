@@ -1,20 +1,20 @@
-"""Phase 2D — unusual options-activity / flow signal (moomoo-style 期权异动).
+"""Phase 2D — unusual options-activity / flow signal (broker-style 期权异动).
 
-Replicates the options block on moomoo's analysis card: detect option VOLUME that
+Replicates the options block on the broker's analysis card: detect option VOLUME that
 far exceeds OPEN INTEREST (a freshly-built position), put/call volume skew, and
 strike-level OI concentration (acts as support/resistance). Intended to feed 2A
 (smart exit) and 2B (sentiment) as one more factor.
 
 ⚠️ STATUS — BLOCKED / SCAFFOLD: the account currently has NO US options quote
-permission, so the moomoo API denies get_option_chain / get_market_snapshot for
-options ("No permission to get quotes ..."). Until the user subscribes to moomoo
+permission, so the broker API denies get_option_chain / get_market_snapshot for
+options ("No permission to get quotes ..."). Until the user subscribes to the broker
 US options market data this CANNOT be validated. The module therefore:
   • is OFF by default (settings.options_flow_enabled) and NOT wired into any live
     path — once data is available, 2A/2B can call assess() and use the result;
   • degrades to {"signal":"neutral","score":0,...} on ANY permission/data/SDK/
     error condition and NEVER raises, so enabling it can't break the main loop.
 
-Column names follow the moomoo SDK option chain (option_type / strike_price /
+Column names follow the broker SDK option chain (option_type / strike_price /
 code) and snapshot (volume / option_open_interest); all access is defensive so a
 future SDK shape change just yields neutral instead of an exception.
 """
@@ -113,7 +113,7 @@ def assess(symbol: str, client, timeout_s: float = 20.0, **kwargs) -> dict:
     # NOTE: do NOT use `with ThreadPoolExecutor()` — its __exit__ calls
     # shutdown(wait=True), which blocks until the (possibly wedged) worker
     # finishes and defeats the timeout. shutdown(wait=False) returns control now;
-    # a stuck moomoo call leaks one daemon thread until it unblocks (rare — only a
+    # a stuck broker call leaks one daemon thread until it unblocks (rare — only a
     # wedged OpenD), which is acceptable vs. stalling the whole bot.
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:

@@ -263,7 +263,7 @@ def simulate_v3(
 
     # Commission model. When _real_comm is off this returns the flat per-trade
     # value byte-for-byte (so parity is preserved); when on it charges the
-    # moomoo per-ORDER schedule on each side: pct × notional + platform fee, plus
+    # broker per-ORDER schedule on each side: pct × notional + platform fee, plus
     # sell-side regulatory bps. (Run the realistic lens without scale-out so each
     # trade is one buy + one sell — partials would re-charge the buy fee.)
     flat_commission = cfg.commission_per_trade

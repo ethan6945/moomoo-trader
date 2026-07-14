@@ -1,5 +1,5 @@
 """yfinance data source for backtests — an independent-window alternative to
-MooMoo OpenD.
+OpenD.
 
 WHY: OpenD's HOUR_1 history caps at ~150 calendar days, so every hourly backtest
 is trapped in the same recent window (can't test overfitting / a different
@@ -8,15 +8,15 @@ second/earlier window for out-of-sample validation and for the autopilot's
 weekly self-check.
 
 DROP-IN: exposes `get_kline(symbol, bars, ktype)` with the SAME return schema as
-`MoomooClient.get_kline` — a tz-naive DatetimeIndex named 'time_key' (ascending)
+`MooClient.get_kline` — a tz-naive DatetimeIndex named 'time_key' (ascending)
 and columns open/high/low/close/volume — so `backtest.prefetch_data` can swap the
 source with no other changes. Default-OFF: the engine only uses this when
-`BacktestConfig.data_source == "yfinance"`, so live/moomoo behavior is byte-identical.
+`BacktestConfig.data_source == "yfinance"`, so live/OpenD behavior is byte-identical.
 
 CAVEAT: Yahoo 1h bars are ~7/day (the last is a 15:30–16:00 half-bar) and are NOT
-tick-aligned with moomoo's bars. Treat a yfinance backtest as an INDEPENDENT
+tick-aligned with the broker's bars. Treat a yfinance backtest as an INDEPENDENT
 reference for "does the edge survive a different window", not a reproduction of
-moomoo fills.
+broker fills.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# moomoo KLType.name -> yfinance interval string
+# SDK KLType.name -> yfinance interval string
 _INTERVAL = {
     "K_1M": "1m", "K_5M": "5m", "K_15M": "15m", "K_30M": "30m",
     "K_60M": "1h", "K_DAY": "1d", "K_WEEK": "1wk", "K_MON": "1mo",
@@ -49,11 +49,11 @@ def _interval_for(ktype) -> str:
 
 
 class YFinanceSource:
-    """Minimal MoomooClient look-alike: only get_kline, matching its schema."""
+    """Minimal MooClient look-alike: only get_kline, matching its schema."""
 
     def close(self) -> None:
         """No-op — yfinance holds no OpenD connection. Present so YFinanceSource
-        is a drop-in wherever prefetch_data calls MoomooClient.close()."""
+        is a drop-in wherever prefetch_data calls MooClient.close()."""
         return None
 
     def get_kline(self, symbol: str, bars: int = 120, ktype=None) -> pd.DataFrame:
@@ -65,7 +65,7 @@ class YFinanceSource:
         interval = _interval_for(ktype)
 
         # Size the fetch window to comfortably hold `bars` candles, capped by
-        # Yahoo's per-interval history limit, then .tail(bars) like moomoo does.
+        # Yahoo's per-interval history limit, then .tail(bars) like OpenD does.
         bpd = _BARS_PER_DAY.get(interval, 1) or 1
         trading_days = max(1, math.ceil(bars / bpd))
         cal_days = min(math.ceil(trading_days * 7 / 5) + 5, _MAX_DAYS.get(interval, 730))
@@ -81,15 +81,15 @@ class YFinanceSource:
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Normalize columns → moomoo schema (lowercase o/h/l/c/v).
+        # Normalize columns → broker schema (lowercase o/h/l/c/v).
         df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
                                 "Close": "close", "Volume": "volume"})
         keep = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
         df = df[keep].copy()
 
-        # Index → tz-naive datetime named 'time_key', matching moomoo. Intraday
+        # Index → tz-naive datetime named 'time_key', matching OpenD. Intraday
         # yahoo bars are tz-aware → render in US/Eastern then drop tz so they line
-        # up with moomoo's ET-naive time_key; daily bars are already naive.
+        # up with the broker's ET-naive time_key; daily bars are already naive.
         idx = pd.to_datetime(df.index)
         if getattr(idx, "tz", None) is not None:
             try:

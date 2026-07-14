@@ -242,7 +242,7 @@ def main() -> None:
         sl_atr_mult=settings.sl_atr_mult,
         max_gap_pct=settings.max_gap_pct,
     )
-    print("\n  Prefetching data (single round-trip to MooMoo)…")
+    print("\n  Prefetching data (single round-trip to the broker)…")
     cache = prefetch_data(cfg_base)
     print(f"  Prefetched {len(cache['per_ticker'])} tickers.")
 

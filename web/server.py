@@ -43,7 +43,7 @@ from flask import Flask, jsonify, make_response, redirect, request, send_from_di
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import ai, approvals, clock, db, keepawake, risk_manager  # noqa: E402
+from src import ai, approvals, clock, db, keepawake, license_client, risk_manager  # noqa: E402
 from src.config import settings  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / "static"
@@ -79,7 +79,11 @@ def _no_cache(resp):
 # instantly invalidates every old cookie. The server REFUSES to bind to a non-local
 # host without a password (see main()).
 AUTH_COOKIE = "wt_auth"
-_PUBLIC_PATHS = {"/login", "/api/login", "/api/logout", "/favicon.ico"}
+_PUBLIC_PATHS = {
+    "/login", "/api/login", "/api/logout", "/favicon.ico",
+    "/static/favicon.svg", "/static/favicon-32.png", "/static/apple-touch-icon.png",
+    "/activate", "/api/license/activate", "/api/license/status",
+}
 _pw_cache = {"mtime": -1.0, "v": ""}
 _secret_cache = {"v": ""}
 
@@ -162,6 +166,26 @@ def _authed() -> bool:
     return hmac.compare_digest(request.cookies.get(AUTH_COOKIE, ""), _auth_token(pw))
 
 
+# ── license gate (Lemon Squeezy activation) ───────────────────────────────────
+# Registered BEFORE the password gate, so an unactivated install always lands
+# on /activate first. /api/license/deactivate stays license-exempt (a machine
+# with a revoked/stale license must still be able to unbind) but is NOT in
+# _PUBLIC_PATHS, so the password gate below still protects it.
+_LICENSE_OPEN = _PUBLIC_PATHS | {"/api/license/deactivate"}
+
+
+@app.before_request
+def _require_license():
+    if request.path in _LICENSE_OPEN:
+        return None
+    ok, _ = license_client.validate()
+    if ok:
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "license required"}), 402
+    return redirect("/activate")
+
+
 @app.before_request
 def _require_auth():
     if not _web_password():
@@ -208,6 +232,40 @@ def api_logout():
     return resp
 
 
+# ── license endpoints ──────────────────────────────────────────────────────────
+
+@app.route("/activate")
+def activate_page():
+    return send_from_directory(STATIC, "activate.html")
+
+
+@app.route("/api/license/status")
+def api_license_status():
+    return jsonify(license_client.status())
+
+
+@app.route("/api/license/activate", methods=["POST"])
+def api_license_activate():
+    # Reuse the login throttle: keys must not be guessable through this proxy.
+    ip = request.remote_addr or "?"
+    if _login_locked(ip):
+        return jsonify({"ok": False, "error": "尝试过多，请稍后再试"}), 429
+    key = ((request.json or {}).get("key") or "").strip()
+    ok, msg = license_client.activate(key)
+    _login_record(ip, ok)
+    if ok:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": msg}), 400
+
+
+@app.route("/api/license/deactivate", methods=["POST"])
+def api_license_deactivate():
+    ok, msg = license_client.deactivate()
+    if ok:
+        return jsonify({"ok": True, "msg": msg})
+    return jsonify({"ok": False, "error": msg}), 400
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _read_json(p: Path, default):
@@ -250,7 +308,7 @@ def _opend_running() -> bool:
     """True if OpenD is reachable on the configured host:port."""
     try:
         with socket.create_connection(
-            (settings.moomoo_host, settings.moomoo_port), timeout=0.6
+            (settings.moo_host, settings.moo_port), timeout=0.6
         ):
             return True
     except Exception:
@@ -377,7 +435,7 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
     connection has its own unlock state and wouldn't reflect the scheduler's).
 
     2026-07-09 honesty rewrite: the old badge claimed 已解锁 whenever an accinfo
-    query had succeeded — WRONG premise: queries never require unlock (moomoo's
+    query had succeeded — WRONG premise: queries never require unlock (the broker's
     trade unlock only gates order ops on REAL accounts) and SIMULATE has no
     unlock concept at all, so the badge lit green with the trade lock untouched.
     Now the unlock claim is env-aware:
@@ -386,7 +444,7 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
         unlock → "模拟盘 · 可交易".
       · REAL — 已解锁 only after a gated order op actually succeeded this
         scheduler session (`real_unlock_confirmed` in the snapshot, written by
-        src/main.py from moomoo_client). Until then the badge warns 解锁未确认
+        src/main.py from moo_client). Until then the badge warns 解锁未确认
         — a fresh REAL session that hasn't traded yet shows the warning even if
         the user did unlock; erring on the safe side is the point.
 
@@ -396,7 +454,7 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
       yellow — reachable but worth a look (label says why)
     """
     try:
-        with socket.create_connection((settings.moomoo_host, settings.moomoo_port), timeout=0.6):
+        with socket.create_connection((settings.moo_host, settings.moo_port), timeout=0.6):
             pass
     except Exception:
         return "red", "OpenD 未启动"
@@ -405,7 +463,7 @@ def _opend_status(acct: dict, sched_running: bool) -> tuple[str, str]:
     # before writing if the query raises) — i.e. the data pipeline works. It
     # says NOTHING about the trade unlock (queries don't need it).
     snapshot_ok = acct.get("cash") is not None
-    is_real = ((acct.get("trade_env") or settings.moomoo_trade_env or "SIMULATE")
+    is_real = ((acct.get("trade_env") or settings.moo_trade_env or "SIMULATE")
                .upper() == "REAL")
     unlock_ok = bool(acct.get("real_unlock_confirmed"))
     interval = (acct.get("scan_interval_min") or 30) * 60
@@ -496,6 +554,11 @@ def static_files(fn):
     return send_from_directory(STATIC, fn)
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return send_from_directory(STATIC, "favicon-32.png")
+
+
 # ── read API ─────────────────────────────────────────────────────────────────
 
 @app.route("/api/status")
@@ -523,7 +586,7 @@ def api_status():
             cell["atr"]         = tr.get("atr")
             cell["strategy"]    = tr.get("strategy")
             cell["pattern"]     = tr.get("pattern")   # chart pattern (pattern strategy only)
-            # Manual-adoption status so the web can badge YOUR own moomoo-app buys
+            # Manual-adoption status so the web can badge YOUR own broker-app buys
             # and show whether the bot has taken over or you're self-managing.
             cell["manual_adopted"] = bool(tr.get("manual_adopted"))
             cell["user_managed"]   = bool(tr.get("user_managed"))
@@ -953,7 +1016,7 @@ def api_scheduler(action):
     if action == "restart":
         # _stop_pid blocks until the old process group is gone (or ~3s), so a
         # fresh spawn afterwards can't collide with it. Picks up the latest .env
-        # (e.g. a just-flipped MOOMOO_TRADE_ENV).
+        # (e.g. a just-flipped MOO_TRADE_ENV).
         _stop_pid(SCHED_PID)
         return jsonify({"ok": True, "pid": _spawn_scheduler(), "note": "restarted"})
     return jsonify({"ok": False, "error": "bad action"}), 400
@@ -967,7 +1030,7 @@ def api_trade_env():
     (what the next start uses), the live value the running scheduler last reported,
     and the open-position count for the go-live safety check."""
     if request.method == "GET":
-        env_file = (_read_env().get("MOOMOO_TRADE_ENV") or "SIMULATE").upper()
+        env_file = (_read_env().get("MOO_TRADE_ENV") or "SIMULATE").upper()
         acct = _read_json(ACCOUNT_FILE, {})
         env_live = (acct.get("trade_env") or "").upper() or None
         try:
@@ -991,9 +1054,9 @@ def api_trade_env():
     if target == "REAL":
         if not body.get("confirm"):
             return jsonify({"ok": False, "error": "切换到实盘需要二次确认"}), 400
-        if not _read_env().get("MOOMOO_TRADE_PWD"):
+        if not _read_env().get("MOO_TRADE_PWD"):
             return jsonify({"ok": False,
-                            "error": "未设置 MOOMOO_TRADE_PWD（6 位交易密码）— 无法切到实盘"}), 400
+                            "error": "未设置 MOO_TRADE_PWD（6 位交易密码）— 无法切到实盘"}), 400
         try:
             n_open = len(db.load_open_trades())
         except Exception:
@@ -1003,7 +1066,7 @@ def api_trade_env():
                             "error": f"当前还有 {n_open} 个未平仓持仓（模拟盘）。请先全部平仓再切实盘，"
                                      f"否则本地持仓状态会和实盘账户串号。"}), 409
 
-    _write_env_key("MOOMOO_TRADE_ENV", target)
+    _write_env_key("MOO_TRADE_ENV", target)
     note = ("已切到实盘 💵 — 点「重启」后生效。首次实盘务必只放小额，先验证下单链路。"
             if target == "REAL"
             else "已切回模拟 🧪 — 点「重启」后生效。")
@@ -1275,7 +1338,7 @@ def _self_review_catchup_on_boot() -> None:
 # ── exit UI: kill everything (OpenD + scheduler + web server) ──────────────────
 @app.route("/api/exit", methods=["POST"])
 def api_exit():
-    """Exit the entire moomoo-trader system: stops OpenD, scheduler, menubar,
+    """Exit the entire moo-trader system: stops OpenD, scheduler, menubar,
     then kills this web server. The browser will show a brief confirmation
     before the connection drops."""
     _stop_opend()

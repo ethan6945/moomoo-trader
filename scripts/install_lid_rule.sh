@@ -7,7 +7,7 @@
 set -e
 USER_NAME="${1:?username required}"
 RULE="$USER_NAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
-DEST="/etc/sudoers.d/moomoo-nosleep"
+DEST="/etc/sudoers.d/moo-nosleep"
 
 # Validate in a temp file first so a typo can never corrupt the sudoers config.
 TMP="$(mktemp)"

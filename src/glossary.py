@@ -24,15 +24,15 @@ from __future__ import annotations
 GLOSSARY: dict[str, dict[str, dict[str, str]]] = {
     # ===================================================================
     "📘 概述 Overview": {
-        "moomoo-trader": {
-            "name": "What is moomoo-trader",
+        "moo-trader": {
+            "name": "What is moo-trader",
             "summary": "AI 驱动的美股自动化短线交易系统",
             "explain": (
                 "一个完整的自动化交易闭环:\n\n"
                 "  • 每 30 分钟扫描 watchlist (30 只 S&P 500 强势股)\n"
                 "  • 用 6 因子打分 + ML 历史胜率 + Gemini AI 上下文审核\n"
                 "  • 8 道过滤漏斗筛掉烂信号\n"
-                "  • 通过 MooMoo OpenAPI 下限价单 + OCO 止损/止盈\n"
+                "  • 通过 券商 OpenAPI 下限价单 + OCO 止损/止盈\n"
                 "  • Telegram 推送所有信号 + 持仓变化\n"
                 "  • DD 断路器 + 自适应仓位 + 黑名单 = 三层风控\n"
                 "  • 每月 ML 重训 + Optuna 重新调参 (建议不强加)"

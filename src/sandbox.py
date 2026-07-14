@@ -37,7 +37,7 @@ from src.config import settings
 from src import indicators, strategy_momentum, strategy_mr, strategy_pattern
 from src import regime as regime_mod, breadth, kill_switch, sector, risk_manager, blacklist
 from src import runtime_config
-from src.moomoo_client import MoomooClient
+from src.moo_client import MooClient
 from moomoo import KLType
 
 
@@ -117,7 +117,7 @@ class SimFeed:
         self._load_vix(start - timedelta(days=lookback_days), end)
 
     def _fetch_all(self, fetch_start: datetime, fetch_end: datetime):
-        client = MoomooClient()
+        client = MooClient()
         print(f"  Fetching {len(self._tickers)} tickers + SPY …")
         all_syms = list(self._tickers) + ["SPY"]
         for i, sym in enumerate(all_syms):
@@ -206,7 +206,7 @@ class SimFeed:
             n_h = len(self._hourly.get(sym, pd.DataFrame()))
             print(f"    {tag}: {n_h}h, {n_d}d bars")
         print(f"  Done: {len(self._hourly)}/{len(all_syms)} tickers loaded")
-        # close() (not just del): the moomoo SDK's quote context spawns
+        # close() (not just del): the broker SDK's quote context spawns
         # NON-DAEMON threads — a leaked context keeps the whole process alive
         # after main() returns (the 2026-07-07 optimizer hang at exit).
         try:
@@ -326,7 +326,7 @@ def _business_days(start: datetime, end: datetime) -> int:
     return days
 
 
-# ── Transaction cost model (Moomoo US rates) ────────────
+# ── Transaction cost model (broker US rates) ────────────
 _COMMISSION_PER_SHARE = 0.0049    # $0.0049/share
 _COMMISSION_MIN = 0.99            # min $0.99 per side
 _SLIPPAGE_BPS = 5.0               # 5 bps = 0.05% one-way
@@ -695,7 +695,7 @@ def run_sandbox(config: SandboxConfig) -> dict:
         regime, effective_label, vix = _assess_regime(feed)
 
         # ── Breadth (sandbox-native, zero OpenD dependency) ──
-        # breadth.assess(client, vix) requires Moomoo OpenQuoteContext.request_history_kline.
+        # breadth.assess(client, vix) requires the SDK OpenQuoteContext.request_history_kline.
         # SimFeed provides get_kline(sym, bars, ktype) — a different interface.
         # Solution: replicate the breadth logic directly against SimFeed SPY dailies.
         # VIX overlay 2026-07-11: SimFeed now carries REAL ^VIX history, so the
@@ -833,7 +833,7 @@ def run_sandbox(config: SandboxConfig) -> dict:
             if spread_pct > _SPREAD_MAX_PCT:
                 _skip("spread", f"bid-ask {spread_pct:.2f}% > {_SPREAD_MAX_PCT}%"); continue
 
-            # Sector — build mock positions_df matching MooMoo format
+            # Sector — build mock positions_df matching broker format
             pos_data = []
             for p in broker.positions.values():
                 code = f"US.{p.symbol}" if not p.symbol.startswith("US.") else p.symbol

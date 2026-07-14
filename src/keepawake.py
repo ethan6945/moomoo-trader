@@ -142,7 +142,7 @@ def _install_lid_rule_gui() -> bool:
     def _as(s: str) -> str:  # quote a Python string as an AppleScript string literal
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-    prompt = ("MooMoo Trader 想在合盖时也保持后台运行，需要一次管理员授权"
+    prompt = ("Moo Trader 想在合盖时也保持后台运行，需要一次管理员授权"
               "（仅授权 pmset 防睡眠，可随时撤销）。")
     osa = (f"do shell script {_as(shell_cmd)} "
            f"with prompt {_as(prompt)} with administrator privileges")

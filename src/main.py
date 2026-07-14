@@ -21,14 +21,14 @@ from moomoo import KLType
 from . import (
     adaptive_sizing, ai, ai_validator, approvals, audit, blacklist, breadth,
     clock, cron_state, db, executor, gap_sentinel, history, indicators,
-    kill_switch, notifier, portfolio,
+    kill_switch, license_client, notifier, portfolio,
     regime as regime_mod, risk_manager, runtime_config, sector, self_improve,
     self_review, strategy_momentum, strategy_mr, strategy_pattern,
     tg_approvals,
 )
 from .config import settings
 from .earnings import earnings_block
-from .moomoo_client import client, real_unlock_confirmed
+from .moo_client import client, real_unlock_confirmed
 from .reconcile import log_reconcile, reconcile
 
 SPREAD_MAX_PCT = 0.5   # refuse entry if bid-ask spread > 0.5% of mid
@@ -40,7 +40,7 @@ _INTRADAY_TFS = {"HOUR_1", "MIN_10", "MIN_30"}
 def _drop_forming_bar(df, timeframe: str):
     """Look-ahead audit: strip the last (currently-forming) intraday bar.
 
-    MooMoo's `request_history_kline` returns bars up to and including the bar
+    the broker's `request_history_kline` returns bars up to and including the bar
     that contains "now" — i.e. the last row of an intraday df is OPEN, not
     closed. Scoring on an open bar means the close, volume, and indicators
     all keep moving after we evaluate, so the live signal won't match the
@@ -180,7 +180,7 @@ def _refresh_account_snapshot(c, vix: float | None = None,
             "entry_threshold": runtime_config.entry_threshold(),   # 2026-07-06: use runtime override, not static .env
             "max_hold_days": runtime_config.max_hold_days(),      # 2026-07-06: use runtime override, not static .env
             "timeframe": settings.timeframe,
-            "trade_env": settings.moomoo_trade_env,
+            "trade_env": settings.moo_trade_env,
             # REAL unlock proof for the web badge: True only after a gated order
             # op succeeded this session. Always False on SIMULATE (no unlock).
             "real_unlock_confirmed": real_unlock_confirmed(),
@@ -338,7 +338,7 @@ def scan_once() -> None:
             log.warning("breadth assessment failed: %s — passing", e)
 
         # 2c. Supervise MANUAL positions reconcile just adopted this scan (your
-        # moomoo-app buys). Runs BEFORE the kill-switch early-return so a bear-
+        # broker-app buys). Runs BEFORE the kill-switch early-return so a bear-
         # regime adoption is still reviewed + risk-flagged. NORMAL adoptions are
         # released to the bot's stops/TP; HIGH-risk ones stay owner-held and queue
         # a Telegram takeover approval.
@@ -450,7 +450,7 @@ def scan_once() -> None:
                 "entry_threshold": runtime_config.entry_threshold(),   # 2026-07-06: use runtime override, not static .env
                 "max_hold_days": runtime_config.max_hold_days(),      # 2026-07-06: use runtime override, not static .env
                 "timeframe": settings.timeframe,
-                "trade_env": settings.moomoo_trade_env,
+                "trade_env": settings.moo_trade_env,
                 "real_unlock_confirmed": real_unlock_confirmed(),
                 "vix": round(vix, 1),
                 "regime": regime.label,
@@ -761,7 +761,7 @@ def scan_once() -> None:
             # The module stays for future opt-in, but the live path skips it.
             vision_conf = vision_label = vision_reason = None
 
-            # --- moomoo-style sentiment read (Phase 2B; advisory) ---
+            # --- broker-style sentiment read (Phase 2B; advisory) ---
             # 看好/中性/看空 multi-factor score. ADVISORY — never changes which
             # trade fires (parity). Optional SENTIMENT_SIZING folds the 0-100
             # score into conviction (sizing only). FAIL-SAFE → neutral 50.
@@ -1632,7 +1632,7 @@ def run_loop() -> None:
     sched.add_job(_watchdog_job, "cron", day_of_week="mon-fri", hour=17, minute=30,
                   coalesce=True, misfire_grace_time=3600, max_instances=1)
 
-    # API/subscription health watchdog: probe moomoo options data + Gemini every
+    # API/subscription health watchdog: probe broker options data + Gemini every
     # HEALTH_CHECK_INTERVAL_MIN min and Telegram the owner ONLY on a state change
     # (subscription lapsed / Gemini quota out → top up). Owner-requested; edge-
     # triggered so no spam. Also runs once at startup for an immediate status.
@@ -1672,7 +1672,7 @@ def run_loop() -> None:
         settings.scan_interval_min,
     )
     from .i18n import t
-    notifier.send(t("tg_started", env=settings.moomoo_trade_env))
+    notifier.send(t("tg_started", env=settings.moo_trade_env))
     sched.start()
 
 
@@ -1681,6 +1681,14 @@ def main() -> None:
         print(__doc__)
         sys.exit(1)
     cmd = sys.argv[1]
+    # License gate — only at process START, deliberately not mid-run: a running
+    # scheduler managing open positions (stops/exits) must never be killed by a
+    # license-server outage. The web panel re-validates daily and locks there.
+    if cmd in ("scan", "run"):
+        lic_ok, lic_msg = license_client.validate()
+        if not lic_ok:
+            print(f"✗ License：{lic_msg}\n  请在 Web 面板完成激活（浏览器打开 /activate 页面）。")
+            sys.exit(3)
     if cmd == "scan":
         scan_once()
     elif cmd == "run":

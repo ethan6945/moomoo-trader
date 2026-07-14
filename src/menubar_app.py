@@ -1,4 +1,4 @@
-"""MooMoo Trader menu-bar status app (rumps).
+"""Moo Trader menu-bar status app (rumps).
 
 Its very presence in the menu bar means the trading scheduler is running in the
 background — so you can close the web dashboard and still tell at a glance whether
@@ -42,12 +42,12 @@ def _pid_alive(pid_file: Path) -> int | None:
 
 class MenuBar(rumps.App):
     def __init__(self):
-        # Plain text title "MAT" (Moomoo Auto Trading) — no logo/emoji. macOS renders
+        # Plain text title "MAT" (Moo Auto Trading) — no logo/emoji. macOS renders
         # menu-bar titles in the system colour automatically (black in light mode,
         # white in dark mode). State lives inside the menu, not in the title.
         # quit_button=None: we replace the default Quit with clearly-labelled items
         # so the user never accidentally thinks closing the icon stops trading.
-        super().__init__("MooMoo", title="MAT", quit_button=None)
+        super().__init__("Moo", title="MAT", quit_button=None)
         self.m_status = rumps.MenuItem("Scheduler …")
         self.m_awake = rumps.MenuItem("☕ 防睡眠 …", callback=self.toggle_awake)
         self.m_open = rumps.MenuItem("🌐 打开 Web 仪表盘", callback=self.open_web)

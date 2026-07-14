@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g" gradientUnits="userSpaceOnUse" x1="22" y1="26" x2="106" y2="112">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#a371f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#0d1424"/>
+  <rect x="1" y="1" width="126" height="126" rx="27" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="2"/>
+  <g transform="translate(64 63.5) scale(1.13) translate(-64 -63.5)">
+    <path d="M44 58 C30 56 22 46 22 30" stroke="url(#g)" stroke-width="13" stroke-linecap="round" fill="none"/>
+    <path d="M84 58 C98 56 106 46 106 30" stroke="url(#g)" stroke-width="13" stroke-linecap="round" fill="none"/>
+    <path d="M36 62 Q36 50 48 50 L80 50 Q92 50 92 62 L92 74 Q92 102 64 102 Q36 102 36 74 Z" fill="url(#g)"/>
+    <circle cx="52" cy="68" r="5" fill="#0d1424"/>
+    <circle cx="76" cy="68" r="5" fill="#0d1424"/>
+    <circle cx="56" cy="89" r="3.2" fill="#0d1424" opacity=".55"/>
+    <circle cx="72" cy="89" r="3.2" fill="#0d1424" opacity=".55"/>
+    <path d="M64 16 L73 28 L67.5 28 L67.5 40 L60.5 40 L60.5 28 L55 28 Z" fill="#3fb950"/>
+  </g>
+</svg>

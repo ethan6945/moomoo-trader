@@ -51,7 +51,7 @@ MAX_CHANGES_PER_WEEK = 3
 DRAWDOWN_FREEZE_PCT = 0.10   # freeze all auto-changes when DD ≥ 10%
 
 # ── System prompt (sent to DeepSeek) ─────────────────────────────────────────
-SYSTEM_PROMPT = """You are the autonomous portfolio manager for moomoo-trader.
+SYSTEM_PROMPT = """You are the autonomous portfolio manager for moo-trader.
 
 ACCOUNT (${budget:,.0f} US cash — owner-allocated budget; NEVER exceed it, no leverage/margin, long-only, no shorting):
 - Max 5 concurrent positions
@@ -201,7 +201,7 @@ def weekly_autopilot() -> dict:
     market_ctx = "market data unavailable"
     try:
         from moomoo import KLType
-        from .moomoo_client import client
+        from .moo_client import client
         with client() as c:
             bv = breadth.assess(c)
             market_ctx = (

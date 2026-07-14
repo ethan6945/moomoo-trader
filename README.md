@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📈 MooMoo Trader
+# 📈 Moo Trader
 
 **AI 驱动的美股全自动短线交易系统**
 
@@ -10,7 +10,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![macOS](https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white)
-![Broker](https://img.shields.io/badge/broker-moomoo%20OpenAPI-FF6A00)
+![Broker](https://img.shields.io/badge/broker-OpenD%20OpenAPI-FF6A00)
 ![AI](https://img.shields.io/badge/AI-Gemini%20%2B%20Optuna-8E75B2)
 ![Status](https://img.shields.io/badge/status-paper%20trading-yellow)
 ![License](https://img.shields.io/badge/license-private-red)
@@ -148,7 +148,7 @@ Optuna 贝叶斯调参 + AI 优化器 + 每日增量 sweep。护栏内的建议�
 ```mermaid
 flowchart TB
     subgraph HOST["🖥 常驻 Mac（建议 Mac mini + 电源常插）"]
-        OPEND["MooMoo OpenD<br/>官方券商网关 · :11111"]
+        OPEND["OpenD<br/>官方券商网关 · :11111"]
         SCHED["① 交易调度器<br/>python -m src.main run<br/>扫描 · 下单 · 管仓 · 定时任务"]
         WEB["② Web 仪表盘<br/>Flask · :8770<br/>监控 · 配置 · 审批 · 启停调度器"]
         DATA[("data/<br/>SQLite + JSON 快照")]
@@ -166,7 +166,7 @@ flowchart TB
 
 | 进程 | 职责 | 说明 |
 |------|------|------|
-| **MooMoo OpenD** | 行情 + 下单网关 | 富途/moomoo 官方本地网关，须全程运行；`start-web.command` 会自动拉起 |
+| **OpenD** | 行情 + 下单网关 | 券商官方本地网关，须全程运行；`start-web.command` 会自动拉起 |
 | **① 调度器** | 真正的交易大脑 | APScheduler 驱动所有扫描、管仓、定时任务；从 Web 面板 ▶ Start 启动 |
 | **② Web 仪表盘** | 监控 + 控制台 | **本身不交易**，只读快照、改配置、处理审批；停掉不影响交易 |
 | **③ Telegram** | 通知 + 审批 | 推送下单/止损/状态，按钮处理审批队列 |
@@ -182,14 +182,14 @@ flowchart TB
 | 依赖 | 用途 | 获取 |
 |------|------|------|
 | macOS + Python 3.11+ | 运行环境 | 安装脚本会自动处理 Python |
-| MooMoo OpenD | 行情 + 下单网关 | [openapi.moomoo.com](https://openapi.moomoo.com) 下载安装并登录 |
-| moomoo App | 开户 + 设交易密码 | App Store 搜 "moomoo"（审核 1–3 工作日，开通 Paper Trading） |
+| OpenD | 行情 + 下单网关 | [openapi.moomoo.com](https://openapi.moomoo.com) 下载安装并登录 |
+| 券商 App | 开户 + 设交易密码 | 到 [openapi.moomoo.com](https://openapi.moomoo.com) 所属券商官网 / App Store 下载官方 App（审核 1–3 工作日，开通 Paper Trading） |
 
 **外部 API（都有免费层）：**
 
 | 服务 | 用途 | 注册 | 免费额度 |
 |------|------|------|---------|
-| MooMoo OpenAPI | 行情 + 交易 | [openapi.moomoo.com](https://openapi.moomoo.com) | 免费 |
+| 券商 OpenAPI | 行情 + 交易 | [openapi.moomoo.com](https://openapi.moomoo.com) | 免费 |
 | Google Gemini | AI 复核 / 优化器 | [aistudio.google.com](https://aistudio.google.com) | 1500 req/天 |
 | Tavily | 新闻搜索（喂给 AI） | [app.tavily.com](https://app.tavily.com) | 1000 req/月 |
 | Telegram Bot | 通知 + 审批 | [@BotFather](https://t.me/BotFather) | 免费 |
@@ -197,8 +197,8 @@ flowchart TB
 ### 1️⃣ 克隆 + 一键安装
 
 ```bash
-git clone <your-repo-url> moomoo-trader
-cd moomoo-trader
+git clone <your-repo-url> moo-trader
+cd moo-trader
 ./setup-macmini.command
 ```
 
@@ -225,7 +225,7 @@ cp .env.example .env
 
 | 键 | 说明 |
 |----|------|
-| `MOOMOO_TRADE_PWD` | 6 位**交易密码**（和登录密码分开，App → 设置 → 交易密码） |
+| `MOO_TRADE_PWD` | 6 位**交易密码**（和登录密码分开，App → 设置 → 交易密码） |
 | `GEMINI_API_KEYS` | 逗号分隔，可多 key 轮换 |
 | `TAVILY_API_KEY` | 新闻搜索 |
 | `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` | @BotFather 创建 |
@@ -323,7 +323,7 @@ flowchart LR
 | 5 | 多周期确认 | 日线 EMA20 > EMA50（HOUR_1 模式必查） | `indicators` |
 | 6 | 隔夜跳空 | \|跳空\| > 4% → 拒（不追高、不接刀） | `indicators` |
 | 7 | 财报屏蔽 | 距下次财报 ≤ 2 天 → 拒 | `earnings` |
-| 8 | 买卖价差 | bid-ask spread > 0.5% → 拒（流动性差） | `moomoo_client` |
+| 8 | 买卖价差 | bid-ask spread > 0.5% → 拒（流动性差） | `moo_client` |
 | 9 | AI 复核 | Gemini + Tavily 查「指标看不到的雷」；**建议模式不拦单**，下单后才问以省延迟 | `ai_validator` |
 | 10 | 风控闸 | 24h 止损冷却 / 持仓数上限 / 现金 / 预算上限 | `risk_manager` |
 | 11 | 每轮新股上限 | 每轮最多 2 只新股，加仓老仓不占额度 | `main` |
@@ -364,7 +364,7 @@ flowchart LR
 | 分批止盈 scale-out | +3R / +6R 各卖 1/3 | ⚠️ 故意空转（回测证明会杀掉肥尾利润） |
 | 智能退出 / 停滞退出 | 盘中 AI 利空锁盈 / 几天不动腾资金 | ❌ 默认关（未过验证闸门） |
 
-> **手动仓位接管**：你自己在 moomoo App 买的票，对账时会被「收养」并标记 `user_managed`（对所有自动退出免疫）。系统评估后：正常则交给 bot 管止损；高风险则发 Telegram 审批让你决定。
+> **手动仓位接管**：你自己在 券商 App 买的票，对账时会被「收养」并标记 `user_managed`（对所有自动退出免疫）。系统评估后：正常则交给 bot 管止损；高风险则发 Telegram 审批让你决定。
 
 ---
 
@@ -479,7 +479,7 @@ python -m src.optimizer --days 180 --trials 20 --folds 3 --min-trades 60
 
 | 配置 | 值 | 说明 |
 |------|----|------|
-| `MOOMOO_TRADE_ENV` | `SIMULATE` | 模拟盘。切 REAL 须在 Web 设置里做（2 次确认 + 交易密码 + 空仓才允许） |
+| `MOO_TRADE_ENV` | `SIMULATE` | 模拟盘。切 REAL 须在 Web 设置里做（2 次确认 + 交易密码 + 空仓才允许） |
 | `GAP_SENTINEL_ENABLED` | `true` | 跳空哨兵：财报临近或实锤利空 → 开盘清仓 |
 | `USE_BREAKEVEN_STOP` | `true` | +1R 保本移动止损 |
 | `REAL_USE_SOFT_EXITS` | `true` | REAL 也用软退出，和回测口径一致 |
@@ -502,7 +502,7 @@ python -m src.optimizer --days 180 --trials 20 --folds 3 --min-trades 60
 | `PATTERN_ENABLED` | 形态策略回测不提升收益且 maxDD 翻倍，过不了「不恶化回撤」闸门。无 edge 不上 |
 | `PATTERN_VISION_ENABLED` | 依赖形态策略；且 HOUR_1 历史数据凑不出第二个独立回测窗口 |
 | `SMART_EXIT_ENABLED` | 盘中 AI/技术智能退出，未验证；隔夜风险已由哨兵覆盖 |
-| `SENTIMENT_SCORING_ENABLED` | moomoo 式看好/看空打分，纯建议不改下单，默认关省 API 调用 |
+| `SENTIMENT_SCORING_ENABLED` | 券商 App 式看好/看空打分，纯建议不改下单，默认关省 API 调用 |
 | `OPTIONS_FLOW_ENABLED` | 期权异动只被 smart_exit / sentiment 消费（都关着），单独开无意义 |
 | `STALL_OUT_ENABLED` | 停滞退出。验证引擎没有它，且 max-hold 桶净赚；实盘仅有的停滞退出全亏 |
 | `SMART_REGIME_ENABLED` | 滞回平滑的 regime 标签（500 天回测：翻转 −89%）。默认关保持与回测逐字节一致 |
@@ -537,11 +537,11 @@ python -m src.optimizer --days 180 --trials 20 --folds 3 --min-trades 60
 <summary><b>展开目录树</b></summary>
 
 ```text
-moomoo-trader/
+moo-trader/
 ├── src/                              # 交易核心
 │   ├── main.py                       # 入口：扫描 + 调度 + 错过任务补跑
 │   ├── config.py                     # .env → settings（功能开关 + 默认值）
-│   ├── moomoo_client.py              # OpenD 封装（行情 / 下单 / 快照）
+│   ├── moo_client.py              # OpenD 封装（行情 / 下单 / 快照）
 │   │
 │   ├── indicators.py                 # 策略① 趋势（6 因子）+ MTF/gap 辅助
 │   ├── strategy_momentum.py          # 策略② 动量突破
@@ -616,7 +616,7 @@ moomoo-trader/
 <details>
 <summary><b>OpenD 启动后要求「解锁交易」？</b></summary>
 
-GUI 版 OpenD 不能通过 API 解锁，需手动点一次 OpenD 窗口的「解锁交易」。之后 bot 用 MD5 哈希后的 `MOOMOO_TRADE_PWD` 自动登录。
+GUI 版 OpenD 不能通过 API 解锁，需手动点一次 OpenD 窗口的「解锁交易」。之后 bot 用 MD5 哈希后的 `MOO_TRADE_PWD` 自动登录。
 
 </details>
 
@@ -683,7 +683,7 @@ GUI 版 OpenD 不能通过 API 解锁，需手动点一次 OpenD 窗口的「解
 | 层 | 技术 |
 |----|------|
 | 语言 / 运行时 | Python 3.11 · APScheduler |
-| 券商接口 | MooMoo OpenAPI SDK（行情 + 交易） |
+| 券商接口 | moomoo-api SDK（行情 + 交易） |
 | AI | Google Gemini（复核 / 优化器 / 看图）· Tavily（新闻） |
 | 量化 | pandas + pandas-ta-classic · Optuna · yfinance |
 | 存储 | SQLite + JSON 快照 |

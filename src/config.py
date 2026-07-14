@@ -30,12 +30,12 @@ def _timeframe(default: str = "HOUR_1") -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    moomoo_host: str = os.getenv("MOOMOO_HOST", "127.0.0.1")
-    moomoo_port: int = _int("MOOMOO_PORT", 11111)
-    moomoo_trade_pwd: str = os.getenv("MOOMOO_TRADE_PWD", "")
-    moomoo_trade_env: str = os.getenv("MOOMOO_TRADE_ENV", "SIMULATE")
-    moomoo_market: str = os.getenv("MOOMOO_MARKET", "US")
-    moomoo_security_firm: str = os.getenv("MOOMOO_SECURITY_FIRM", "FUTUMY")
+    moo_host: str = os.getenv("MOO_HOST", "127.0.0.1")
+    moo_port: int = _int("MOO_PORT", 11111)
+    moo_trade_pwd: str = os.getenv("MOO_TRADE_PWD", "")
+    moo_trade_env: str = os.getenv("MOO_TRADE_ENV", "SIMULATE")
+    moo_market: str = os.getenv("MOO_MARKET", "US")
+    moo_security_firm: str = os.getenv("MOO_SECURITY_FIRM", "FUTUMY")
 
     gemini_keys: tuple = tuple(
         k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()
@@ -173,10 +173,10 @@ class Settings:
     smart_exit_min_profit_r: float = _float("SMART_EXIT_MIN_PROFIT_R", 1.0)
     smart_exit_model: str = os.getenv("SMART_EXIT_MODEL", "gemini-3.5-flash")
 
-    # ── Sentiment scoring (Phase 2B, 2026-06-23): moomoo-style 看好/看空 ──
+    # ── Sentiment scoring (Phase 2B, 2026-06-23): broker-style 看好/看空 ──
     # For each buy candidate, Gemini fuses news + analyst-target direction + the
     # technical reasons (sig.reasons) into a 0-100 bullishness score (50=neutral),
-    # like the moomoo analysis card. DEFAULT OFF, ADVISORY (recorded + shown, does
+    # like the broker analysis card. DEFAULT OFF, ADVISORY (recorded + shown, does
     # NOT change which trades fire → live↔backtest parity preserved). FAIL-SAFE →
     # neutral 50 on any error. Optional SENTIMENT_SIZING folds the score into the
     # existing conviction → position-size channel (still never changes selection).
@@ -186,7 +186,7 @@ class Settings:
     sentiment_budget: int = _int("SENTIMENT_BUDGET", 8)
 
     # ── Options flow (Phase 2D, 2026-06-23): unusual options activity ──
-    # moomoo-style 期权异动: volume ≫ open-interest, put/call skew, OI-concentration
+    # broker-style 期权异动: volume ≫ open-interest, put/call skew, OI-concentration
     # support/resistance (src/options_flow.py). BLOCKED until the account has US
     # options quote permission — the API denies the chain/snapshot otherwise. The
     # module degrades to neutral and is NOT wired into live paths yet; flip this on
@@ -194,7 +194,7 @@ class Settings:
     options_flow_enabled: bool = os.getenv("OPTIONS_FLOW_ENABLED", "false").lower() in ("1", "true", "yes")
 
     # ── API/subscription health watchdog (2026-06-23) ──
-    # Edge-triggered Telegram alerts when a silent dependency lapses: the moomoo
+    # Edge-triggered Telegram alerts when a silent dependency lapses: the broker
     # options data subscription (can't fetch chains/snapshots) or the Gemini API
     # balance/quota (AI layers go blind). Owner-requested safety net → DEFAULT ON
     # (set HEALTH_CHECK_ENABLED=false to silence). Runs every interval minutes +

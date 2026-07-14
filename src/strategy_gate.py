@@ -138,7 +138,7 @@ def weekly_gate_check() -> dict:
 
     # ── Market check ──
     try:
-        from .moomoo_client import client
+        from .moo_client import client
         with client() as c:
             vix = c.get_vix()
             bv = breadth.assess(c, vix=vix)

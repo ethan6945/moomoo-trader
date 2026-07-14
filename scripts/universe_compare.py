@@ -29,7 +29,7 @@ log = logging.getLogger("uni_cmp")
 MEGA = ["SNDK", "MU", "INTC", "LRCX", "DDOG", "AMD", "WDC", "SWKS", "PANW", "MCHP"]
 # Liquid, structurally high-volatility small/mid-caps across themes (fintech, EV,
 # growth/consumer, crypto-proxy). Picked for ATR% + liquidity + diversity, not
-# recent performance. Names with thin/no MooMoo data are auto-skipped by prefetch.
+# recent performance. Names with thin/no broker data are auto-skipped by prefetch.
 MIDVOL = ["SOFI", "AFRM", "HOOD", "RIVN", "LCID", "RBLX", "U", "PINS",
           "SNAP", "DKNG", "CVNA", "MARA", "RIOT", "UPST"]
 

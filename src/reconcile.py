@@ -152,7 +152,7 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
                 "strategy": "reconcile_orphan_recovery",
                 "stacks": 1,
                 # Manual-position hand-off (2026-06-22): an orphan is a position
-                # the bot never opened (your manual moomoo-app buy, or crash
+                # the bot never opened (your manual broker-app buy, or crash
                 # recovery). Mark it owner-held + pending so NO auto-exit (soft
                 # stop, fast-stop tick, blacklist/gap/over-cap flush) touches it
                 # until manual_positions.review_adopted() has judged its risk and
@@ -168,7 +168,7 @@ def reconcile(broker_positions: pd.DataFrame, auto_fix: bool = True,
                         sym, o["broker_qty"], cost)
 
         # FIX GHOST: a tracked position the broker no longer holds = it was closed
-        # ELSEWHERE — you sold it yourself in the moomoo app (or an unrecorded
+        # ELSEWHERE — you sold it yourself in the broker app (or an unrecorded
         # close). BOOK the realised P&L at the true fill price so the trade lands
         # in trades.jsonl / win-rate / equity, THEN drop the record. Falls back to
         # a fresh last price (flagged approximate) so the trade is still recorded

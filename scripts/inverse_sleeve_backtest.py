@@ -1,7 +1,7 @@
 """Validation harness for the inverse-ETF sleeve (src/inverse_sleeve.py).
 
 The sleeve is DEFAULT OFF and must not go live until it clears a gate. This
-script is that gate. It fetches DAILY bars (so it is NOT limited by moomoo's
+script is that gate. It fetches DAILY bars (so it is NOT limited by the broker's
 HOUR_1 ~150-bar cap — daily gives a genuine multi-year window, which is what a
 regime/trend play needs), replays the exact entry/exit rule, and answers:
 
@@ -44,7 +44,7 @@ def _regime_series(spy: pd.DataFrame) -> pd.Series:
 
 def run(symbol: str, days: int, sl_atr: float, tp_atr: float,
         sma_len: int, atr_len: int, max_hold: int) -> dict:
-    from src.moomoo_client import client
+    from src.moo_client import client
     from moomoo import KLType
 
     bars = max(days + 220, 460)   # +warmup for SMA200

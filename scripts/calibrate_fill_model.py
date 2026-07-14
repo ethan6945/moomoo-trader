@@ -7,7 +7,7 @@ MEASUREMENT ONLY. This script never edits a constant — it prints and saves the
 evidence so the owner can decide. Two hard gates before any constant should be
 touched, both enforced in the verdict:
 
-  1. ENVIRONMENT — under MOOMOO_TRD_ENV=SIMULATE the fills come from moomoo's
+  1. ENVIRONMENT — under MOO_TRD_ENV=SIMULATE the fills come from the broker's
      paper-trading engine (no queue position, no partial-fill dynamics, usually
      fills AT the touch). Paper "slippage" says nothing about real
      microstructure; only the CANCEL RATE (5-min TTL expiries) carries real
@@ -66,10 +66,10 @@ def _pctl(xs: list[float], q: float):
 
 def fetch_orders(days: int):
     from src.config import settings
-    from src.moomoo_client import MoomooClient, _env_enum
+    from src.moo_client import MooClient, _env_enum
     start = (date.today() - timedelta(days=days)).isoformat()
     end = (date.today() + timedelta(days=1)).isoformat()
-    c = MoomooClient()
+    c = MooClient()
     try:
         ret, df = c.trade.history_order_list_query(
             start=start, end=end, trd_env=_env_enum())
@@ -79,7 +79,7 @@ def fetch_orders(days: int):
         raise RuntimeError(f"history_order_list_query failed: {df}")
     skip_code = f"US.{settings.cash_yield_symbol}"
     df = df[df["code"] != skip_code]
-    return df, settings.moomoo_trade_env
+    return df, settings.moo_trade_env
 
 
 def analyze_buys(df) -> dict:
@@ -187,7 +187,7 @@ def main() -> int:
     n_fills = buys["exec_vs_limit_bps"]["n"]
     blockers = []
     if env == "SIMULATE":
-        blockers.append("paper trading (SIMULATE) — fill prices come from moomoo's "
+        blockers.append("paper trading (SIMULATE) — fill prices come from the broker's "
                         "paper engine, not real microstructure; only the cancel "
                         "rate carries real signal")
     if n_fills < MIN_FILLS_FOR_CHANGE:

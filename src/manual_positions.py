@@ -1,4 +1,4 @@
-"""Adopt & supervise MANUAL positions — orders YOU placed yourself in the moomoo
+"""Adopt & supervise MANUAL positions — orders YOU placed yourself in the broker
 app (or any broker position the bot never opened).
 
 reconcile.py already pulls such a position ("orphan": broker has it, we don't)

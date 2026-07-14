@@ -1,4 +1,4 @@
-"""adversary.py — the RED TEAM for moomoo-trader.
+"""adversary.py — the RED TEAM for moo-trader.
 
 Premise: every "practice" the live bot believes in is GUILTY until the data
 proves it innocent. This script does two adversarial jobs:

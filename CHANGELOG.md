@@ -10,7 +10,7 @@
 - **基线（2026-07-11,30 天窗）**：sandbox 27 vs v3 15 笔（窗口内）、9 笔配对；同日配对入场差中位 ~6bps（成交模型吻合）,±1 天配对含周末跳空属诚实非信号 → 容差只读同日配对。缺口主因：sandbox 的 regime 自适应阈值（BULL 60 vs v3 固定 65）+ v3 的 17 次 cash-limited。默认容差按基线+余量校准（match≥25%、同日中位≤25bps、净利差≤60%）。
 - 环境修复：uv venv 缺 parquet 引擎（`pd.read_parquet` 全挂,sandbox 缓存实际不可用）→ 装 `pyarrow` 并补进 `requirements.txt`。
 - **周检接线**（`main.py`）：新增 `_weekly_sandbox_diff_job`,周一 20:25 KL（周一链最后一个,量测的是本周实际要跑的配置）,subprocess 隔离跑差分脚本;**exit 0 只记 log+audit,exit 2（分歧超容差）才 Telegram**,脚本自身挂掉也通知。含启动 catch-up 注册（`sandbox_diff`）。已实跑验证全链路。
-- **第 4 层脚手架**（`scripts/calibrate_fill_model.py`）：从 moomoo `history_order_list_query` 量测真实成交 vs 模型假设（5bps/边、触价即成）。**只测量不改常数**,改动被双闸门挡住：SIMULATE 环境（纸面撮合无微观结构信号,只有撤单率是真的）+ 样本 <30 笔。排除 SGOV（现金生息仓）。首测 90 天：BUY 177 单仅 45 成交（**成交率 25.4%**,132 单 5 分钟 TTL 撤单——对照引擎"一根 bar 内触价即成"的假设,这是最值得跟踪的真信号）;bot 账本记录的卖出价与实际 dealt 中位差仅 2.2bps（记账诚实）;SL 软止损中位越价 −12.6bps（n=6）。
+- **第 4 层脚手架**（`scripts/calibrate_fill_model.py`）：从券商 `history_order_list_query` 量测真实成交 vs 模型假设（5bps/边、触价即成）。**只测量不改常数**,改动被双闸门挡住：SIMULATE 环境（纸面撮合无微观结构信号,只有撤单率是真的）+ 样本 <30 笔。排除 SGOV（现金生息仓）。首测 90 天：BUY 177 单仅 45 成交（**成交率 25.4%**,132 单 5 分钟 TTL 撤单——对照引擎"一根 bar 内触价即成"的假设,这是最值得跟踪的真信号）;bot 账本记录的卖出价与实际 dealt 中位差仅 2.2bps（记账诚实）;SL 软止损中位越价 −12.6bps（n=6）。
 - 发现：closed_trades 里 bot 的 `entry_price` 记的是**下单限价**而非 `dealt_avg_price`（代码只读过 `dealt_qty`）——真实成交价只能从券商订单历史拿,校准脚本因此直接查 API。
 
 ## 2026-07-08 — 网页面板：净值曲线移入历史 + 美国板块总览（Live）
@@ -55,9 +55,9 @@
 - **隔离**：自己的 db-state 槽 `inverse_sleeve_position`（不进 open_trades，策略 executor 不碰它）；reconcile 把该 ETF 从 orphan 检测排除。`main.py` 扫描里在 cash_yield 之前调用（先占自己的 sleeve，剩下的现金再给 cash_yield 生息）。下单复用 `place_limit_order`。Web `GET/POST /api/inverse-sleeve`。
 - 验证：14/14 纯函数单测（indicators / entry / exit 各分支 / size 封顶 / regime 序列）+ 全量 import clean。回测脚本需 OpenD 在线、由 owner 跑。
 
-## 2026-06-23 — Phase 2：moomoo 式 AI 智能退出 / 加权选股 / 期权流骨架
+## 2026-06-23 — Phase 2：券商 App 式 AI 智能退出 / 加权选股 / 期权流骨架
 
-复刻 moomoo 个股 AI 分析卡的能力（新闻情绪 + 技术 + 期权异动），接进现有风控。全部默认关、FAIL-SAFE、Gemini 全用 ≥3.5-flash。
+复刻 券商个股 AI 分析卡的能力（新闻情绪 + 技术 + 期权异动），接进现有风控。全部默认关、FAIL-SAFE、Gemini 全用 ≥3.5-flash。
 
 - **2A AI 智能退出** — `src/smart_exit.py`(新) + `ai_validator.assess_exit()`：持仓盘中遇
   「具体坏消息/分析师下调/板块转空」(AI) 或「技术明确破位且已盈利」(算法锁盈) 时强制提前退出，
@@ -65,12 +65,12 @@
   **同一个 `_force_close`**（零新增执行代码）。配置 `SMART_EXIT_*`（默认关）。`SMART_EXIT_MIN_PROFIT_R`
   门控算法锁盈（浮盈≥N×R 才落袋，避免割没赚的单；AI 坏消息路径不受此限）。已验证：算法锁盈/盈利门控/
   禁用/无 key FAIL-SAFE 全正确（实测一次 Gemini 撞到 Google 地区限制 400→正确 HOLD 不崩）。
-- **2B moomoo 式加权选股** — `ai_validator.assess_sentiment()`：每个买入候选用 Gemini 融合
+- **2B 券商 App 式加权选股** — `ai_validator.assess_sentiment()`：每个买入候选用 Gemini 融合
   新闻+分析师目标价方向+技术理由(sig.reasons)→ 0-100 看好度（50中性）。`main.py` 评分处接入，
   **默认 advisory**（写审计 extra，不改成交集→保回测平价）；可选 `SENTIMENT_SIZING` 折进 conviction
   仓位（仍不改选择）。配置 `SENTIMENT_*`（默认关）。
 - **2C 宽 TP 验证** — 回测网格证明用户「降 TP/SL 增收益」直觉是**反的**：降 TP/SL 不增加交易数、
-  反砍收益（把赢家提前砍掉）、收紧 SL 直接亏；**调宽** TP（2.0/2.5×ATR）才最优。受 moomoo 小时数据
+  反砍收益（把赢家提前砍掉）、收紧 SL 直接亏；**调宽** TP（2.0/2.5×ATR）才最优。受 券商小时数据
   ~150d 上限所限无法做真多窗口验证，故不自动改 `.env`，留 SIMULATE 观察后由 owner 定。
 - **2D 期权异动（已激活并接入）** — `src/options_flow.py`(新)：volume≫OI、put/call 偏斜检测。
   owner 订阅美股期权 LV1 + 重启 OpenD 后**数据已通**（实测 MU/AAPL 返回真实 volume+未平仓）。
@@ -80,7 +80,7 @@
   （`OPTIONS_FLOW_ENABLED=false`），开启后才参与。修了两个 bug：option_type 列名冲突、
   ThreadPoolExecutor `with` 的 shutdown(wait=True) 抵消超时。
 - **API/订阅健康看门狗** — `src/health_check.py`(新) + `HEALTH_CHECK_*` 配置（**默认开**，owner 要求）。
-  每 30 分钟 + 启动时探测 ① moomoo 期权数据 ② Gemini API，**边沿触发**（仅状态变化才发 Telegram，
+  每 30 分钟 + 启动时探测 ① 券商期权数据 ② Gemini API，**边沿触发**（仅状态变化才发 Telegram，
   带 2 次去抖防闪断刷屏）：订阅过期/无权限 → 告警续订；Gemini 配额/余额耗尽/key 失效/地区限制 → 告警
   充值（级联已是单模型 3.5-flash 无静默降级）。瞬时错误（OpenD 离线、503）归类 skip 不误报。挂在
   `main.py` 调度器（紧邻现有 17:30 `_watchdog_job`）。
@@ -113,7 +113,7 @@ momentum_break / mean_revert 并列的第 4 套策略，输出同构 `Signal` �
   救回「大致中性」。最佳档 = 双底+上升三角、conf≥80、必须 triggered（$16.75 vs 基线
   $16.37/day，仅 +2 笔），但 **maxDD 翻倍 5.8%→11.8%、PF 3.63→3.12**——回报增量在噪声内
   且回撤变差，**未过「不恶化回撤」的 gate**。故 `PATTERN_ENABLED` 维持 false。
-- **360d 复测无效（数据限制，2026-06-23）**：moomoo OpenD 的 HOUR_1 历史封顶 ≈679 根
+- **360d 复测无效（数据限制，2026-06-23）**：OpenD 的 HOUR_1 历史封顶 ≈679 根
   （约 150 日历天），360d 配置被截断成与 180d 同一批 bar → 交易集完全相同（同样 +2 笔、
   同样 maxDD 11.8%）。**小时线拿不到真正独立的第二窗口**，双窗口验证对 HOUR_1 不可用。
   结论不变：无可证 edge，`PATTERN_ENABLED` + `PATTERN_VISION_ENABLED` 均保持 false。若日后

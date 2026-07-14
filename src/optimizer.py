@@ -218,7 +218,7 @@ def run_study(
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=5)
     study = optuna.create_study(
         direction="maximize", sampler=sampler, pruner=pruner,
-        study_name=f"moomoo-trader-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
+        study_name=f"moo-trader-{datetime.utcnow().strftime('%Y%m%d-%H%M')}",
     )
 
     objective = _make_objective(base_cfg, n_folds, min_trades, cache)

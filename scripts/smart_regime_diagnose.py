@@ -53,7 +53,7 @@ def _short_runs(seq: list[str], label: str, max_len: int = 2) -> int:
 
 
 def run(days: int) -> dict:
-    from src.moomoo_client import client
+    from src.moo_client import client
     from moomoo import KLType
     bars = max(days + 220, 460)
     with client() as c:

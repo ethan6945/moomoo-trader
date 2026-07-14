@@ -126,7 +126,7 @@ def _base_cfg(days: int):
         days=days, timeframe=settings.timeframe,
         threshold=runtime_config.entry_threshold(),
         tickers=tickers, account_usd=risk_manager.budget_usd(),
-        # data_source defaults to "moomoo" (OpenD) — validation runs on the same
+        # data_source defaults to "moo" (OpenD) — validation runs on the same
         # live feed the bot trades, over a recent short window (_VALIDATE_WINDOWS).
         # Owner's choice 2026-07-02: recent 60d OpenD, not yfinance/360d.
         risk_per_trade=runtime_config.risk_per_trade(),

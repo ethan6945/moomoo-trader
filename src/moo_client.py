@@ -43,9 +43,9 @@ _BARS_PER_TRADING_DAY = {
 
 
 # ---------- process-level sliding-window rate limiter ----------
-# MooMoo's documented limit: 60 history-kline requests per 30 seconds.
+# the broker's documented limit: 60 history-kline requests per 30 seconds.
 # We track a deque of call timestamps and block any 61st caller until the
-# oldest call ages out of the window. This is shared across ALL MoomooClient
+# oldest call ages out of the window. This is shared across ALL MooClient
 # instances in the process (training + scan won't double-spend the quota).
 _KLINE_WINDOW_SEC = 30.0
 _KLINE_MAX_CALLS = 55       # leave a 5-call safety margin under the hard 60
@@ -57,7 +57,7 @@ _kline_lock = threading.Lock()
 # triggers the same warning. Log it once per process instead of spamming.
 _OPEND_UNLOCK_WARNED = False
 
-# 2026-07-09: REAL-unlock proof. moomoo's trade unlock only gates order ops
+# 2026-07-09: REAL-unlock proof. the broker's trade unlock only gates order ops
 # (place/modify/cancel) on REAL accounts — queries never need it and SIMULATE
 # has no unlock concept at all. So the ONLY hard evidence that the user really
 # clicked Unlock in the OpenD GUI is a gated operation succeeding in REAL env.
@@ -74,7 +74,7 @@ def real_unlock_confirmed() -> bool:
 
 def _note_gated_op_ok() -> None:
     global _REAL_GATED_OP_OK
-    if not _REAL_GATED_OP_OK and settings.moomoo_trade_env == "REAL":
+    if not _REAL_GATED_OP_OK and settings.moo_trade_env == "REAL":
         _REAL_GATED_OP_OK = True
         log.info("REAL trade unlock confirmed (a gated order op succeeded)")
 
@@ -104,14 +104,14 @@ def _market_enum() -> TrdMarket:
         "HK": TrdMarket.HK,
         "CN": TrdMarket.CN,
         "SG": TrdMarket.SG,
-    }[settings.moomoo_market]
+    }[settings.moo_market]
 
 
 def _env_enum() -> TrdEnv:
-    return TrdEnv.SIMULATE if settings.moomoo_trade_env == "SIMULATE" else TrdEnv.REAL
+    return TrdEnv.SIMULATE if settings.moo_trade_env == "SIMULATE" else TrdEnv.REAL
 
 
-class MoomooClient:
+class MooClient:
     """One quote context + one trade context, opened lazily."""
 
     def __init__(self) -> None:
@@ -123,21 +123,21 @@ class MoomooClient:
     def quote(self) -> OpenQuoteContext:
         if self._quote is None:
             self._quote = OpenQuoteContext(
-                host=settings.moomoo_host, port=settings.moomoo_port
+                host=settings.moo_host, port=settings.moo_port
             )
         return self._quote
 
     @property
     def trade(self) -> OpenSecTradeContext:
         if self._trade is None:
-            firm = getattr(SecurityFirm, settings.moomoo_security_firm)
+            firm = getattr(SecurityFirm, settings.moo_security_firm)
             self._trade = OpenSecTradeContext(
                 filter_trdmarket=_market_enum(),
-                host=settings.moomoo_host,
-                port=settings.moomoo_port,
+                host=settings.moo_host,
+                port=settings.moo_port,
                 security_firm=firm,
             )
-            pwd = settings.moomoo_trade_pwd
+            pwd = settings.moo_trade_pwd
             pwd_md5 = hashlib.md5(pwd.encode()).hexdigest()
             ret, data = self._trade.unlock_trade(password=pwd, password_md5=pwd_md5)
             if ret != RET_OK:
@@ -150,7 +150,7 @@ class MoomooClient:
                     # once per process, env-appropriately.
                     global _OPEND_UNLOCK_WARNED
                     if not _OPEND_UNLOCK_WARNED:
-                        if settings.moomoo_trade_env == "REAL":
+                        if settings.moo_trade_env == "REAL":
                             log.warning(
                                 "OpenD connected (GUI version, API unlock disabled) "
                                 "— REAL unlock NOT confirmed: order ops will fail "
@@ -179,7 +179,7 @@ class MoomooClient:
         auto-retry once on a high-frequency error.
 
         Background: pre-fix, throttle was per-instance, so train + scan running
-        back-to-back could spend > 60 calls in 30s and trigger MooMoo's hard
+        back-to-back could spend > 60 calls in 30s and trigger the broker's hard
         limit. The new _kline_rate_acquire() is module-global → all clients
         share the same 30-second window.
 
@@ -238,9 +238,9 @@ class MoomooClient:
                 df = df.set_index("time_key").sort_index()
                 return df.tail(bars)
             last_err = str(df)
-            # If MooMoo rejected for rate, sleep one full window + retry once.
+            # If Broker rejected for rate, sleep one full window + retry once.
             if "high frequency" in last_err.lower() and attempt == 1:
-                log.warning("MooMoo rejected %s for rate-limit — waiting 32s and retrying",
+                log.warning("Broker rejected %s for rate-limit — waiting 32s and retrying",
                             symbol)
                 time.sleep(32)
                 continue
@@ -248,7 +248,7 @@ class MoomooClient:
         raise RuntimeError(f"request_history_kline failed for {symbol}: {last_err}")
 
     def get_vix(self) -> float:
-        """Fetch current VIX level from MooMoo snapshot.
+        """Fetch current VIX level from broker snapshot.
 
         Falls back to SPY realized-vol proxy if the index quote isn't available,
         and returns 15.0 (benign default) if both fail.
@@ -300,7 +300,7 @@ class MoomooClient:
             return 0.0
 
     def get_order_status(self, order_id: str) -> str:
-        """Return moomoo OrderStatus string (e.g. 'FILLED_ALL', 'SUBMITTED'),
+        """Return SDK OrderStatus string (e.g. 'FILLED_ALL', 'SUBMITTED'),
         or '' if the order can't be found."""
         try:
             ret, data = self.trade.order_list_query(trd_env=_env_enum())
@@ -372,7 +372,7 @@ class MoomooClient:
         """Most recent SELL execution for `symbol` → {price, qty, time}, or None.
 
         Used to BOOK a manual exit: when reconcile finds a tracked position the
-        broker no longer holds (GHOST = you sold it in the moomoo app), this looks
+        broker no longer holds (GHOST = you sold it in the broker app), this looks
         up the ACTUAL fill so the realised P&L is recorded at the true exit price
         instead of a guess. Checks today's deals first (the common case —
         reconcile runs every scan), then the history deal list over the last
@@ -509,15 +509,15 @@ class MoomooClient:
     # ---------- helpers ----------
     @staticmethod
     def _format_code(symbol: str) -> str:
-        market = settings.moomoo_market
+        market = settings.moo_market
         if "." in symbol:
             return symbol
         return f"{market}.{symbol}"
 
 
 @contextmanager
-def client() -> Iterator[MoomooClient]:
-    c = MoomooClient()
+def client() -> Iterator[MooClient]:
+    c = MooClient()
     try:
         yield c
     finally:

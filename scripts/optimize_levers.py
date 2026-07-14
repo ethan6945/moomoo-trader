@@ -6,7 +6,7 @@ project's iron rule: a lever only wins if it RAISES $/day AND does NOT worsen
 max MTM drawdown (and ideally holds on a second, broader universe).
 
 Faithful baseline: this mirrors `_run_live_engine` EXACTLY (momentum strategy,
-VIX sizing, regime up-scaling at REGIME_BULL_MULT, earnings gate, real moomoo
+VIX sizing, regime up-scaling at REGIME_BULL_MULT, earnings gate, real broker
 commissions, breakeven stop, and all the Phase-0 realism knobs), then changes
 ONE lever per row. enforce_cash=True → the deleveraged $5k cash account.
 
@@ -19,7 +19,7 @@ Levers tested (the text's exit-side + sizing ideas):
   · max hold              MAX_HOLD_DAYS        (from winner hold distribution)
   · combined data-derived best-of-each
 
-Data note: moomoo OpenD HOUR_1 history caps at ~150d, so 180d and 360d return
+Data note: OpenD HOUR_1 history caps at ~150d, so 180d and 360d return
 the SAME bars — there is no independent 2nd time-window for hourly. The
 robustness check here is a 2nd UNIVERSE (--pool, the full liquidity pool) on
 the same window: a lever that helps on both the 20-name watchlist and the

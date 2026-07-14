@@ -1,6 +1,6 @@
 """Walk-forward backtester using the live 6-factor scoring pipeline.
 
-Fetches historical K-lines from MooMoo, replays the exact same indicator
+Fetches historical K-lines from the broker, replays the exact same indicator
 scoring used in production, simulates entries/exits, and emits a
 performance report.
 
@@ -29,7 +29,7 @@ import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# Hard wall-clock cap on a single MooMoo kline fetch. Without this, the SDK's
+# Hard wall-clock cap on a single broker kline fetch. Without this, the SDK's
 # request_history_kline can block forever when OpenD's socket goes silent —
 # the whole prefetch loop hangs on whichever ticker tripped it.
 #
@@ -86,7 +86,7 @@ class BacktestConfig:
     timeframe: str = "HOUR_1"
     threshold: float = 70.0
     tickers: list[str] = field(default_factory=list)
-    data_source: str = "moomoo"        # "moomoo" (OpenD) | "yfinance" (independent ~730d 1h window)
+    data_source: str = "moo"        # "moo" (OpenD) | "yfinance" (independent ~730d 1h window)
     account_usd: float = 4500.0
     risk_per_trade: float = 0.02
     max_position_pct: float = 0.20
@@ -220,9 +220,9 @@ class BacktestConfig:
     use_score_sizing: bool = False
     score_size_lo: float = 0.6     # multiplier at score == threshold (marginal signal)
     score_size_hi: float = 1.3     # multiplier at score == 100 (max conviction)
-    use_realistic_commission: bool = False  # moomoo per-order fees instead of flat $1
-    commission_pct_per_order: float = 0.0003  # moomoo MY US: 0.03% × notional / order / side
-    platform_fee_per_order: float = 0.99      # moomoo MY US: $0.99 / order / side
+    use_realistic_commission: bool = False  # broker per-order fees instead of flat $1
+    commission_pct_per_order: float = 0.0003  # broker MY US: 0.03% × notional / order / side
+    platform_fee_per_order: float = 0.99      # broker MY US: $0.99 / order / side
     sell_regulatory_bps: float = 0.5          # SEC+TAF+settlement ≈ bps of sell notional (sell only)
     # SL cooldown — block re-entry on a name we just stopped out of.
     # Defaults match the live risk_manager.SL_COOLDOWN_HOURS so backtest ≈ live.
@@ -812,12 +812,12 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
     Layout:
         {
           "tf":        TF preset for the timeframe,
-          "kltype":    moomoo KLType for the intraday frame,
+          "kltype":    SDK KLType for the intraday frame,
           "spy_daily": DataFrame | None,
           "per_ticker": {sym: {"intraday": df, "daily": df_d_or_none}, ...},
         }
     """
-    from .moomoo_client import MoomooClient
+    from .moo_client import MooClient
     from .timeframe import HOUR_1, MIN_10, MIN_30
     from moomoo import KLType
 
@@ -862,12 +862,12 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
                 f"get_kline({sym}) hung > {_FETCH_TIMEOUT_SEC}s — OpenD silent; skipping"
             )
 
-    if getattr(cfg, "data_source", "moomoo") == "yfinance":
+    if getattr(cfg, "data_source", "moo") == "yfinance":
         from .yfinance_source import YFinanceSource
         c = YFinanceSource()
         log.info("[prefetch] data source: yfinance (independent window)")
     else:
-        c = MoomooClient()
+        c = MooClient()
     try:
         # SPY needed for the regime gate AND the Phase 3-A RS gate.
         if cfg.apply_regime_gate or cfg.apply_rs_gate:
@@ -918,7 +918,7 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
 
     # ── 2026-05-28: join VIX history into each intraday df so the ML model's
     # macro features (vix_level, vix_change_5) read real values during backtest.
-    # MooMoo's API doesn't serve VIX kline; we use yfinance for the daily series
+    # the broker's API doesn't serve VIX kline; we use yfinance for the daily series
     # and forward-fill (with a 1-day shift to avoid look-ahead).
     #
     # Bug fix 2026-05-29: buffer was `cfg.days + 60` calendar days, but the
@@ -962,12 +962,12 @@ def prefetch_data(cfg: BacktestConfig, progress_cb=None) -> dict:
     # insider_30d_net_log feature was ablated to zero importance / zero $/day.)
 
     # ── 2026-05-28 v2: join sector-ETF close per ticker for `rs_vs_sector_5d`.
-    # Fetches each unique sector ETF once (same MooMoo path), then re-indexes
+    # Fetches each unique sector ETF once (same broker path), then re-indexes
     # onto each ticker's bar index. Missing data → 'sector_close' = NaN; the
     # feature falls back to 0 in compute_features, so backtest survives.
     try:
         from .sector import SECTOR_TO_ETF, get_sector
-        c2 = MoomooClient()
+        c2 = MooClient()
         unique_etfs = sorted({
             SECTOR_TO_ETF[s] for s in (get_sector(t) for t in per_ticker.keys())
             if s in SECTOR_TO_ETF
@@ -1030,7 +1030,7 @@ def simulate_with_cache(cfg: BacktestConfig, cache: dict, progress_cb=None) -> d
 # ── the one honest production engine ─────────────────────────────────────────
 # Single source of truth for "what a real cash account would actually have done":
 # the deleveraged V3 simulator with all three live-fidelity gaps closed (real
-# cash wall, VIX risk-off sizing, earnings gate, real moomoo commissions). Every
+# cash wall, VIX risk-off sizing, earnings gate, real broker commissions). Every
 # user-facing report — GUI panel, weekly Telegram self-check, CLI — flows through
 # here, so there is exactly ONE honest number and no optimistic implicit-leverage
 # path can leak into anything the user reads. The frozen oracle
@@ -1077,7 +1077,7 @@ def run_backtest(
 
     HONEST ENGINE (2026-06): this user-facing path runs the deleveraged V3
     simulator with the three live-fidelity gaps closed — real $5k cash wall
-    (enforce_cash), VIX risk-off sizing, earnings gate, and real moomoo (MY)
+    (enforce_cash), VIX risk-off sizing, earnings gate, and real broker (MY)
     commissions — so the GUI panel and the weekly Telegram self-check report
     what a real cash account would have done, not the optimistic implicit-leverage
     number. The frozen oracle `simulate_time_stepped` is untouched and still backs
@@ -1204,7 +1204,7 @@ def print_report(result: dict) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s | %(message)s")
 
-    ap = argparse.ArgumentParser(description="moomoo-trader backtester")
+    ap = argparse.ArgumentParser(description="moo-trader backtester")
     ap.add_argument("--days", type=int, default=180, help="Lookback window in calendar days")
     ap.add_argument("--timeframe", default=None, help="HOUR_1 / MIN_10 / MIN_30 (default: from .env; DAILY mode removed)")
     ap.add_argument("--threshold", type=float, default=None, help="Entry score threshold (default: from .env)")

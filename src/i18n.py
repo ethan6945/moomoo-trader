@@ -33,7 +33,7 @@ STRINGS: dict[str, dict[str, str]] = {
     # =================================================================
     "en": {
         # --- GUI window title + menus ---
-        "app_title": "MooMoo Trader",
+        "app_title": "Moo Trader",
         "menu_language": "Language",
         "menu_lang_en": "English",
         "menu_lang_zh": "中文 (Chinese)",
@@ -173,7 +173,7 @@ STRINGS: dict[str, dict[str, str]] = {
                         "Price ${price:.2f} ≤ Stop ${stop:.2f}"),
         "tg_max_hold": ("⏰ *MAX HOLD* {symbol} qty={qty} "
                         "age={age_days}d PnL ${pnl:+.2f}"),
-        "tg_started": "🤖 *moomoo-trader started* env=`{env}`",
+        "tg_started": "🤖 *moo-trader started* env=`{env}`",
         "tg_regime_block": "⚠ Regime {label}: {note} — skipping all entries",
         "tg_exec_fail": "⚠ *Order execution failed*: {symbols} — check broker/logs",
         "tg_clock_fail": ("⚠ *Pre-open clock check* — no network time source reachable; "
@@ -196,11 +196,11 @@ STRINGS: dict[str, dict[str, str]] = {
     },
 
     # =================================================================
-    # 中文 — leaves trader jargon (SL/TP/ATR/PnL/MooMoo/ML/AI) in English
+    # 中文 — leaves trader jargon (SL/TP/ATR/PnL/ML/AI) in English
     # so the message still reads naturally for someone fluent in both.
     # =================================================================
     "zh": {
-        "app_title": "MooMoo 短线交易",
+        "app_title": "Moo 短线交易",
         "menu_language": "语言",
         "menu_lang_en": "English",
         "menu_lang_zh": "中文",
@@ -330,7 +330,7 @@ STRINGS: dict[str, dict[str, str]] = {
                         "价格 ${price:.2f} ≤ 止损 ${stop:.2f}"),
         "tg_max_hold": ("⏰ *持仓超时* {symbol} 数量={qty} "
                         "持仓 {age_days} 天  PnL ${pnl:+.2f}"),
-        "tg_started": "🤖 *moomoo-trader 已启动* 环境=`{env}`",
+        "tg_started": "🤖 *moo-trader 已启动* 环境=`{env}`",
         "tg_regime_block": "⚠ 市场体制 {label}：{note} — 暂停所有新入场",
         "tg_exec_fail": "⚠ *下单执行失败*: {symbols} — 请检查券商端/日志",
         "tg_clock_fail": ("⚠ *盘前校时失败* — 所有网络时间源不可达，暂用未校验的系统时钟运行，"

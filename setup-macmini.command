@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════
-#  moomoo-trader 迁移安装脚本 — 在 Mac mini 上双击运行一次即可
+#  moo-trader 迁移安装脚本 — 在 Mac mini 上双击运行一次即可
 #
 #  自动完成：
 #    1. 确保 uv 可用（没有就自动安装）
@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 DIR="$(pwd)"
 
 echo "═══════════════════════════════════════════════════"
-echo "   moomoo-trader 迁移安装 (Mac mini)"
+echo "   moo-trader 迁移安装 (Mac mini)"
 echo "   目录: $DIR"
 echo "═══════════════════════════════════════════════════"
 echo ""
@@ -56,21 +56,21 @@ echo ""
 # ── 3. 安装 crontab（自适应当前路径）───────────────────────────────
 echo "→ 配置 crontab 定时优化任务（路径自动指向本文件夹）..."
 CRON_TMP="$(mktemp)"
-# 保留现有其它任务，去掉旧的 moomoo 行避免重复
-crontab -l 2>/dev/null | grep -v "moomoo-trader" | grep -v "optimize_and_apply.sh" > "$CRON_TMP" || true
+# 保留现有其它任务，去掉旧的 moo-trader 行避免重复
+crontab -l 2>/dev/null | grep -v "moo-trader" | grep -v "optimize_and_apply.sh" > "$CRON_TMP" || true
 # 若没有 MAILTO 设置，加一条抑制邮件
 if ! grep -q '^MAILTO=' "$CRON_TMP" 2>/dev/null; then
     printf 'MAILTO=""\n' | cat - "$CRON_TMP" > "${CRON_TMP}.2" && mv "${CRON_TMP}.2" "$CRON_TMP"
 fi
 cat >> "$CRON_TMP" <<EOF
-# moomoo-trader 周优化（全网格 quick sweep）— 周一 07:00 MYT（美股休市）
+# moo-trader 周优化（全网格 quick sweep）— 周一 07:00 MYT（美股休市）
 0 7 * * 1 cd $DIR && ./cron/optimize_and_apply.sh weekly >> logs/cron_optimize.log 2>&1
-# moomoo-trader 每日增量优化（补昨日数据 + 邻域校验）— 周二至周六 09:00 MYT
+# moo-trader 每日增量优化（补昨日数据 + 邻域校验）— 周二至周六 09:00 MYT
 0 9 * * 2-6 cd $DIR && ./cron/optimize_and_apply.sh daily >> logs/cron_optimize.log 2>&1
 EOF
 crontab "$CRON_TMP"
 rm -f "$CRON_TMP"
-echo "✓ crontab 已安装。当前 moomoo 任务："
+echo "✓ crontab 已安装。当前 moo-trader 任务："
 crontab -l | grep -A0 "optimize_and_apply.sh" | sed 's/^/    /'
 echo ""
 
@@ -90,7 +90,7 @@ fi
 
 # ── 6. 检查 .env ──────────────────────────────────────────────────
 if [ -f .env ]; then
-    ENVLINE="$(grep -E '^MOOMOO_TRADE_ENV' .env | head -1)"
+    ENVLINE="$(grep -E '^MOO_TRADE_ENV' .env | head -1)"
     echo "✓ .env 存在 — $ENVLINE"
     case "$ENVLINE" in
         *REAL*) echo "   ⚠⚠ 注意：当前是 REAL 实盘模式！确认无误再启动。";;

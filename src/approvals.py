@@ -206,7 +206,7 @@ def _execute(item: dict) -> None:
                 notifier.send(f"ℹ️ {sym} 已不在持仓（可能你已手动卖出），无需接管。")
                 log.info("manual takeover sell %s: already flat — skip", sym)
                 return
-            from .moomoo_client import client as _broker
+            from .moo_client import client as _broker
             with _broker() as c:
                 action = executor.close_position(c, sym, reason="MANUAL_TAKEOVER")
             log.info("approval applied: manual takeover sell %s → %s", sym, action)

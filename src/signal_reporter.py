@@ -29,7 +29,7 @@ CLI（在项目根目录运行）:
   python -m src.main signal add NVDA
   python -m src.main signal remove NVDA
 
-为什么不用 moomoo-trader 的评分模型:
+为什么不用 moo-trader 的评分模型:
   indicators.py 的 EMA20/50、ADX14 是为 daily/1H swing 校准的，
   在 5-min 上指标严重滞后。这里改用短线参数:
     RSI(7)         →  7×5min = 35 min 响应
@@ -52,7 +52,7 @@ from moomoo import KLType
 
 from .config import settings
 from . import ai, news_fetcher, notifier
-from .moomoo_client import client as _moomoo_client
+from .moo_client import client as _moo_client
 
 
 # ─── Context helpers (macro + sector + insider + pre-market) ──────────────────
@@ -85,7 +85,7 @@ def _vix_label(vix: float) -> str:
 def _is_premarket_now() -> bool:
     """True when current NY time is in 04:00-09:30 ET (US pre-market window).
 
-    Why this matters: MooMoo's snapshot `last_price` does NOT refresh during
+    Why this matters: the broker's snapshot `last_price` does NOT refresh during
     pre-market for most subscription tiers — it still holds yesterday's regular
     session close until 9:30 ET. If we display `last_price` as "current price"
     at 08:30 ET, the card shows yesterday's close + yesterday's daily change,
@@ -655,7 +655,7 @@ def _build_premarket_card(tech: dict, ai: dict,
     chg1   = tech.get("chg1") or 0.0
     arrow  = "📈" if chg1 >= 0 else "📉"
     # Tag the price source so the user knows whether this is regular-session
-    # last or today's pre-market last. Critical at 08:30 ET where MooMoo's
+    # last or today's pre-market last. Critical at 08:30 ET where the broker's
     # last_price is stale and we fall back to pre_price.
     src    = tech.get("price_src", "last")
     src_tag = " 🕓盘前" if src == "pre" else ""
@@ -792,7 +792,7 @@ def _fetch_tech(c, sym: str, ktype: KLType, bars: int,
     # Use real-time snapshot for current price and daily change.
     # request_history_kline only returns completed bars, so close.iloc[-1] may be
     # 5–15 min stale during trading hours. Snapshot gives the live last price.
-    # _live_snap auto-swaps to pre_price during 04:00-09:30 ET — MooMoo's
+    # _live_snap auto-swaps to pre_price during 04:00-09:30 ET — the broker's
     # last_price field is stuck on yesterday's close in that window, which
     # used to make the premarket card show yesterday's price + yesterday's chg.
     price = round(float(close.iloc[-1]), 2)  # fallback
@@ -1073,7 +1073,7 @@ def run_daily_brief(phase: str = "premarket") -> None:
     title = _BRIEF_TITLES.get(phase, phase)
     _DAILY_DIR.mkdir(parents=True, exist_ok=True)
 
-    with _moomoo_client() as c:
+    with _moo_client() as c:
         for sym in watchlist:
             try:
                 d = _daily_brief_data(c, sym)
@@ -1141,7 +1141,7 @@ def run_premarket() -> None:
     results    = []
     df_d_cache: dict = {}
 
-    with _moomoo_client() as c:
+    with _moo_client() as c:
         # Fetch macro context ONCE per premarket — SPY snapshot + VIX. These
         # are shared across every ticker card so each one shows the same
         # market backdrop.
@@ -1216,7 +1216,7 @@ def run_intraday() -> None:
     lines      = []
     df_d_cache: dict = {}
 
-    with _moomoo_client() as c:
+    with _moo_client() as c:
         for sym in watchlist:
             tech = _fetch_tech(c, sym, KLType.K_5M, 80, df_d_cache)
             if not tech:
@@ -1462,7 +1462,7 @@ def run_monitor() -> None:
     symbols = state.setdefault("symbols", {})
     fired: list[dict] = []
     df_d_cache: dict = {}
-    with _moomoo_client() as c:
+    with _moo_client() as c:
         for sym in watchlist:
             try:
                 tech = _fetch_tech(c, sym, KLType.K_5M, 80, df_d_cache)

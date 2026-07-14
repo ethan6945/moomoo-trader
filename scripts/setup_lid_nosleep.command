@@ -12,13 +12,13 @@
 #     full-tilt. In a closed bag it can OVERHEAT. Only use it on a desk / well
 #     ventilated, ideally on power. Turn ☕ off (or close this rule) when done.
 #
-# To UNDO this rule later:  sudo rm /etc/sudoers.d/moomoo-nosleep
+# To UNDO this rule later:  sudo rm /etc/sudoers.d/moo-nosleep
 set -e
 cd "$(dirname "$0")"
 
-DEST="/etc/sudoers.d/moomoo-nosleep"
+DEST="/etc/sudoers.d/moo-nosleep"
 
-echo "MooMoo Trader — lid-closed keep-awake setup"
+echo "Moo Trader — lid-closed keep-awake setup"
 echo "-------------------------------------------"
 echo "This installs a passwordless sudo rule scoped to ONLY pmset disablesleep,"
 echo "so the web ☕ toggle can also block lid-closed sleep."

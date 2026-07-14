@@ -10,7 +10,7 @@ Sources:
   • Larry Williams — market breadth indicators
   • IBD — accumulation/distribution rating
 
-DATA: Uses SPY daily bars as a breadth proxy (Moomoo has no market-wide breadth
+DATA: Uses SPY daily bars as a breadth proxy (the broker has no market-wide breadth
 API). Two signals:
   1. SPY distance from 50-day MA — how far above/below trend
   2. SPY recent win streak (days up / total) — microcosm of A/D line

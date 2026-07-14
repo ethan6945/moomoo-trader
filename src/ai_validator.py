@@ -254,7 +254,7 @@ def assess_exit(symbol: str, tech_summary: str, entry: float = 0.0,
 
 
 SENTIMENT_PROMPT = """You are a multi-factor analyst for a LONG-ONLY US-stock
-trading bot — produce a moomoo-style 看好/中性/看空 read on BUY candidate {symbol}
+trading bot — produce a broker-style 看好/中性/看空 read on BUY candidate {symbol}
 (now ${price}).
 
 Technical signals the bot already computed:
@@ -287,7 +287,7 @@ If you have no strong view, return neutral with score ~50.
 
 
 def assess_sentiment(signal, options_summary: str = "") -> tuple[str, int, str]:
-    """Phase 2B moomoo-style sentiment read for a BUY candidate. Returns
+    """Phase 2B broker-style sentiment read for a BUY candidate. Returns
     (verdict, score_0_100, reason). ADVISORY — never vetoes. FAIL-SAFE → neutral
     ('neutral', 50, ...) on no key / quota / error. Uses sentiment_model (≥3.5).
     options_summary (optional) injects the options-flow read as a 4th factor."""

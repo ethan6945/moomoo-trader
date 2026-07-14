@@ -2,7 +2,7 @@
 
 Places a limit buy at the signal price, then attaches a sell-stop at the ATR
 stop-loss level. The take-profit half is tracked locally in `data/state.json`
-and resolved on the next scan (MooMoo doesn't natively bracket OCOs across
+and resolved on the next scan (the broker doesn't natively bracket OCOs across
 contexts in the simple SDK path).
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ from . import db, portfolio, risk_manager, runtime_config
 
 from .config import settings
 from .indicators import Signal
-from .moomoo_client import MoomooClient
+from .moo_client import MooClient
 
 ORDER_TIMEOUT_MIN = 5    # cancel unfilled BUY orders after this many minutes
 # Protective exits (soft stop-loss, force-close, max-hold, stall-out) are
@@ -90,7 +90,7 @@ def _business_days_between(start: datetime, end: datetime) -> int:
 
 
 def place_bracket(
-    client: MoomooClient,
+    client: MooClient,
     symbol: str,
     qty: int,
     stop_price: float,
@@ -148,7 +148,7 @@ def _save_open_trades(trades: dict) -> None:
         log.warning("legacy JSON mirror write failed: %s", e)
 
 
-def open_position(client: MoomooClient, signal: Signal, qty: int) -> dict | None:
+def open_position(client: MooClient, signal: Signal, qty: int) -> dict | None:
     """Buy at limit. REAL → attach OCO bracket (STOP + TP); SIMULATE → soft-track.
 
     Returns None when the entry is SKIPPED (market ran past the signal price —
@@ -165,7 +165,7 @@ def open_position(client: MoomooClient, signal: Signal, qty: int) -> dict | None
         return _open_position_locked(client, signal, qty)
 
 
-def _open_position_locked(client: MoomooClient, signal: Signal, qty: int) -> dict | None:
+def _open_position_locked(client: MooClient, signal: Signal, qty: int) -> dict | None:
     trades = _load_open_trades()
     existing = trades.get(signal.symbol)
     is_stack = existing is not None and int(existing.get("qty", 0)) > 0
@@ -204,7 +204,7 @@ def _open_position_locked(client: MoomooClient, signal: Signal, qty: int) -> dic
         # (only when broker brackets are in use — soft-exit mode skips this).
         stop_order_id = existing.get("stop_order_id")
         tp_order_id = existing.get("tp_order_id")
-        if settings.moomoo_trade_env == "REAL" and not settings.real_use_soft_exits:
+        if settings.moo_trade_env == "REAL" and not settings.real_use_soft_exits:
             for oid in (stop_order_id, tp_order_id):
                 if oid:
                     try:
@@ -248,7 +248,7 @@ def _open_position_locked(client: MoomooClient, signal: Signal, qty: int) -> dic
         # REAL with a broker OCO bracket ONLY when soft-exits are off. When
         # REAL_USE_SOFT_EXITS=true, REAL is managed exactly like SIMULATE
         # (soft scale-out/trailing/stop) so live matches the honest backtest.
-        if settings.moomoo_trade_env == "REAL" and not settings.real_use_soft_exits:
+        if settings.moo_trade_env == "REAL" and not settings.real_use_soft_exits:
             stop_order_id, tp_order_id = place_bracket(
                 client, signal.symbol, qty, signal.stop_loss, signal.take_profit
             )
@@ -256,7 +256,7 @@ def _open_position_locked(client: MoomooClient, signal: Signal, qty: int) -> dic
                 log.warning("Bracket incomplete for %s (stop=%s tp=%s) — soft tracking active as fallback",
                             signal.symbol, stop_order_id, tp_order_id)
         else:
-            mode = "REAL soft-exits" if settings.moomoo_trade_env == "REAL" else "SIMULATE"
+            mode = "REAL soft-exits" if settings.moo_trade_env == "REAL" else "SIMULATE"
             log.info("%s: soft stop @ $%.2f & TP @ $%.2f tracked locally (scale-out enabled)",
                      mode, signal.stop_loss, signal.take_profit)
 
@@ -334,7 +334,7 @@ def _close_and_log(symbol: str, trade: dict, qty: int, exit_price: float, reason
     return pnl
 
 
-def cancel_stale_orders(client: MoomooClient) -> list[dict]:
+def cancel_stale_orders(client: MooClient) -> list[dict]:
     """Cancel BUY orders older than ORDER_TIMEOUT_MIN minutes.
     Stale unfilled limits eat budget headroom and let prices drift away."""
     canceled: list[dict] = []
@@ -346,7 +346,7 @@ def cancel_stale_orders(client: MoomooClient) -> list[dict]:
     if pending.empty:
         return canceled
 
-    # Use ET (America/New_York) for both sides — MooMoo create_time is naive ET.
+    # Use ET (America/New_York) for both sides — SDK create_time is naive ET.
     now_et = datetime.now(_ET).replace(tzinfo=None)
     for _, row in pending.iterrows():
         ct = str(row.get("create_time", ""))
@@ -392,7 +392,7 @@ def cancel_stale_orders(client: MoomooClient) -> list[dict]:
     return canceled
 
 
-def _check_bracket_fills(client: MoomooClient, symbol: str, trade: dict) -> dict | None:
+def _check_bracket_fills(client: MooClient, symbol: str, trade: dict) -> dict | None:
     """OCO check: if either bracket leg filled, cancel the other and close the trade.
 
     Returns an action dict if a bracket leg fired (caller pops the trade), else None.
@@ -430,7 +430,7 @@ def _check_bracket_fills(client: MoomooClient, symbol: str, trade: dict) -> dict
     return None
 
 
-def _last_price(client: MoomooClient, symbol: str) -> float | None:
+def _last_price(client: MooClient, symbol: str) -> float | None:
     """Fetch a *validated* last price, or None if the symbol looks halted/anomalous.
 
     A halted, suspended, or limit-up/down stock can return last_price of 0, None,
@@ -485,7 +485,7 @@ def _is_stalled(trade: dict, last_price: float, atr_ref: float) -> bool:
     return True
 
 
-def _force_close(client: MoomooClient, symbol: str, trade: dict,
+def _force_close(client: MooClient, symbol: str, trade: dict,
                  last: float, reason: str) -> tuple[float, dict]:
     """Cancel any bracket legs and market-sell the position. Returns (pnl, action).
 
@@ -514,7 +514,7 @@ def _force_close(client: MoomooClient, symbol: str, trade: dict,
                  "qty": trade["qty"], "pnl": pnl}
 
 
-def _manage_one(client: MoomooClient, symbol: str, trade: dict,
+def _manage_one(client: MooClient, symbol: str, trade: dict,
                 trades: dict, actions: list[dict], stops_only: bool = False) -> None:
     """Manage ONE open position for a single scan cycle.
 
@@ -719,7 +719,7 @@ def _manage_one(client: MoomooClient, symbol: str, trade: dict,
         return
 
 
-def manage_open_trades(client: MoomooClient) -> list[dict]:
+def manage_open_trades(client: MooClient) -> list[dict]:
     """Thread-safe wrapper — the scan job and the 5-min manage tick both call
     this from different scheduler threads; the lock keeps their load→mutate→
     save cycles on the open-trades store from clobbering each other."""
@@ -727,7 +727,7 @@ def manage_open_trades(client: MoomooClient) -> list[dict]:
         return _manage_open_trades_locked(client)
 
 
-def manage_stops_only(client: MoomooClient) -> list[dict]:
+def manage_stops_only(client: MooClient) -> list[dict]:
     """Lightweight protective-exit pass for the fast-stop loop (src/main.py).
 
     Checks ONLY the breakeven ratchet + soft stop-loss on soft-tracked positions
@@ -759,7 +759,7 @@ def manage_stops_only(client: MoomooClient) -> list[dict]:
         return actions
 
 
-def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
+def _manage_open_trades_locked(client: MooClient) -> list[dict]:
     """Per-scan housekeeping: stale order cancel → OCO bracket check → soft fallback.
 
     2026-05-30 additions to keep capital flowing:
@@ -938,7 +938,7 @@ def _manage_open_trades_locked(client: MoomooClient) -> list[dict]:
     return actions
 
 
-def close_position(client: MoomooClient, symbol: str, reason: str = "MANUAL") -> dict:
+def close_position(client: MooClient, symbol: str, reason: str = "MANUAL") -> dict:
     """Cancel any bracket legs, then market-sell the tracked position at a FRESH
     real-time price (refuses if halted/anomalous, leaving brackets intact). The
     `reason` labels the trade log + returned action. Used by the gap-sentinel
@@ -964,7 +964,7 @@ def close_position(client: MoomooClient, symbol: str, reason: str = "MANUAL") ->
             "price": last, "pnl": pnl}
 
 
-def manual_close(client: MoomooClient, symbol: str) -> dict:
+def manual_close(client: MooClient, symbol: str) -> dict:
     """GUI helper — cancel any bracket legs, then market-sell the position."""
     trades = _load_open_trades()
     if symbol not in trades:
@@ -994,7 +994,7 @@ def manual_close(client: MoomooClient, symbol: str) -> dict:
             "price": last, "pnl": pnl}
 
 
-def edit_stop(client: MoomooClient | None, symbol: str, new_stop: float) -> dict:
+def edit_stop(client: MooClient | None, symbol: str, new_stop: float) -> dict:
     """GUI helper — adjust stop loss. If a broker stop is active, re-place it."""
     trades = _load_open_trades()
     if symbol not in trades:

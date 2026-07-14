@@ -5,7 +5,7 @@ default-OFF, parity-suppressed flag (engine_compare stays byte-exact):
 
   apply_vix_sizing          live risk_manager halves size when VIX>25, quarters >35
   apply_earnings_gate       block a NEW entry within N days before an earnings report
-  use_realistic_commission  moomoo per-ORDER fees instead of the flat $1/trade
+  use_realistic_commission  broker per-ORDER fees instead of the flat $1/trade
 
 This sweeps them one at a time (and all-on) on the SAME prefetched data,
 enforce_cash=True (the honest deleveraged $5k account), both windows, WITHOUT
@@ -13,12 +13,12 @@ scale-out so every trade is exactly one buy + one sell — the realistic commiss
 model charges per order, so partials would re-bill the buy fee and muddy the read.
 
 Two commission rows bracket the broker reality:
-  +comm MY   moomoo Malaysia US-stocks: 0.03% × notional + $0.99 / order / SIDE
-  +comm US   moomoo US resident: $0 commission + $0 platform, only sell-side SEC/TAF
+  +comm MY   broker (MY) US-stocks: 0.03% × notional + $0.99 / order / SIDE
+  +comm US   broker US-resident: $0 commission + $0 platform, only sell-side SEC/TAF
 
 earnBlk = how many entries the earnings gate actually blocked. "vs base" = $/day
 delta from the baseline (flat-$1, no new gates). The ALL row (with MY commission)
-is the closest-to-live number for a Malaysian moomoo $5k cash account.
+is the closest-to-live number for a Malaysian $5k cash account.
 
 Run:  .venv/bin/python3 scripts/fidelity_compare.py
 """
@@ -98,7 +98,7 @@ def show(rows, base_daily):
 for days in [180, 360]:
     print(f"\n{'='*95}\n  {days}-DAY · CASH ACCOUNT (enforce_cash=True, DD cap {DD_CAP:.0f}%, "
           f"seed ${settings.account_usd:,.0f})\n"
-          f"  closing the 3 reachable live gaps — VIX risk-off / earnings gate / real moomoo fees\n"
+          f"  closing the 3 reachable live gaps — VIX risk-off / earnings gate / real broker fees\n"
           f"  (no scale-out: every trade = 1 buy + 1 sell, so the per-order commission is exact)\n{'='*95}")
     cache = prefetch_data(base(days, LIVE10))
     rows = [row(lbl, ov, days, LIVE10, cache) for lbl, ov in CONFIGS]
