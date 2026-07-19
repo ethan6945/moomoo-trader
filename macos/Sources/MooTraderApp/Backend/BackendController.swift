@@ -12,6 +12,11 @@ import Foundation
 ///     writing logs/web.pid — so quitting this app never kills the backend.
 ///   • `/api/web-access` makes the server restart itself: on connection loss
 ///     we quietly re-probe for a while and re-adopt before declaring failure.
+///
+/// IMPORTANT: no disk IO in init. The repo usually lives under ~/Desktop, and
+/// the app's first file access there blocks on the macOS privacy consent
+/// prompt (TCC) — doing that during SwiftUI scene init hangs the whole app.
+/// All discovery happens off the main thread in run().
 @MainActor
 final class BackendController: ObservableObject {
     static let shared = BackendController()
@@ -23,65 +28,56 @@ final class BackendController: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .starting
+    @Published private(set) var repoRoot: URL?
+    @Published private(set) var port = 8770
 
-    let repoRoot: URL
-    let port: Int
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
 
     private var monitorTask: Task<Void, Never>?
     private var restartAttempted = false
 
-    private init() {
-        repoRoot = Self.locateRepoRoot()
-        port = Self.readPort(repoRoot: repoRoot)
-        APIClient.shared.baseURL = URL(string: "http://127.0.0.1:\(port)")!
-    }
+    private init() {}
 
-    // ── repo discovery ────────────────────────────────────────────────
+    // ── repo discovery (runs detached — may block on the TCC prompt) ──
     /// Priority: user-set path (Settings) → walk up from the .app bundle
     /// (dist/MooTrader.app lives inside macos/, two levels below the repo)
     /// → walk up from CWD (covers `swift run` in macos/).
-    private static func locateRepoRoot() -> URL {
+    private nonisolated static func discover() -> (root: URL?, port: Int) {
         func isRepo(_ url: URL) -> Bool {
             FileManager.default.fileExists(
                 atPath: url.appendingPathComponent("web/server.py").path)
         }
-        if let saved = UserDefaults.standard.string(forKey: "repoPath") {
-            let url = URL(fileURLWithPath: saved)
-            if isRepo(url) { return url }
-        }
-        for start in [Bundle.main.bundleURL,
-                      URL(fileURLWithPath: FileManager.default.currentDirectoryPath)] {
-            var url = start
-            for _ in 0..<8 {
-                if isRepo(url) { return url }
-                url.deleteLastPathComponent()
+        var root: URL?
+        if let saved = UserDefaults.standard.string(forKey: "repoPath"),
+           isRepo(URL(fileURLWithPath: saved)) {
+            root = URL(fileURLWithPath: saved)
+        } else {
+            outer: for start in [Bundle.main.bundleURL,
+                          URL(fileURLWithPath: FileManager.default.currentDirectoryPath)] {
+                var url = start
+                for _ in 0..<8 {
+                    if isRepo(url) { root = url; break outer }
+                    url.deleteLastPathComponent()
+                }
             }
         }
-        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    }
-
-    private static func readPort(repoRoot: URL) -> Int {
+        var port = 8770
         if let env = ProcessInfo.processInfo.environment["WEB_PORT"], let p = Int(env) {
-            return p
-        }
-        // Parse WEB_PORT from the repo's .env (dotenv format, no quotes expected).
-        if let text = try? String(contentsOf: repoRoot.appendingPathComponent(".env"),
-                                  encoding: .utf8) {
+            port = p
+        } else if let root,
+                  let text = try? String(contentsOf: root.appendingPathComponent(".env"),
+                                         encoding: .utf8) {
+            // dotenv format, no quotes expected
             for line in text.split(separator: "\n") {
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if t.hasPrefix("WEB_PORT="), let p = Int(t.dropFirst("WEB_PORT=".count)
                         .trimmingCharacters(in: .whitespaces)) {
-                    return p
+                    port = p
+                    break
                 }
             }
         }
-        return 8770
-    }
-
-    var repoLooksValid: Bool {
-        FileManager.default.fileExists(
-            atPath: repoRoot.appendingPathComponent("web/server.py").path)
+        return (root, port)
     }
 
     // ── lifecycle ─────────────────────────────────────────────────────
@@ -92,17 +88,26 @@ final class BackendController: ObservableObject {
 
     private func run() async {
         phase = .starting
-        guard repoLooksValid else {
-            phase = .failed("找不到 moo-trader 仓库（web/server.py）。请把 MooTrader.app 放在仓库内，或在设置中指定仓库路径。")
+        let found = await Task.detached { Self.discover() }.value
+        guard let root = found.root else {
+            phase = .failed("找不到 moo-trader 仓库（web/server.py）。请把 MooTrader.app 放在仓库的 macos/dist/ 内。")
             return
         }
+        repoRoot = root
+        port = found.port
+        APIClient.shared.baseURL = baseURL
+        debugLog("run: repoRoot=\(root.path) port=\(port)")
+
         if await serverResponds(timeout: 0.8) {
+            debugLog("adopted existing server")
             phase = .running
         } else {
             spawnServer()
             if await waitForServer(seconds: 25) {
+                debugLog("spawned server is up")
                 phase = .running
             } else {
+                debugLog("spawned server did not come up in 25s")
                 phase = .failed("Web 服务器 25 秒内未就绪 — 查看 logs/web.log")
                 return
             }
@@ -110,18 +115,25 @@ final class BackendController: ObservableObject {
         await monitorLoop()
     }
 
-    /// Detached spawn identical to start-web.command (minus the fresh-kill):
-    /// nohup + background + pid file. bash exits immediately; the python
-    /// process survives this app quitting.
+    /// Detached spawn identical to start-web.command: nohup + background +
+    /// pid file ($! is the python pid — mkdir is a separate statement so the
+    /// background job isn't a compound wrapped in a lingering subshell).
+    /// bash exits immediately; the python process survives this app quitting.
     private func spawnServer() {
+        guard let root = repoRoot else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = ["-c",
-            "mkdir -p logs && nohup .venv/bin/python web/server.py >> logs/web.log 2>&1 & echo $! > logs/web.pid"]
-        p.currentDirectoryURL = repoRoot
+            "mkdir -p logs; nohup .venv/bin/python web/server.py >> logs/web.log 2>&1 & echo $! > logs/web.pid"]
+        p.currentDirectoryURL = root
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
-        try? p.run()
+        do {
+            try p.run()
+            debugLog("spawned web server via bash")
+        } catch {
+            debugLog("spawn failed: \(error.localizedDescription)")
+        }
     }
 
     /// Any HTTP answer (including 401/redirect) proves the server is up.
@@ -184,5 +196,18 @@ final class BackendController: ObservableObject {
         monitorTask?.cancel()
         try? await Task.sleep(for: .milliseconds(800))
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Lifecycle breadcrumbs → logs/shell-debug.log (gitignored) + Console.
+    private func debugLog(_ msg: String) {
+        NSLog("MooTrader: %@", msg)
+        guard let root = repoRoot,
+              let data = "\(Date()) \(msg)\n".data(using: .utf8) else { return }
+        let url = root.appendingPathComponent("logs/shell-debug.log")
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
     }
 }

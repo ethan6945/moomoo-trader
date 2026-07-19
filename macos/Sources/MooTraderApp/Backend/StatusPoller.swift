@@ -62,9 +62,10 @@ final class StatusPoller: ObservableObject {
             // transient network error — BackendController's monitor owns this
         }
         caffeinate = try? await APIClient.shared.caffeinate()
-        schedulerPID = Self.alivePID(
-            at: BackendController.shared.repoRoot
-                .appendingPathComponent("logs/scheduler.pid"))
+        if let root = BackendController.shared.repoRoot {
+            schedulerPID = Self.alivePID(
+                at: root.appendingPathComponent("logs/scheduler.pid"))
+        }
     }
 
     /// PID from a pid file, but only if the process actually exists.
