@@ -8,9 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// pywebview parity: closing the window quits the GUI only — the nohup'd
-    /// Flask server, scheduler and OpenD keep running untouched.
+    /// The menu-bar icon stays alive after the window closes (unlike pywebview,
+    /// where closing the window quit the GUI). Trading is unaffected either
+    /// way — the Flask server / scheduler / OpenD are detached processes.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 }
