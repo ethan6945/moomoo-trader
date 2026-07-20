@@ -236,3 +236,174 @@ struct CaffeinateStatus: Decodable {
     var on: Bool
     var lid: Bool?
 }
+
+// ── signals (盯盘) ────────────────────────────────────────────────────
+/// One symbol's latest tick from data/signal_monitor_state.json.
+struct MonitorTick: Identifiable {
+    let symbol: String
+    var ts: String?
+    var price: Double?
+    var chg: Double?
+    var rsi: Double?
+    var vol: Double?          // 量比
+    var vwap: Double?
+    var aboveVwap: Bool?
+    var buy: Int?
+    var sell: Int?
+    var net: Int?
+    var mom: Double?
+    var dayHigh: Double?
+    var dayLow: Double?
+    var alertsToday: Int?
+    var lastAlert: String?
+
+    var id: String { symbol }
+
+    struct Payload: Decodable {
+        var ts: String?
+        var price: Double?
+        var chg: Double?
+        var rsi: Double?
+        var vol: Double?
+        var vwap: Double?
+        var above_vwap: Bool?
+        var buy: Int?
+        var sell: Int?
+        var net: Int?
+        var mom: Double?
+        var day_high: Double?
+        var day_low: Double?
+        var alerts_today: Int?
+        var last_alert: String?
+    }
+
+    init(symbol: String, p: Payload) {
+        self.symbol = symbol
+        ts = p.ts; price = p.price; chg = p.chg; rsi = p.rsi; vol = p.vol
+        vwap = p.vwap; aboveVwap = p.above_vwap; buy = p.buy; sell = p.sell
+        net = p.net; mom = p.mom; dayHigh = p.day_high; dayLow = p.day_low
+        alertsToday = p.alerts_today; lastAlert = p.last_alert
+    }
+}
+
+/// One entry of the alert feed (newest first from the API).
+struct SignalAlert: Decodable, Identifiable {
+    var tsIso: String?
+    var sym: String?
+    var type: String?
+    var level: String?        // push / info
+    var emoji: String?
+    var title: String?
+    var detail: String?
+    var price: Double?
+    var chg: Double?
+
+    var id: String { (tsIso ?? "") + "-" + (sym ?? "") + "-" + (type ?? "") }
+    var isPush: Bool { level == "push" }
+
+    enum CodingKeys: String, CodingKey {
+        case sym, type, level, emoji, title, detail, price, chg
+        case tsIso = "ts_iso"
+    }
+}
+
+struct RunningState: Decodable {
+    var running: Bool?
+    var pid: Int32?
+}
+
+// ── settings ─────────────────────────────────────────────────────────
+/// `/api/trade-env` GET — .env value, live value, and the go-live guards.
+struct TradeEnvState: Decodable {
+    var envFile: String?
+    var envLive: String?
+    var running: Bool?
+    var openPositions: Int?
+    var pendingRestart: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case running
+        case envFile = "env_file"
+        case envLive = "env_live"
+        case openPositions = "open_positions"
+        case pendingRestart = "pending_restart"
+    }
+}
+
+/// `/api/auto-budget` — compounding budget state.
+struct AutoBudgetState: Decodable {
+    var enabled: Bool?
+    var armed: Bool?
+    var seed: Double?
+    var currentBudget: Double?
+    var target: Double?
+    var profitSinceArm: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case enabled, armed, seed, target
+        case currentBudget = "current_budget"
+        case profitSinceArm = "profit_since_arm"
+    }
+}
+
+/// `/api/ai-provider` — active engine plus the pickable ones.
+struct AIProviderState: Decodable {
+    var provider: String?
+    var model: String?
+    var supportsVision: Bool?
+    var providers: [Provider]?
+
+    struct Provider: Decodable, Identifiable {
+        var id: String
+        var label: String?
+        var hasKey: Bool?
+        var defaultModel: String?
+        var vision: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case id, label, vision
+            case hasKey = "has_key"
+            case defaultModel = "default_model"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case provider, model, providers
+        case supportsVision = "supports_vision"
+    }
+}
+
+/// `/api/settings` — .env keys with masked values (never the real secret).
+struct SettingsKeys: Decodable {
+    var keys: [Item]
+
+    struct Item: Decodable, Identifiable {
+        var key: String
+        var desc: String?
+        var masked: String?
+        var isSet: Bool?
+
+        var id: String { key }
+
+        enum CodingKeys: String, CodingKey {
+            case key, desc, masked
+            case isSet = "set"
+        }
+    }
+}
+
+/// `/api/web-access` — localhost vs LAN exposure.
+struct WebAccessState: Decodable {
+    var mode: String?          // local / lan
+    var passwordSet: Bool?
+    var port: Int?
+    var lanIp: String?
+    var tailscaleIp: String?
+
+    enum CodingKeys: String, CodingKey {
+        case mode, port
+        case passwordSet = "password_set"
+        case lanIp = "lan_ip"
+        case tailscaleIp = "tailscale_ip"
+    }
+}

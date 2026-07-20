@@ -106,4 +106,102 @@ final class APIClient: @unchecked Sendable {
     func login(password: String) async throws {
         try await post("api/login", json: ["password": password])
     }
+
+    // ── signals (盯盘) ────────────────────────────────────────────────
+    func monitorTicks() async throws -> [MonitorTick] {
+        let raw: [String: MonitorTick.Payload] = try await getJSON("api/signal-monitor")
+        return raw.map { MonitorTick(symbol: $0.key, p: $0.value) }
+            .sorted { ($0.net ?? 0, $0.symbol) > ($1.net ?? 0, $1.symbol) }
+    }
+
+    func signalAlerts(limit: Int = 80) async throws -> [SignalAlert] {
+        try await getJSON("api/signal-alerts?n=\(limit)")
+    }
+
+    func signalStatus() async throws -> RunningState {
+        try await getJSON("api/signal-status")
+    }
+
+    /// action ∈ start / stop.
+    func signalScheduler(_ action: String) async throws {
+        try await post("api/signal-scheduler/\(action)")
+    }
+
+    /// mode ∈ brief / review / close / premarket / intraday / monitor.
+    func signalRun(_ mode: String) async throws {
+        try await post("api/signal-run/\(mode)", timeout: 30)
+    }
+
+    func signalWatchlist() async throws -> [String] {
+        struct Reply: Decodable { var tickers: [String] }
+        let r: Reply = try await getJSON("api/signal-watchlist")
+        return r.tickers
+    }
+
+    func setSignalWatchlist(_ tickers: [String]) async throws {
+        try await post("api/signal-watchlist", json: ["tickers": tickers])
+    }
+
+    // ── settings ─────────────────────────────────────────────────────
+    func tradeEnv() async throws -> TradeEnvState {
+        try await getJSON("api/trade-env")
+    }
+
+    /// REAL requires confirm:true and is refused (409) with open positions.
+    func setTradeEnv(_ env: String, confirm: Bool = false) async throws {
+        try await post("api/trade-env", json: ["env": env, "confirm": confirm])
+    }
+
+    func setBudget(_ value: Double) async throws {
+        try await post("api/budget", json: ["value": value])
+    }
+
+    func autoBudget() async throws -> AutoBudgetState {
+        try await getJSON("api/auto-budget")
+    }
+
+    /// action ∈ arm / disarm / recompute.
+    func autoBudgetAction(_ action: String) async throws {
+        try await post("api/auto-budget", json: ["action": action])
+    }
+
+    func setAutoBudget(enabled: Bool) async throws {
+        try await post("api/auto-budget", json: ["enabled": enabled])
+    }
+
+    func aiProvider() async throws -> AIProviderState {
+        try await getJSON("api/ai-provider")
+    }
+
+    func setAIProvider(_ provider: String, model: String) async throws {
+        try await post("api/ai-provider", json: ["provider": provider, "model": model])
+    }
+
+    func aiModels(provider: String) async throws -> [String] {
+        struct Reply: Decodable { var models: [String]? }
+        let r: Reply = try await getJSON("api/ai-models?provider=\(provider)", timeout: 20)
+        return r.models ?? []
+    }
+
+    func settingsKeys() async throws -> SettingsKeys {
+        try await getJSON("api/settings")
+    }
+
+    /// Writes one allowed key into .env. Values come from the user typing into
+    /// the sheet — the app never reads or displays the stored secret.
+    func setSettingsKey(_ key: String, value: String) async throws {
+        try await post("api/settings/key", json: ["key": key, "value": value])
+    }
+
+    func webAccess() async throws -> WebAccessState {
+        try await getJSON("api/web-access")
+    }
+
+    func setWebAccess(mode: String) async throws {
+        try await post("api/web-access", json: ["mode": mode])
+    }
+
+    func resetStats() async throws {
+        try await post("api/reset-stats")
+    }
 }

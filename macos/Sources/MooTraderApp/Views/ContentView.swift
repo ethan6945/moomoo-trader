@@ -45,22 +45,24 @@ struct ContentView: View {
     }
 }
 
-/// Sidebar navigation. Native views cover the day-to-day surfaces; the full web
-/// dashboard stays one click away for signals, sectors, backtest and settings.
+/// Sidebar navigation. Native views cover everything day to day; the full web
+/// dashboard stays one click away for the backtest tab and the sector heatmap.
 struct RootView: View {
     @EnvironmentObject var backend: BackendController
     @EnvironmentObject var poller: StatusPoller
     @State private var section: Section? = .overview
 
     enum Section: String, CaseIterable, Identifiable {
-        case overview, approvals, history, web
+        case overview, approvals, signals, history, settings, web
         var id: String { rawValue }
 
         var title: String {
             switch self {
             case .overview: return "总览"
             case .approvals: return "审批"
+            case .signals: return "信号"
             case .history: return "历史"
+            case .settings: return "设置"
             case .web: return "完整面板"
             }
         }
@@ -69,7 +71,9 @@ struct RootView: View {
             switch self {
             case .overview: return "chart.pie"
             case .approvals: return "checkmark.seal"
+            case .signals: return "antenna.radiowaves.left.and.right"
             case .history: return "clock.arrow.circlepath"
+            case .settings: return "gearshape"
             case .web: return "globe"
             }
         }
@@ -101,7 +105,9 @@ struct RootView: View {
             switch section ?? .overview {
             case .overview:  OverviewView()
             case .approvals: ApprovalsView()
+            case .signals:   SignalsView()
             case .history:   HistoryView()
+            case .settings:  SettingsPanelView()
             case .web:       DashboardWebView(url: backend.baseURL).navigationTitle("完整面板")
             }
         }
