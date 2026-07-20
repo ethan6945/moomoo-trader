@@ -22,12 +22,14 @@ final class BackendController: ObservableObject {
     static let shared = BackendController()
 
     enum Phase: Equatable {
-        case starting
+        case starting(String)     // with the message to show while we wait
         case running
         case failed(String)
+
+        var isStarting: Bool { if case .starting = self { return true }; return false }
     }
 
-    @Published private(set) var phase: Phase = .starting
+    @Published private(set) var phase: Phase = .starting("引擎启动中…")
     @Published private(set) var repoRoot: URL?
     @Published private(set) var port = 8770
 
@@ -87,8 +89,20 @@ final class BackendController: ObservableObject {
     }
 
     private func run() async {
-        phase = .starting
-        let found = await Task.detached { Self.discover() }.value
+        phase = .starting("引擎启动中…")
+        // Discovery touches the repo, which usually sits under ~/Desktop — a
+        // TCC-protected location. The read BLOCKS until the user answers the
+        // privacy prompt (which reappears after every rebuild, since ad-hoc
+        // signing changes the app's identity). Detached so the UI stays live,
+        // plus a watchdog that explains the wait instead of spinning silently.
+        let discovery = Task.detached { Self.discover() }
+        let watchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, self.phase.isStarting else { return }
+            self.phase = .starting("等待 macOS 文件访问授权 —\n请在系统弹窗中点『允许』")
+        }
+        let found = await discovery.value
+        watchdog.cancel()
         guard let root = found.root else {
             phase = .failed("找不到 moo-trader 仓库（web/server.py）。请把 MooTrader.app 放在仓库的 macos/dist/ 内。")
             return
@@ -176,7 +190,7 @@ final class BackendController: ObservableObject {
             guard misses >= 3 else { continue }   // ~10 s of grace
             if !restartAttempted {
                 restartAttempted = true
-                phase = .starting
+                phase = .starting("Web 服务器重启中…")
                 spawnServer()
                 if await waitForServer(seconds: 25) {
                     phase = .running
@@ -199,15 +213,20 @@ final class BackendController: ObservableObject {
     }
 
     /// Lifecycle breadcrumbs → logs/shell-debug.log (gitignored) + Console.
+    /// Detached: writing into the repo can block on the TCC prompt, and the
+    /// main actor must never be the thread that waits for it.
     private func debugLog(_ msg: String) {
         NSLog("MooTrader: %@", msg)
-        guard let root = repoRoot,
-              let data = "\(Date()) \(msg)\n".data(using: .utf8) else { return }
+        guard let root = repoRoot else { return }
         let url = root.appendingPathComponent("logs/shell-debug.log")
-        if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(data); try? h.close()
-        } else {
-            try? data.write(to: url)
+        let line = "\(Date()) \(msg)\n"
+        Task.detached {
+            guard let data = line.data(using: .utf8) else { return }
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile(); h.write(data); try? h.close()
+            } else {
+                try? data.write(to: url)
+            }
         }
     }
 }

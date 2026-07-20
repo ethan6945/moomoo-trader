@@ -2,27 +2,29 @@ import Combine
 import Foundation
 import UserNotifications
 
-/// Polls /api/status (+ /api/caffeinate) every few seconds while the backend
-/// is up. Feeds the menu bar and any native views; detects the 401 →
-/// login-needed edge case (WEB_PASSWORD set); and fires a system notification
-/// when new pending approvals appear.
+/// Polls the backend every few seconds while it is up and publishes the state
+/// every native view reads. Also detects the 401 → login-needed edge case
+/// (WEB_PASSWORD set) and notifies when new approvals appear.
 @MainActor
 final class StatusPoller: ObservableObject {
     static let shared = StatusPoller()
 
     @Published private(set) var status: TraderStatus?
     @Published private(set) var caffeinate: CaffeinateStatus?
+    @Published private(set) var approvals: [Approval] = []
+    @Published private(set) var activity: [String] = []
     @Published private(set) var schedulerPID: Int32?
     @Published var needsLogin = false
     @Published var schedulerBusy = false   // start/stop in flight (can take ~60 s)
 
+    var pending: [Approval] { approvals.filter(\.isPending) }
+
     private var task: Task<Void, Never>?
     private var lastPendingCount: Int?
 
-    /// UNUserNotificationCenter requires a real .app bundle — crashes under a
+    /// UNUserNotificationCenter requires a real .app bundle — it traps in a
     /// bare `swift run` binary.
-    private let canNotify = Bundle.main.bundleIdentifier != nil
-        && Bundle.main.bundleURL.pathExtension == "app"
+    private let canNotify = Bundle.main.bundleURL.pathExtension == "app"
 
     private init() {}
 
@@ -35,9 +37,7 @@ final class StatusPoller: ObservableObject {
         task = Task { await loop() }
     }
 
-    func stop() {
-        task?.cancel()
-    }
+    func stop() { task?.cancel() }
 
     private func loop() async {
         while !Task.isCancelled {
@@ -52,44 +52,49 @@ final class StatusPoller: ObservableObject {
 
     func refresh() async {
         do {
-            let st = try await APIClient.shared.status()
-            status = st
+            status = try await APIClient.shared.status()
             needsLogin = false
-            notifyIfNewApprovals(pending: st.pendingApprovals)
         } catch let e as APIClient.HTTPError where e.isAuthRequired {
             needsLogin = true
+            return                       // nothing else will succeed either
         } catch {
-            // transient network error — BackendController's monitor owns this
+            return                       // transient — BackendController owns recovery
         }
         caffeinate = try? await APIClient.shared.caffeinate()
+        if let items = try? await APIClient.shared.approvals() {
+            approvals = items
+            notifyIfNewApprovals(items.filter(\.isPending).count)
+        }
+        activity = (try? await APIClient.shared.activityLog(lines: 40)) ?? activity
         if let root = BackendController.shared.repoRoot {
-            schedulerPID = Self.alivePID(
-                at: root.appendingPathComponent("logs/scheduler.pid"))
+            schedulerPID = await Self.alivePID(at: root.appendingPathComponent("logs/scheduler.pid"))
         }
     }
 
-    /// PID from a pid file, but only if the process actually exists.
-    static func alivePID(at url: URL) -> Int32? {
-        guard let text = try? String(contentsOf: url, encoding: .utf8),
-              let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-              kill(pid, 0) == 0 else { return nil }
-        return pid
+    /// PID from a pid file, but only if that process actually exists.
+    /// Detached: reading inside the repo can block on the macOS privacy
+    /// prompt, and blocking the main actor would freeze the whole UI.
+    static func alivePID(at url: URL) async -> Int32? {
+        await Task.detached {
+            guard let text = try? String(contentsOf: url, encoding: .utf8),
+                  let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  kill(pid, 0) == 0 else { return nil }
+            return pid
+        }.value
     }
 
-    private func notifyIfNewApprovals(pending: Int?) {
-        defer { lastPendingCount = pending }
-        guard canNotify, let pending, pending > 0,
-              let last = lastPendingCount, pending > last else { return }
+    private func notifyIfNewApprovals(_ count: Int) {
+        defer { lastPendingCount = count }
+        guard canNotify, count > 0, let last = lastPendingCount, count > last else { return }
         let content = UNMutableNotificationContent()
         content.title = "Moo Trader"
-        content.body = "有 \(pending) 个交易审批待处理"
+        content.body = "有 \(count) 个审批待处理"
         content.sound = .default
         UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: UUID().uuidString,
-                                  content: content, trigger: nil))
+            UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
     }
 
-    // ── actions used by the menu bar ──────────────────────────────────
+    // ── actions ───────────────────────────────────────────────────────
     func toggleCaffeinate() {
         let target = !(caffeinate?.on ?? false)
         Task {
@@ -106,6 +111,13 @@ final class StatusPoller: ObservableObject {
             defer { schedulerBusy = false }
             try? await APIClient.shared.scheduler(action)
             await refresh()
+        }
+    }
+
+    func resolveApproval(_ id: String, action: String) {
+        Task {
+            try? await APIClient.shared.resolveApproval(id, action: action)
+            if let items = try? await APIClient.shared.approvals() { approvals = items }
         }
     }
 }

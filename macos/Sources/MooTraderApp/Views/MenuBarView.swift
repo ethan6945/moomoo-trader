@@ -22,8 +22,8 @@ struct MenuBarView: View {
             if let s = poller.status, let label = s.opendLabel {
                 Text("\(opendDot(s.opendStatus)) OpenD: \(label)")
             }
-            if let pending = poller.status?.pendingApprovals, pending > 0 {
-                Text("⚠ \(pending) 个审批待处理")
+            if !poller.pending.isEmpty {
+                Text("⚠ \(poller.pending.count) 个审批待处理")
             }
         }
 

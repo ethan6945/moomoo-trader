@@ -24,10 +24,17 @@ final class APIClient: @unchecked Sendable {
     }
 
     // ── core ──────────────────────────────────────────────────────────
+    /// `appendingPathComponent` would percent-escape a "?" into the path
+    /// (/api/log%3Fn=40 → 404), so query strings are resolved as a relative
+    /// URL against the base instead.
+    private func url(for path: String) -> URL {
+        URL(string: path, relativeTo: baseURL)?.absoluteURL
+            ?? baseURL.appendingPathComponent(path)
+    }
+
     private func request(_ path: String, method: String, json: [String: Any]?,
                          timeout: TimeInterval) async throws -> Data {
-        var req = URLRequest(url: baseURL.appendingPathComponent(path),
-                             timeoutInterval: timeout)
+        var req = URLRequest(url: url(for: path), timeoutInterval: timeout)
         req.httpMethod = method
         if let json {
             req.httpBody = try JSONSerialization.data(withJSONObject: json)
@@ -62,6 +69,23 @@ final class APIClient: @unchecked Sendable {
 
     func caffeinate() async throws -> CaffeinateStatus {
         try await getJSON("api/caffeinate")
+    }
+
+    func approvals() async throws -> [Approval] {
+        try await getJSON("api/approvals")
+    }
+
+    /// action ∈ approve / reject.
+    func resolveApproval(_ id: String, action: String) async throws {
+        try await post("api/approvals/\(id)/\(action)")
+    }
+
+    func closedTrades(limit: Int = 400) async throws -> [ClosedTrade] {
+        try await getJSON("api/closed?n=\(limit)")
+    }
+
+    func activityLog(lines: Int = 40) async throws -> [String] {
+        try await getJSON("api/log?n=\(lines)")
     }
 
     func setCaffeinate(on: Bool) async throws {
