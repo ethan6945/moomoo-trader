@@ -19,10 +19,13 @@ struct MooTraderApp: App {
         }
         .defaultSize(width: 1300, height: 880)
 
-        MenuBarExtra("MAT") {
+        MenuBarExtra {
             MenuBarView()
                 .environmentObject(backend)
                 .environmentObject(poller)
+        } label: {
+            // The app icon's bull, as a template image — no more "MAT" text.
+            Image(nsImage: AppGlyph.menuBar)
         }
     }
 }
