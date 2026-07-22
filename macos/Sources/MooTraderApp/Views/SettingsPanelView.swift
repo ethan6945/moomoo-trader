@@ -79,7 +79,7 @@ struct SettingsPanelView: View {
 
     // ── 交易环境 ──
     private var tradeEnvPanel: some View {
-        Panel(title: "交易环境") {
+        Panel(title: "交易环境", fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 HStack(spacing: Theme.Space.sm) {
                     Pill(text: ".env: \(env?.envFile ?? "—")",
@@ -113,7 +113,7 @@ struct SettingsPanelView: View {
 
     // ── 预算 ──
     private var budgetPanel: some View {
-        Panel(title: "预算") {
+        Panel(title: "预算", fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 HStack(spacing: Theme.Space.sm) {
                     Text("当前预算")
@@ -172,7 +172,7 @@ struct SettingsPanelView: View {
 
     // ── AI 引擎 ──
     private var aiPanel: some View {
-        Panel(title: "AI 引擎") {
+        Panel(title: "AI 引擎", fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 HStack(spacing: Theme.Space.sm) {
                     Pill(text: ai?.provider ?? "—", tint: Theme.purple)
@@ -246,7 +246,7 @@ struct SettingsPanelView: View {
 
     // ── web 访问 ──
     private var accessPanel: some View {
-        Panel(title: "面板访问范围") {
+        Panel(title: "面板访问范围", fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 HStack(spacing: Theme.Space.sm) {
                     Pill(text: access?.mode == "lan" ? "局域网可访问" : "仅本机",
