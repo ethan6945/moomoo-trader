@@ -31,11 +31,19 @@ struct SettingsPanelView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .rowSurface()
                 }
-                tradeEnvPanel
-                budgetPanel
-                aiPanel
+                // Two columns for the compact panels — they each used only the
+                // left half, so the right half of the window sat empty. Top
+                // alignment lets paired panels keep independent heights. Keys
+                // stays full-width: its descriptions need the room.
+                HStack(alignment: .top, spacing: Theme.Space.md) {
+                    tradeEnvPanel
+                    budgetPanel
+                }
+                HStack(alignment: .top, spacing: Theme.Space.md) {
+                    aiPanel
+                    accessPanel
+                }
                 keysPanel
-                accessPanel
                 maintenancePanel
             }
             .padding(Theme.Space.xl)
