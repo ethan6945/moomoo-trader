@@ -14,7 +14,7 @@ enum Fmt {
 
     static func signed(_ v: Double?, decimals: Int = 2) -> String {
         guard let v else { return "—" }
-        return (v >= 0 ? "+" : "") + money(v, decimals: decimals).replacingOccurrences(of: "-", with: "-")
+        return (v >= 0 ? "+" : "") + money(v, decimals: decimals)
     }
 
     static func pct(_ v: Double?, decimals: Int = 1) -> String {
@@ -30,86 +30,140 @@ enum Fmt {
     /// "2026-07-20T20:15:01.936673" / ISO with zone → "07-20 20:15"
     static func stamp(_ s: String?) -> String {
         guard let s, s.count >= 16 else { return "—" }
-        let date = s.prefix(10).dropFirst(5)      // MM-dd
-        let time = s.dropFirst(11).prefix(5)      // HH:mm
-        return "\(date) \(time)"
+        return "\(s.prefix(10).dropFirst(5)) \(s.dropFirst(11).prefix(5))"
     }
 }
 
-/// Green for gains, red for losses, secondary for nothing.
+/// Green for gains, red for losses, muted for flat/unknown.
 func pnlColor(_ v: Double?) -> Color {
-    guard let v, v != 0 else { return .secondary }
-    return v > 0 ? .green : .red
+    guard let v, v != 0 else { return Theme.muted }
+    return v > 0 ? Theme.green : Theme.red
 }
 
 // ── building blocks ───────────────────────────────────────────────────
-/// Headline number with a caption — the dashboard's top row.
+/// Headline figure with caption — the dashboard's top row. Fixed height so a
+/// row of them lines up regardless of whether footnotes are present.
 struct StatCard: View {
     let label: String
     let value: String
-    var tint: Color = .primary
+    var tint: Color = Theme.strong
     var footnote: String?
+    /// Draws the brand sweep as a thin left rail — used on the hero card.
+    var accent: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.system(size: 22, weight: .semibold, design: .rounded))
-                .foregroundStyle(tint)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-            if let footnote {
-                Text(footnote)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+        HStack(spacing: 0) {
+            if accent {
+                Theme.brand.frame(width: 3)
+            }
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                Text(label)
+                    .font(Theme.Font_.label)
+                    .foregroundStyle(Theme.muted)
+                Text(value)
+                    .font(Theme.Font_.figure)
+                    .monospacedDigit()
+                    .foregroundStyle(tint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.55)
+                Text(footnote ?? " ")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.muted.opacity(footnote == nil ? 0 : 1))
                     .lineLimit(1)
             }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.md)
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity, minHeight: 84, alignment: .leading)
+        // Clip BEFORE the surface: the accent rail is a square-cornered
+        // rectangle in the content layer, so without this it pokes out past the
+        // card's rounded corners. Clipping first leaves the border stroke whole.
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .cardSurface()
     }
 }
 
-/// Small rounded label used for regime / OpenD / env badges.
+/// Small capsule label — status, tags, badges.
 struct Pill: View {
     let text: String
-    var tint: Color = .secondary
+    var tint: Color = Theme.muted
     var icon: String?
 
     var body: some View {
         HStack(spacing: 4) {
-            if let icon { Text(icon) }
-            Text(text)
+            if let icon { Text(icon).font(.system(size: 10)) }
+            Text(text).font(Theme.Font_.label)
         }
-        .font(.caption)
         .padding(.horizontal, 9)
-        .padding(.vertical, 4)
-        .background(tint.opacity(0.15), in: Capsule())
-        .overlay(Capsule().strokeBorder(tint.opacity(0.35)))
-        .foregroundStyle(tint == .secondary ? .secondary : tint)
+        .frame(height: Theme.control)
+        .background(tint.opacity(0.16), in: Capsule())
+        .overlay(Capsule().strokeBorder(tint.opacity(0.34)))
+        .foregroundStyle(tint == Theme.muted ? Theme.text : tint)
+        .fixedSize()
     }
 }
 
-/// Titled container matching the web dashboard's panels.
+/// Titled container. Every panel shares padding, radius and title treatment.
 struct Panel<Content: View>: View {
     let title: String
+    var subtitle: String?
     var trailing: AnyView?
+    /// Grow to the tallest sibling in a row. Must be set on the panel itself —
+    /// wrapping it in a `.frame(maxHeight:)` only centres it in a taller box.
+    var fillHeight = false
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text(title).font(.headline)
-                Spacer()
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.strong)
+                if let subtitle {
+                    Text(subtitle).font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                }
+                Spacer(minLength: Theme.Space.sm)
                 if let trailing { trailing }
             }
             content
         }
-        .padding(14)
-        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 12))
+        .padding(Theme.Space.lg)
+        // .topLeading, not .leading: when a panel is stretched to match a taller
+        // neighbour, the extra height must fall out of the bottom — a centring
+        // frame would push the title away from the top edge.
+        .frame(maxWidth: .infinity,
+               maxHeight: fillHeight ? .infinity : nil,
+               alignment: .topLeading)
+        .cardSurface()
+    }
+}
+
+/// Column header for the custom data rows — muted, small, aligned with cells.
+struct ColumnHeader: View {
+    let text: String
+    var alignment: Alignment = .leading
+
+    var body: some View {
+        Text(text)
+            .font(Theme.Font_.label)
+            .foregroundStyle(Theme.muted)
+            .frame(maxWidth: .infinity, alignment: alignment)
+    }
+}
+
+/// A numeric cell: monospaced digits, trailing-aligned, optional tint.
+struct NumCell: View {
+    let text: String
+    var tint: Color = Theme.text
+    var alignment: Alignment = .trailing
+
+    var body: some View {
+        Text(text)
+            .font(Theme.Font_.body)
+            .monospacedDigit()
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity, alignment: alignment)
     }
 }
 
@@ -120,39 +174,57 @@ struct RangeBar: View {
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(.quaternary).frame(height: 5)
+                Capsule()
+                    .fill(LinearGradient(colors: [Theme.red.opacity(0.5), Theme.card2,
+                                                  Theme.green.opacity(0.5)],
+                                         startPoint: .leading, endPoint: .trailing))
+                    .frame(height: 4)
                 if let entry = position.entryFraction {
                     Rectangle()
-                        .fill(.secondary)
-                        .frame(width: 1.5, height: 11)
+                        .fill(Theme.muted)
+                        .frame(width: 1.5, height: 10)
                         .offset(x: geo.size.width * entry)
                 }
                 if let now = position.rangeFraction {
                     Circle()
                         .fill(pnlColor(position.plValue))
-                        .frame(width: 8, height: 8)
-                        .offset(x: max(0, geo.size.width * now - 4))
+                        .overlay(Circle().strokeBorder(Theme.card, lineWidth: 1.5))
+                        .frame(width: 9, height: 9)
+                        .offset(x: max(0, geo.size.width * now - 4.5))
                 }
             }
-            .frame(height: 11)
+            .frame(height: 10)
             .frame(maxHeight: .infinity)
         }
-        .frame(minWidth: 60)
+        .frame(minWidth: 56, minHeight: 14)
         .help(position.rangeFraction.map {
             "SL \(Fmt.money(position.stopLoss)) → TP \(Fmt.money(position.takeProfit)) · \(Int($0 * 100))%"
         } ?? "—")
     }
 }
 
+/// Empty-state line used by every panel so they all read the same.
+struct EmptyNote: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(Theme.Font_.body)
+            .foregroundStyle(Theme.muted)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.vertical, Theme.Space.xl)
+    }
+}
+
 extension String {
-    /// "green"/"red"/... from /api/status → a SwiftUI colour.
+    /// "green"/"red"/... from /api/status → a themed colour.
     var statusColor: Color {
         switch self {
-        case "green": return .green
-        case "blue": return .blue
-        case "yellow": return .orange
-        case "red": return .red
-        default: return .secondary
+        case "green": return Theme.green
+        case "blue": return Theme.blue
+        case "yellow": return Theme.amber
+        case "red": return Theme.red
+        default: return Theme.muted
         }
     }
 }

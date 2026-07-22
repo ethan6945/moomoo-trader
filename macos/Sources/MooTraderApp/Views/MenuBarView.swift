@@ -12,12 +12,14 @@ struct MenuBarView: View {
     var body: some View {
         // ── status (disabled = plain text rows) ──
         Group {
+            // Same emoji dots as the OpenD row below, so the two status lines
+            // carry equal visual weight (●/○ text glyphs rendered much smaller).
             if let pid = poller.schedulerPID {
-                Text("● Scheduler 运行中 (PID \(String(pid)))")
+                Text("🟢 Scheduler 运行中 (PID \(String(pid)))")
             } else if poller.schedulerBusy {
-                Text("… Scheduler 启动/停止中")
+                Text("🟡 Scheduler 启动/停止中")
             } else {
-                Text("○ Scheduler 已停止")
+                Text("⚪️ Scheduler 已停止")
             }
             if let s = poller.status, let label = s.opendLabel {
                 Text("\(opendDot(s.opendStatus)) OpenD: \(label)")

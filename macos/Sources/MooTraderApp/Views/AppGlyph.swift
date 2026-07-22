@@ -8,6 +8,9 @@ import AppKit
 /// stays legible in light and dark menu bars and inverts while the menu is open.
 enum AppGlyph {
     static let menuBar: NSImage = make(size: NSSize(width: 18, height: 18))
+    /// Same mark at sidebar size. Still a template, so SwiftUI can paint the
+    /// brand gradient straight through it.
+    static let sidebar: NSImage = make(size: NSSize(width: 26, height: 26))
 
     // Glyph bounds in favicon coordinates: horns spread x[15.5,112.5]
     // (the 13pt round caps widen them), arrow top y=13.6 → head bottom y=102.

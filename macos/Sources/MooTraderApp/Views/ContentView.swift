@@ -10,27 +10,41 @@ struct ContentView: View {
             case .starting(let note):
                 message {
                     ProgressView()
+                        .controlSize(.large)
+                        .tint(Theme.blue)
                     Text(note)
-                        .font(.title3)
+                        .font(.system(size: 15))
                         .multilineTextAlignment(.center)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Theme.muted)
                 }
 
             case .running:
                 if poller.needsLogin {
                     // Never load the web view while unauthenticated: it would
                     // land on /login and stay there after the sheet wins.
-                    message { Text("等待登录…").font(.title3).foregroundStyle(.secondary) }
+                    message {
+                        BrandMark(size: 44)
+                        Text("等待登录…")
+                            .font(.system(size: 15))
+                            .foregroundStyle(Theme.muted)
+                    }
                 } else {
                     RootView()
                 }
 
             case .failed(let text):
                 message {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 40)).foregroundStyle(.orange)
-                    Text(text).multilineTextAlignment(.center).frame(maxWidth: 480)
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 34))
+                        .foregroundStyle(Theme.amber)
+                    Text(text)
+                        .font(Theme.Font_.body)
+                        .foregroundStyle(Theme.text)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 480)
                     Button("重新启动引擎") { backend.start() }
+                        .buttonStyle(BrandButtonStyle())
                         .keyboardShortcut(.defaultAction)
                 }
             }
@@ -41,7 +55,28 @@ struct ContentView: View {
     }
 
     private func message<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        VStack(spacing: 14, content: content).padding()
+        VStack(spacing: Theme.Space.lg, content: content)
+            .padding(Theme.Space.xl)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .pageBackground()
+    }
+}
+
+/// The app's bull mark in the brand gradient. Template rendering lets the
+/// gradient paint straight through the glyph.
+struct BrandMark: View {
+    var size: CGFloat = 26
+
+    var body: some View {
+        Theme.brand
+            .mask {
+                Image(nsImage: AppGlyph.sidebar)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+            }
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
     }
 }
 
@@ -69,38 +104,60 @@ struct RootView: View {
 
         var icon: String {
             switch self {
-            case .overview: return "chart.pie"
-            case .approvals: return "checkmark.seal"
+            case .overview: return "chart.pie.fill"
+            case .approvals: return "checkmark.seal.fill"
             case .signals: return "antenna.radiowaves.left.and.right"
             case .history: return "clock.arrow.circlepath"
-            case .settings: return "gearshape"
+            case .settings: return "gearshape.fill"
             case .web: return "globe"
+            }
+        }
+
+        /// One hue per destination, so the eye can find a row by colour alone.
+        var tint: Color {
+            switch self {
+            case .overview: return Theme.blue
+            case .approvals: return Theme.amber
+            case .signals: return Theme.purple
+            case .history: return Theme.green
+            case .settings: return Theme.muted
+            case .web: return Theme.blueUp
             }
         }
     }
 
     var body: some View {
         NavigationSplitView {
-            List(Section.allCases, selection: $section) { item in
-                NavigationLink(value: item) {
-                    Label {
-                        HStack {
-                            Text(item.title)
-                            if item == .approvals, !poller.pending.isEmpty {
-                                Spacer()
-                                Text(String(poller.pending.count))
-                                    .font(.caption2).monospacedDigit()
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(.orange, in: Capsule())
-                                    .foregroundStyle(.white)
+            VStack(spacing: 0) {
+                header
+                List(Section.allCases, selection: $section) { item in
+                    NavigationLink(value: item) {
+                        Label {
+                            HStack(spacing: Theme.Space.sm) {
+                                Text(item.title)
+                                    .font(.system(size: 13, weight: .medium))
+                                if item == .approvals, !poller.pending.isEmpty {
+                                    Spacer(minLength: Theme.Space.xs)
+                                    Text(String(poller.pending.count))
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .monospacedDigit()
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Theme.amber, in: Capsule())
+                                        .foregroundStyle(.black)
+                                }
                             }
+                        } icon: {
+                            Image(systemName: item.icon)
+                                .foregroundStyle(item.tint)
                         }
-                    } icon: {
-                        Image(systemName: item.icon)
                     }
                 }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
             }
-            .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
+            .background(Theme.bg)
+            .navigationSplitViewColumnWidth(min: 150, ideal: 176, max: 220)
         } detail: {
             switch section ?? .overview {
             case .overview:  OverviewView()
@@ -111,5 +168,41 @@ struct RootView: View {
             case .web:       DashboardWebView(url: backend.baseURL).navigationTitle("完整面板")
             }
         }
+        .tint(Theme.blue)
+    }
+
+    /// Wordmark plus a live scheduler dot — the one place the running state is
+    /// visible no matter which section is open.
+    private var header: some View {
+        HStack(spacing: Theme.Space.sm) {
+            BrandMark(size: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Moo Trader")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.strong)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(schedulerTint)
+                        .frame(width: 5, height: 5)
+                    Text(schedulerNote)
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.muted)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.top, Theme.Space.sm)
+        .padding(.bottom, Theme.Space.md)
+    }
+
+    private var schedulerTint: Color {
+        if poller.schedulerPID != nil { return Theme.green }
+        return poller.schedulerBusy ? Theme.amber : Theme.muted
+    }
+
+    private var schedulerNote: String {
+        if poller.schedulerPID != nil { return "调度器运行中" }
+        return poller.schedulerBusy ? "切换中…" : "调度器已停止"
     }
 }

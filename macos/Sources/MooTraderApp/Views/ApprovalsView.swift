@@ -7,70 +7,78 @@ struct ApprovalsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
                 if poller.pending.isEmpty {
-                    Text("✅ 没有待处理的审批")
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.vertical, 20)
+                    Panel(title: "待处理") {
+                        EmptyNote(text: "✅ 没有待处理的审批")
+                    }
                 } else {
-                    Panel(title: "待处理 · \(poller.pending.count)") {
-                        VStack(spacing: 8) {
-                            ForEach(poller.pending) { item in
-                                row(item, actionable: true)
-                            }
+                    Panel(title: "待处理", subtitle: "\(poller.pending.count) 条") {
+                        VStack(spacing: Theme.Space.sm) {
+                            ForEach(poller.pending) { row($0, actionable: true) }
                         }
                     }
                 }
 
                 let resolved = poller.approvals.filter { !$0.isPending }
                 if !resolved.isEmpty {
-                    Panel(title: "已处理") {
-                        VStack(spacing: 8) {
-                            ForEach(resolved.prefix(30)) { item in
-                                row(item, actionable: false)
-                            }
+                    Panel(title: "已处理", subtitle: "最近 \(min(resolved.count, 30)) 条") {
+                        VStack(spacing: Theme.Space.sm) {
+                            ForEach(resolved.prefix(30)) { row($0, actionable: false) }
                         }
                     }
                 }
             }
-            .padding(16)
+            .padding(Theme.Space.xl)
         }
+        .pageBackground()
         .navigationTitle("审批")
     }
 
     private func row(_ item: Approval, actionable: Bool) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Pill(text: item.kind ?? "—",
-                         tint: actionable ? .orange : .secondary)
+        HStack(alignment: .top, spacing: Theme.Space.md) {
+            // Status rail: amber while it waits on you, quiet once resolved.
+            RoundedRectangle(cornerRadius: 2)
+                .fill(actionable ? Theme.amber
+                      : (item.status == "approved" ? Theme.green : Theme.red).opacity(0.5))
+                .frame(width: 3)
+
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                HStack(spacing: Theme.Space.sm) {
+                    Pill(text: item.kind ?? "—", tint: actionable ? Theme.amber : Theme.muted)
                     Text(Fmt.stamp(item.createdAt))
-                        .font(.caption2).foregroundStyle(.tertiary)
+                        .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                     if !actionable, let status = item.status {
-                        Text(status == "approved" ? "已通过" : "已拒绝")
-                            .font(.caption2)
-                            .foregroundStyle(status == "approved" ? .green : .red)
+                        Pill(text: status == "approved" ? "已通过" : "已拒绝",
+                             tint: status == "approved" ? Theme.green : Theme.red)
                     }
                 }
                 Text(item.detail ?? "")
-                    .font(.callout)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.text)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let action = item.action, !action.isEmpty {
                     Text("→ \(action)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(Theme.Font_.body)
+                        .foregroundStyle(Theme.muted)
                         .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Spacer(minLength: 8)
+            Spacer(minLength: Theme.Space.sm)
             if actionable {
-                Button("✓") { poller.resolveApproval(item.id, action: "approve") }
-                    .buttonStyle(.borderedProminent)
-                Button("✗") { poller.resolveApproval(item.id, action: "reject") }
+                HStack(spacing: Theme.Space.sm) {
+                    Button("✓ 通过") { poller.resolveApproval(item.id, action: "approve") }
+                        .buttonStyle(BrandButtonStyle(
+                            tint: LinearGradient(colors: [Theme.green, Theme.green.opacity(0.75)],
+                                                 startPoint: .top, endPoint: .bottom)))
+                    Button("✗ 拒绝") { poller.resolveApproval(item.id, action: "reject") }
+                        .buttonStyle(QuietButtonStyle(tint: Theme.red))
+                }
             }
         }
-        .padding(10)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
+        .padding(Theme.Space.md)
+        .rowSurface()
     }
 }
