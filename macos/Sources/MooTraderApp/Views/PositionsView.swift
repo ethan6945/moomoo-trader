@@ -28,15 +28,17 @@ struct PositionsView: View {
 
     private var header: some View {
         HStack(spacing: Theme.Space.sm) {
-            ColumnHeader(text: "代码").frame(width: cols[0], alignment: .leading)
-            ColumnHeader(text: "数量").frame(width: cols[1], alignment: .trailing)
-            ColumnHeader(text: "入场").frame(width: cols[2], alignment: .trailing)
-            ColumnHeader(text: "现价").frame(width: cols[3], alignment: .trailing)
-            ColumnHeader(text: "止损").frame(width: cols[4], alignment: .trailing)
-            ColumnHeader(text: "止盈").frame(width: cols[5], alignment: .trailing)
-            ColumnHeader(text: "区间").frame(width: cols[6], alignment: .center)
-            ColumnHeader(text: "策略").frame(width: cols[7], alignment: .leading)
-            ColumnHeader(text: "盈亏").frame(width: cols[8], alignment: .trailing)
+            // Header alignment must match each data cell's, or the labels drift
+            // off their columns once the widths stretch.
+            ColumnHeader(text: "代码", alignment: .leading).frame(width: cols[0])
+            ColumnHeader(text: "数量", alignment: .trailing).frame(width: cols[1])
+            ColumnHeader(text: "入场", alignment: .trailing).frame(width: cols[2])
+            ColumnHeader(text: "现价", alignment: .trailing).frame(width: cols[3])
+            ColumnHeader(text: "止损", alignment: .trailing).frame(width: cols[4])
+            ColumnHeader(text: "止盈", alignment: .trailing).frame(width: cols[5])
+            ColumnHeader(text: "区间", alignment: .center).frame(width: cols[6])
+            ColumnHeader(text: "策略", alignment: .leading).frame(width: cols[7])
+            ColumnHeader(text: "盈亏", alignment: .trailing).frame(width: cols[8])
         }
         .padding(.horizontal, Theme.Space.md)
         .padding(.bottom, Theme.Space.xs)

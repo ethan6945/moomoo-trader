@@ -98,15 +98,17 @@ struct HistoryView: View {
     private var table: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: Theme.Space.sm) {
-                ColumnHeader(text: "时间").frame(width: cols[0], alignment: .leading)
-                ColumnHeader(text: "代码").frame(width: cols[1], alignment: .leading)
-                ColumnHeader(text: "数量").frame(width: cols[2], alignment: .trailing)
-                ColumnHeader(text: "入场").frame(width: cols[3], alignment: .trailing)
-                ColumnHeader(text: "离场").frame(width: cols[4], alignment: .trailing)
-                ColumnHeader(text: "原因").frame(width: cols[5], alignment: .leading)
-                ColumnHeader(text: "策略").frame(width: cols[6], alignment: .leading)
-                ColumnHeader(text: "R").frame(width: cols[7], alignment: .trailing)
-                ColumnHeader(text: "盈亏").frame(width: cols[8], alignment: .trailing)
+                // Header alignment must match each data cell's, or the labels
+                // drift off their columns once the widths stretch.
+                ColumnHeader(text: "时间", alignment: .leading).frame(width: cols[0])
+                ColumnHeader(text: "代码", alignment: .leading).frame(width: cols[1])
+                ColumnHeader(text: "数量", alignment: .trailing).frame(width: cols[2])
+                ColumnHeader(text: "入场", alignment: .trailing).frame(width: cols[3])
+                ColumnHeader(text: "离场", alignment: .trailing).frame(width: cols[4])
+                ColumnHeader(text: "原因", alignment: .leading).frame(width: cols[5])
+                ColumnHeader(text: "策略", alignment: .leading).frame(width: cols[6])
+                ColumnHeader(text: "R", alignment: .trailing).frame(width: cols[7])
+                ColumnHeader(text: "盈亏", alignment: .trailing).frame(width: cols[8])
             }
             .padding(.horizontal, Theme.Space.md)
             .padding(.bottom, Theme.Space.xs)
