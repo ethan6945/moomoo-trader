@@ -245,13 +245,14 @@ struct SectorOverview: Decodable {
     var asof: String?
     var stale: Bool?
 
-    /// zh session label + as-of date, matching the web panel's header line.
-    var sessionLabel: String {
-        let map = ["open": "🟢 盘中", "premarket": "🌅 盘前", "afterhours": "🌙 盘后",
-                   "weekend": "⚪️ 周末", "holiday": "⚪️ 休市"]
+    /// Session label + as-of date, matching the web panel's header line.
+    @MainActor var sessionLabel: String {
+        let map = ["open": "🟢 " + L("盘中", "Open"), "premarket": "🌅 " + L("盘前", "Pre-mkt"),
+                   "afterhours": "🌙 " + L("盘后", "After-hrs"), "weekend": "⚪️ " + L("周末", "Weekend"),
+                   "holiday": "⚪️ " + L("休市", "Holiday")]
         var s = map[session ?? ""] ?? ""
         if let asof, !asof.isEmpty { s += " · \(asof.dropFirst(5))" }
-        if stale == true { s += " · 延迟" }
+        if stale == true { s += " · " + L("延迟", "stale") }
         return s
     }
 }

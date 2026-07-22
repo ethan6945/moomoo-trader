@@ -5,6 +5,7 @@ import SwiftUI
 /// URLSession requests carry it automatically.
 struct LoginSheet: View {
     @EnvironmentObject var poller: StatusPoller
+    @ObservedObject private var l10n = L10n.shared
     @State private var password = ""
     @State private var error: String?
     @State private var busy = false
@@ -14,15 +15,15 @@ struct LoginSheet: View {
             BrandMark(size: 40)
 
             VStack(spacing: Theme.Space.xs) {
-                Text("需要登录")
+                Text(L("需要登录", "Login required"))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Theme.strong)
-                Text("请输入 .env 中的 WEB_PASSWORD")
+                Text(L("请输入 .env 中的 WEB_PASSWORD", "Enter WEB_PASSWORD from .env"))
                     .font(Theme.Font_.label)
                     .foregroundStyle(Theme.muted)
             }
 
-            SecureField("Web 密码", text: $password)
+            SecureField(L("Web 密码", "Web password"), text: $password)
                 .textFieldStyle(.plain)
                 .font(Theme.Font_.body)
                 .padding(.horizontal, Theme.Space.md)
@@ -39,7 +40,7 @@ struct LoginSheet: View {
                 .foregroundStyle(Theme.red)
                 .opacity(error == nil ? 0 : 1)
 
-            Button(busy ? "登录中…" : "登录") { submit() }
+            Button(busy ? L("登录中…", "Logging in…") : L("登录", "Log in")) { submit() }
                 .buttonStyle(BrandButtonStyle())
                 .keyboardShortcut(.defaultAction)
                 .disabled(busy || password.isEmpty)
@@ -58,9 +59,9 @@ struct LoginSheet: View {
                 try await APIClient.shared.login(password: password)
                 await poller.refresh()   // clears needsLogin → dismisses sheet
             } catch let e as APIClient.HTTPError where e.status == 429 {
-                error = "尝试次数过多，已锁定 5 分钟"
+                error = L("尝试次数过多，已锁定 5 分钟", "Too many attempts — locked for 5 minutes")
             } catch {
-                self.error = "密码错误"
+                self.error = L("密码错误", "Wrong password")
             }
             busy = false
         }

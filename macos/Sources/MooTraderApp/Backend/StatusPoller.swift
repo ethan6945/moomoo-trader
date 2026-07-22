@@ -92,7 +92,7 @@ final class StatusPoller: ObservableObject {
         guard canNotify, count > 0, let last = lastPendingCount, count > last else { return }
         let content = UNMutableNotificationContent()
         content.title = "Moo Trader"
-        content.body = "有 \(count) 个审批待处理"
+        content.body = L("有 \(count) 个审批待处理", "\(count) approval(s) pending")
         content.sound = .default
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))

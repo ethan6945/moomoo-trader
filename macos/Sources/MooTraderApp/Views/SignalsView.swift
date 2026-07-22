@@ -3,6 +3,7 @@ import SwiftUI
 /// 盯盘 — watchlist monitor tiles, alert feed, and the reporter's controls.
 /// Data comes from src/signal_reporter.py via the signal-* endpoints.
 struct SignalsView: View {
+    @ObservedObject private var l10n = L10n.shared
     @State private var ticks: [MonitorTick] = []
     @State private var alerts: [SignalAlert] = []
     @State private var running = false
@@ -13,10 +14,11 @@ struct SignalsView: View {
     @State private var editingWatchlist = false
     @State private var poll: Task<Void, Never>?
 
-    private let runModes: [(id: String, label: String)] = [
-        ("premarket", "盘前"), ("intraday", "盘中"), ("close", "收盘"),
-        ("brief", "简报"), ("review", "复盘"), ("monitor", "单次盯盘"),
-    ]
+    private var runModes: [(id: String, label: String)] {
+        [("premarket", L("盘前", "Pre-mkt")), ("intraday", L("盘中", "Intraday")),
+         ("close", L("收盘", "Close")), ("brief", L("简报", "Brief")),
+         ("review", L("复盘", "Review")), ("monitor", L("单次盯盘", "Monitor"))]
+    }
 
     var body: some View {
         ScrollView {
@@ -30,18 +32,18 @@ struct SignalsView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .rowSurface()
                 }
-                Panel(title: "自选股", subtitle: "\(watchlist.count) 只",
-                      trailing: AnyView(Button("编辑") { editingWatchlist = true }
+                Panel(title: L("自选股", "Watchlist"), subtitle: L("\(watchlist.count) 只", "\(watchlist.count)"),
+                      trailing: AnyView(Button(L("编辑", "Edit")) { editingWatchlist = true }
                         .buttonStyle(QuietButtonStyle(tint: Theme.blue)))) {
                     watchlistChips
                 }
-                Panel(title: "盯盘快照") { tiles }
-                Panel(title: "警报流") { alertFeed }
+                Panel(title: L("盯盘快照", "Monitor snapshot")) { tiles }
+                Panel(title: L("警报流", "Alert feed")) { alertFeed }
             }
             .padding(Theme.Space.xl)
         }
         .pageBackground()
-        .navigationTitle("信号")
+        .navigationTitle(L("信号", "Signals"))
         .sheet(isPresented: $editingWatchlist) {
             WatchlistEditor(tickers: watchlist) { updated in
                 Task {
@@ -67,14 +69,14 @@ struct SignalsView: View {
     private var controls: some View {
         HStack(spacing: Theme.Space.sm) {
             if running {
-                Pill(text: "盯盘运行中" + (pid.map { " · PID \($0)" } ?? ""),
+                Pill(text: L("盯盘运行中", "Monitor running") + (pid.map { " · PID \($0)" } ?? ""),
                      tint: Theme.green, icon: "●")
             } else {
-                Pill(text: "盯盘已停止", icon: "○")
+                Pill(text: L("盯盘已停止", "Monitor stopped"), icon: "○")
             }
-            Pill(text: "\(ticks.count) 只有快照", tint: Theme.blue)
+            Pill(text: L("\(ticks.count) 只有快照", "\(ticks.count) snapshots"), tint: Theme.blue)
             Spacer(minLength: Theme.Space.sm)
-            Menu("单次运行") {
+            Menu(L("单次运行", "Run once")) {
                 ForEach(runModes, id: \.id) { mode in
                     Button(mode.label) { run(mode.id) }
                 }
@@ -83,11 +85,11 @@ struct SignalsView: View {
             .disabled(busy)
 
             if running {
-                Button("■ 停止盯盘") { toggleScheduler() }
+                Button("■ " + L("停止盯盘", "Stop monitor")) { toggleScheduler() }
                     .buttonStyle(QuietButtonStyle(tint: Theme.red))
                     .disabled(busy)
             } else {
-                Button("▶ 启动盯盘") { toggleScheduler() }
+                Button("▶ " + L("启动盯盘", "Start monitor")) { toggleScheduler() }
                     .buttonStyle(BrandButtonStyle())
                     .disabled(busy)
             }
@@ -101,7 +103,7 @@ struct SignalsView: View {
     private var watchlistChips: some View {
         Group {
             if watchlist.isEmpty {
-                EmptyNote(text: "尚未添加自选股")
+                EmptyNote(text: L("尚未添加自选股", "No watchlist symbols yet"))
             } else {
                 FlowChips(items: watchlist)
             }
@@ -112,7 +114,7 @@ struct SignalsView: View {
     private var tiles: some View {
         Group {
             if ticks.isEmpty {
-                EmptyNote(text: "暂无盯盘数据 — 启动盯盘后每轮扫描会写入快照")
+                EmptyNote(text: L("暂无盯盘数据 — 启动盯盘后每轮扫描会写入快照", "No monitor data — snapshots are written each scan once the monitor runs"))
             } else {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 216), spacing: Theme.Space.md)],
                           spacing: Theme.Space.md) {
@@ -126,7 +128,7 @@ struct SignalsView: View {
     private var alertFeed: some View {
         Group {
             if alerts.isEmpty {
-                EmptyNote(text: "暂无警报")
+                EmptyNote(text: L("暂无警报", "No alerts"))
             } else {
                 VStack(spacing: Theme.Space.sm) {
                     ForEach(alerts.prefix(60)) { a in
@@ -190,14 +192,14 @@ struct SignalsView: View {
 
     private func run(_ mode: String) {
         busy = true
-        note = "正在运行…"
+        note = L("正在运行…", "Running…")
         Task {
             defer { busy = false }
             do {
                 try await APIClient.shared.signalRun(mode)
-                note = "已触发 \(mode) — 结果会推送到 Telegram，警报流稍后更新"
+                note = L("已触发 \(mode) — 结果会推送到 Telegram，警报流稍后更新", "Triggered \(mode) — results go to Telegram; the alert feed updates shortly")
             } catch {
-                note = "运行失败：\(error.localizedDescription)"
+                note = L("运行失败：", "Run failed: ") + error.localizedDescription
             }
             await load()
         }
@@ -206,6 +208,7 @@ struct SignalsView: View {
 
 /// One watchlist symbol's latest tick.
 struct MonitorTile: View {
+    @ObservedObject private var l10n = L10n.shared
     let tick: MonitorTick
 
     private var netTint: Color {
@@ -246,8 +249,8 @@ struct MonitorTile: View {
             }
 
             HStack(spacing: Theme.Space.xs) {
-                Pill(text: "买\(tick.buy ?? 0)/卖\(tick.sell ?? 0)", tint: netTint)
-                if let n = tick.alertsToday, n > 0 { Pill(text: "今日 \(n) 警报") }
+                Pill(text: L("买", "B") + "\(tick.buy ?? 0)/" + L("卖", "S") + "\(tick.sell ?? 0)", tint: netTint)
+                if let n = tick.alertsToday, n > 0 { Pill(text: L("今日 \(n) 警报", "\(n) alerts today")) }
             }
 
             if let last = tick.lastAlert {
@@ -277,6 +280,7 @@ struct FlowChips: View {
 
 /// One-symbol-per-line editor; the server normalises (upper/trim/dedupe).
 struct WatchlistEditor: View {
+    @ObservedObject private var l10n = L10n.shared
     @Environment(\.dismiss) private var dismiss
     @State private var text: String
     let onSave: ([String]) -> Void
@@ -288,10 +292,10 @@ struct WatchlistEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            Text("盯盘自选股")
+            Text(L("盯盘自选股", "Monitor watchlist"))
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(Theme.strong)
-            Text("一行一个代码，保存后写入 config/signal_watchlist.json")
+            Text(L("一行一个代码，保存后写入 config/signal_watchlist.json", "One symbol per line; saved to config/signal_watchlist.json"))
                 .font(Theme.Font_.label)
                 .foregroundStyle(Theme.muted)
             TextEditor(text: $text)
@@ -304,10 +308,10 @@ struct WatchlistEditor: View {
                 .overlay(RoundedRectangle(cornerRadius: Theme.Radius.row, style: .continuous)
                     .strokeBorder(Theme.border))
             HStack {
-                Button("取消") { dismiss() }
+                Button(L("取消", "Cancel")) { dismiss() }
                     .buttonStyle(QuietButtonStyle())
                 Spacer()
-                Button("保存") {
+                Button(L("保存", "Save")) {
                     let list = text.split(whereSeparator: \.isNewline)
                         .map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
                         .filter { !$0.isEmpty }

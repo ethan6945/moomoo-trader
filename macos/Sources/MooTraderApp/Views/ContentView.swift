@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var backend: BackendController
     @EnvironmentObject var poller: StatusPoller
+    @ObservedObject private var l10n = L10n.shared
 
     var body: some View {
         Group {
@@ -24,7 +25,7 @@ struct ContentView: View {
                     // land on /login and stay there after the sheet wins.
                     message {
                         BrandMark(size: 44)
-                        Text("等待登录…")
+                        Text(L("等待登录…", "Waiting for login…"))
                             .font(.system(size: 15))
                             .foregroundStyle(Theme.muted)
                     }
@@ -43,7 +44,7 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .textSelection(.enabled)
                         .frame(maxWidth: 480)
-                    Button("重新启动引擎") { backend.start() }
+                    Button(L("重新启动引擎", "Restart engine")) { backend.start() }
                         .buttonStyle(BrandButtonStyle())
                         .keyboardShortcut(.defaultAction)
                 }
@@ -85,20 +86,21 @@ struct BrandMark: View {
 struct RootView: View {
     @EnvironmentObject var backend: BackendController
     @EnvironmentObject var poller: StatusPoller
+    @ObservedObject private var l10n = L10n.shared
     @State private var section: Section? = .overview
 
     enum Section: String, CaseIterable, Identifiable {
         case overview, approvals, signals, history, settings, web
         var id: String { rawValue }
 
-        var title: String {
+        @MainActor var title: String {
             switch self {
-            case .overview: return "总览"
-            case .approvals: return "审批"
-            case .signals: return "信号"
-            case .history: return "历史"
-            case .settings: return "设置"
-            case .web: return "完整面板"
+            case .overview: return L("总览", "Overview")
+            case .approvals: return L("审批", "Approvals")
+            case .signals: return L("信号", "Signals")
+            case .history: return L("历史", "History")
+            case .settings: return L("设置", "Settings")
+            case .web: return L("完整面板", "Web panel")
             }
         }
 
@@ -165,7 +167,7 @@ struct RootView: View {
             case .signals:   SignalsView()
             case .history:   HistoryView()
             case .settings:  SettingsPanelView()
-            case .web:       DashboardWebView(url: backend.baseURL).navigationTitle("完整面板")
+            case .web:       DashboardWebView(url: backend.baseURL).navigationTitle(L("完整面板", "Web panel"))
             }
         }
         .tint(Theme.blue)
@@ -202,7 +204,7 @@ struct RootView: View {
     }
 
     private var schedulerNote: String {
-        if poller.schedulerPID != nil { return "调度器运行中" }
-        return poller.schedulerBusy ? "切换中…" : "调度器已停止"
+        if poller.schedulerPID != nil { return L("调度器运行中", "Scheduler running") }
+        return poller.schedulerBusy ? L("切换中…", "Switching…") : L("调度器已停止", "Scheduler stopped")
     }
 }

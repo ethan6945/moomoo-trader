@@ -29,7 +29,7 @@ final class BackendController: ObservableObject {
         var isStarting: Bool { if case .starting = self { return true }; return false }
     }
 
-    @Published private(set) var phase: Phase = .starting("引擎启动中…")
+    @Published private(set) var phase: Phase = .starting(L("引擎启动中…", "Starting engine…"))
     @Published private(set) var repoRoot: URL?
     @Published private(set) var port = 8770
 
@@ -89,7 +89,7 @@ final class BackendController: ObservableObject {
     }
 
     private func run() async {
-        phase = .starting("引擎启动中…")
+        phase = .starting(L("引擎启动中…", "Starting engine…"))
         // Discovery touches the repo, which usually sits under ~/Desktop — a
         // TCC-protected location. The read BLOCKS until the user answers the
         // privacy prompt (which reappears after every rebuild, since ad-hoc
@@ -99,12 +99,12 @@ final class BackendController: ObservableObject {
         let watchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))
             guard let self, self.phase.isStarting else { return }
-            self.phase = .starting("等待 macOS 文件访问授权 —\n请在系统弹窗中点『允许』")
+            self.phase = .starting(L("等待 macOS 文件访问授权 —\n请在系统弹窗中点『允许』", "Waiting for macOS file-access permission —\nclick “Allow” in the system prompt"))
         }
         let found = await discovery.value
         watchdog.cancel()
         guard let root = found.root else {
-            phase = .failed("找不到 moo-trader 仓库（web/server.py）。请把 MooTrader.app 放在仓库的 macos/dist/ 内。")
+            phase = .failed(L("找不到 moo-trader 仓库（web/server.py）。请把 MooTrader.app 放在仓库的 macos/dist/ 内。", "Can’t find the moo-trader repo (web/server.py). Put MooTrader.app inside the repo’s macos/dist/."))
             return
         }
         repoRoot = root
@@ -122,7 +122,7 @@ final class BackendController: ObservableObject {
                 phase = .running
             } else {
                 debugLog("spawned server did not come up in 25s")
-                phase = .failed("Web 服务器 25 秒内未就绪 — 查看 logs/web.log")
+                phase = .failed(L("Web 服务器 25 秒内未就绪 — 查看 logs/web.log", "Web server didn’t come up within 25s — see logs/web.log"))
                 return
             }
         }
@@ -190,7 +190,7 @@ final class BackendController: ObservableObject {
             guard misses >= 3 else { continue }   // ~10 s of grace
             if !restartAttempted {
                 restartAttempted = true
-                phase = .starting("Web 服务器重启中…")
+                phase = .starting(L("Web 服务器重启中…", "Restarting web server…"))
                 spawnServer()
                 if await waitForServer(seconds: 25) {
                     phase = .running
@@ -198,7 +198,7 @@ final class BackendController: ObservableObject {
                     continue
                 }
             }
-            phase = .failed("Web 服务器已停止且自动重启失败 — 查看 logs/web.log")
+            phase = .failed(L("Web 服务器已停止且自动重启失败 — 查看 logs/web.log", "Web server stopped and auto-restart failed — see logs/web.log"))
             return
         }
     }

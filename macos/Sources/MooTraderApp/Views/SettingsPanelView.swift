@@ -6,6 +6,7 @@ import SwiftUI
 /// so the Python side stays the single source of truth (and keeps its guards).
 struct SettingsPanelView: View {
     @EnvironmentObject var poller: StatusPoller
+    @ObservedObject private var l10n = L10n.shared
     @AppStorage(Appearance.key) private var appearance = "system"
 
     @State private var env: TradeEnvState?
@@ -55,59 +56,58 @@ struct SettingsPanelView: View {
             .padding(Theme.Space.xl)
         }
         .pageBackground()
-        .navigationTitle("设置")
+        .navigationTitle(L("设置", "Settings"))
         .task { await load() }
         .sheet(item: $editingKey) { item in
             KeyEditor(item: item) { value in
                 Task { await save(key: item.key, value: value) }
             }
         }
-        .alert("切换到实盘？", isPresented: $confirmReal) {
-            Button("取消", role: .cancel) {}
-            Button("切到实盘", role: .destructive) { setEnv("REAL", confirm: true) }
+        .alert(L("切换到实盘？", "Switch to LIVE?"), isPresented: $confirmReal) {
+            Button(L("取消", "Cancel"), role: .cancel) {}
+            Button(L("切到实盘", "Go LIVE"), role: .destructive) { setEnv("REAL", confirm: true) }
         } message: {
-            Text("实盘用的是真钱。需要已设置 6 位交易密码 MOO_TRADE_PWD，且当前无未平仓持仓；"
-                 + "切换后要点「重启调度器」才生效。首次实盘务必只放小额。")
+            Text(L("实盘用的是真钱。需要已设置 6 位交易密码 MOO_TRADE_PWD，且当前无未平仓持仓；切换后要点「重启调度器」才生效。首次实盘务必只放小额。", "LIVE uses real money. Requires the 6-digit trade password MOO_TRADE_PWD set and no open positions; takes effect after you restart the scheduler. Start with a tiny amount."))
         }
-        .alert("重置交易统计？", isPresented: $confirmReset) {
-            Button("取消", role: .cancel) {}
-            Button("重置", role: .destructive) {
+        .alert(L("重置交易统计？", "Reset trade stats?"), isPresented: $confirmReset) {
+            Button(L("取消", "Cancel"), role: .cancel) {}
+            Button(L("重置", "Reset"), role: .destructive) {
                 Task {
                     try? await APIClient.shared.resetStats()
-                    note = "已重置统计基线 — 之后平仓的交易才计入战绩"
+                    note = L("已重置统计基线 — 之后平仓的交易才计入战绩", "Stats baseline reset — only trades closed from now count")
                     await poller.refresh()
                 }
             }
         } message: {
-            Text("战绩/胜率从此刻重新开始统计。历史交易记录本身不会被删除。")
+            Text(L("战绩/胜率从此刻重新开始统计。历史交易记录本身不会被删除。", "Record/win-rate restart from now. Trade history itself is not deleted."))
         }
     }
 
     // ── 交易环境 ──
     private var tradeEnvPanel: some View {
-        Panel(title: "交易环境", fillHeight: true) {
+        Panel(title: L("交易环境", "Trade env"), fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 HStack(spacing: Theme.Space.sm) {
                     Pill(text: ".env: \(env?.envFile ?? "—")",
                          tint: env?.envFile == "REAL" ? Theme.red : Theme.blue)
                     if let live = env?.envLive {
-                        Pill(text: "运行中: \(live)", tint: live == "REAL" ? Theme.red : Theme.blue)
+                        Pill(text: L("运行中: ", "live: ") + live, tint: live == "REAL" ? Theme.red : Theme.blue)
                     }
                     if env?.pendingRestart == true {
-                        Pill(text: "需重启调度器生效", tint: Theme.amber, icon: "⚠")
+                        Pill(text: L("需重启调度器生效", "needs scheduler restart"), tint: Theme.amber, icon: "⚠")
                     }
-                    Pill(text: "未平仓 \(env?.openPositions ?? 0)")
+                    Pill(text: L("未平仓 ", "open ") + "\(env?.openPositions ?? 0)")
                     Spacer()
                 }
                 HStack(spacing: Theme.Space.sm) {
-                    Button("切到模拟盘") { setEnv("SIMULATE") }
+                    Button(L("切到模拟盘", "Go PAPER")) { setEnv("SIMULATE") }
                         .buttonStyle(QuietButtonStyle(tint: Theme.blue))
                         .disabled(busy || env?.envFile == "SIMULATE")
-                    Button("切到实盘 💵") { confirmReal = true }
+                    Button(L("切到实盘 💵", "Go LIVE 💵")) { confirmReal = true }
                         .buttonStyle(QuietButtonStyle(tint: Theme.red))
                         .disabled(busy || env?.envFile == "REAL")
                     if env?.pendingRestart == true {
-                        Button("重启调度器") { poller.scheduler("restart") }
+                        Button(L("重启调度器", "Restart scheduler")) { poller.scheduler("restart") }
                             .buttonStyle(BrandButtonStyle())
                             .disabled(poller.schedulerBusy)
                     }
@@ -119,10 +119,10 @@ struct SettingsPanelView: View {
 
     // ── 预算 ──
     private var budgetPanel: some View {
-        Panel(title: "预算", fillHeight: true) {
+        Panel(title: L("预算", "Budget"), fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 HStack(spacing: Theme.Space.sm) {
-                    Text("当前预算")
+                    Text(L("当前预算", "Budget"))
                         .font(Theme.Font_.body).foregroundStyle(Theme.muted)
                         .frame(width: 64, alignment: .leading)
                     TextField("USD", text: $budgetText)
@@ -130,44 +130,44 @@ struct SettingsPanelView: View {
                         .font(Theme.Font_.body)
                         .frame(width: 110)
                         .onSubmit { applyBudget() }
-                    Button("应用") { applyBudget() }
+                    Button(L("应用", "Apply")) { applyBudget() }
                         .buttonStyle(BrandButtonStyle())
                         .disabled(busy)
                     Spacer()
                 }
                 Divider()
                 HStack(spacing: Theme.Space.sm) {
-                    Text("自动复利")
+                    Text(L("自动复利", "Auto-comp"))
                         .font(Theme.Font_.body).foregroundStyle(Theme.muted)
                         .frame(width: 64, alignment: .leading)
-                    Pill(text: autoBudget?.enabled == true ? "已开启" : "已关闭",
+                    Pill(text: autoBudget?.enabled == true ? L("已开启", "on") : L("已关闭", "off"),
                          tint: autoBudget?.enabled == true ? Theme.green : Theme.muted)
                     if autoBudget?.armed == true {
-                        Pill(text: "已锁定基准 \(Fmt.money(autoBudget?.seed, decimals: 0))",
+                        Pill(text: L("已锁定基准 ", "seed ") + Fmt.money(autoBudget?.seed, decimals: 0),
                              tint: Theme.blue)
                     }
                     if let target = autoBudget?.target {
-                        Pill(text: "目标 \(Fmt.money(target, decimals: 0))")
+                        Pill(text: L("目标 ", "target ") + Fmt.money(target, decimals: 0))
                     }
                     if let p = autoBudget?.profitSinceArm {
-                        Pill(text: "累计 \(Fmt.signed(p, decimals: 0))",
+                        Pill(text: L("累计 ", "P&L ") + Fmt.signed(p, decimals: 0),
                              tint: p >= 0 ? Theme.green : Theme.red)
                     }
                     Spacer()
                 }
                 HStack {
-                    Button(autoBudget?.enabled == true ? "关闭复利" : "开启复利") {
+                    Button(autoBudget?.enabled == true ? L("关闭复利", "Disable") : L("开启复利", "Enable")) {
                         act { try await APIClient.shared.setAutoBudget(
                             enabled: !(autoBudget?.enabled ?? false)) }
                     }
                     .buttonStyle(QuietButtonStyle(
                         tint: autoBudget?.enabled == true ? Theme.muted : Theme.green))
-                    Button(autoBudget?.armed == true ? "解除锁定" : "锁定当前为基准") {
+                    Button(autoBudget?.armed == true ? L("解除锁定", "Unlock") : L("锁定当前为基准", "Lock as seed")) {
                         act { try await APIClient.shared.autoBudgetAction(
                             autoBudget?.armed == true ? "disarm" : "arm") }
                     }
                     .buttonStyle(QuietButtonStyle(tint: Theme.blue))
-                    Button("重算") { act { try await APIClient.shared.autoBudgetAction("recompute") } }
+                    Button(L("重算", "Recompute")) { act { try await APIClient.shared.autoBudgetAction("recompute") } }
                         .buttonStyle(QuietButtonStyle())
                     Spacer()
                 }
@@ -180,14 +180,14 @@ struct SettingsPanelView: View {
     // Single engine (DeepSeek) — no provider picker. Just the fixed engine and
     // its live-fetched model list.
     private var aiPanel: some View {
-        Panel(title: "AI 引擎", fillHeight: true) {
+        Panel(title: L("AI 引擎", "AI engine"), fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 HStack(spacing: Theme.Space.sm) {
                     Pill(text: "DeepSeek", tint: Theme.purple)
                     Pill(text: ai?.model ?? "—")
                     Spacer()
                 }
-                Text("所有需要 AI 的功能（盯盘 / 情绪 / 退出 / 优化 / 入场验证）都用 DeepSeek。")
+                Text(L("所有需要 AI 的功能（盯盘 / 情绪 / 退出 / 优化 / 入场验证）都用 DeepSeek。", "Every AI feature (monitor / sentiment / exit / optimize / entry check) uses DeepSeek."))
                     .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
                 if !aiModels.isEmpty {
@@ -195,10 +195,10 @@ struct SettingsPanelView: View {
                     // laid out as one unit with the control, which floats the
                     // pair off the leading edge the rows above line up on.
                     HStack(spacing: Theme.Space.sm) {
-                        Text("模型")
+                        Text(L("模型", "Model"))
                             .font(Theme.Font_.label)
                             .foregroundStyle(Theme.muted)
-                        Picker("模型", selection: Binding(
+                        Picker(L("模型", "Model"), selection: Binding(
                             get: { ai?.model ?? "" },
                             set: { model in
                                 guard let provider = ai?.provider else { return }
@@ -217,22 +217,22 @@ struct SettingsPanelView: View {
 
     // ── .env keys ──
     private var keysPanel: some View {
-        Panel(title: "API Key / 密码（写入 .env）") {
+        Panel(title: L("API Key / 密码（写入 .env）", "API keys / passwords (.env)")) {
             VStack(spacing: Theme.Space.sm) {
                 ForEach(keys) { item in
                     HStack(alignment: .top, spacing: Theme.Space.md) {
                         VStack(alignment: .leading, spacing: 3) {
                             HStack(spacing: Theme.Space.sm) {
                                 Text(item.key).font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.strong)
-                                Pill(text: item.isSet == true ? (item.masked ?? "已设置") : "未设置",
+                                Pill(text: item.isSet == true ? (item.masked ?? L("已设置", "set")) : L("未设置", "unset"),
                                      tint: item.isSet == true ? Theme.green : Theme.muted)
                             }
-                            Text(item.desc ?? "")
+                            Text(l10n.keyDesc(item.key, fallback: item.desc ?? ""))
                                 .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         Spacer(minLength: 8)
-                        Button("修改") { editingKey = item }
+                        Button(L("修改", "Edit")) { editingKey = item }
                             .buttonStyle(QuietButtonStyle(tint: Theme.blue))
                     }
                     .padding(Theme.Space.md)
@@ -244,12 +244,12 @@ struct SettingsPanelView: View {
 
     // ── web 访问 ──
     private var accessPanel: some View {
-        Panel(title: "面板访问范围", fillHeight: true) {
+        Panel(title: L("面板访问范围", "Panel access"), fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 HStack(spacing: Theme.Space.sm) {
-                    Pill(text: access?.mode == "lan" ? "局域网可访问" : "仅本机",
+                    Pill(text: access?.mode == "lan" ? L("局域网可访问", "LAN reachable") : L("仅本机", "Local only"),
                          tint: access?.mode == "lan" ? Theme.amber : Theme.green)
-                    Pill(text: access?.passwordSet == true ? "已设密码" : "无密码",
+                    Pill(text: access?.passwordSet == true ? L("已设密码", "password set") : L("无密码", "no password"),
                          tint: access?.passwordSet == true ? Theme.green : Theme.muted)
                     if let ip = access?.lanIp, access?.mode == "lan" {
                         Pill(text: "\(ip):\(access?.port ?? 8770)")
@@ -259,24 +259,24 @@ struct SettingsPanelView: View {
                     }
                     Spacer()
                 }
-                Text("局域网为明文 HTTP，密码/会话在同网段可被嗅探；公共 WiFi 下建议走 Tailscale 地址。开放局域网前必须先设 WEB_PASSWORD。")
+                Text(L("局域网为明文 HTTP，密码/会话在同网段可被嗅探；公共 WiFi 下建议走 Tailscale 地址。开放局域网前必须先设 WEB_PASSWORD。", "LAN is plain HTTP — password/session can be sniffed on the same network; prefer the Tailscale address on public WiFi. Set WEB_PASSWORD before exposing to LAN."))
                     .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: Theme.Space.sm) {
-                    Button(access?.mode == "lan" ? "改回仅本机" : "开放到局域网") {
+                    Button(access?.mode == "lan" ? L("改回仅本机", "Back to local") : L("开放到局域网", "Expose to LAN")) {
                         let target = access?.mode == "lan" ? "local" : "lan"
                         act {
                             try await APIClient.shared.setWebAccess(mode: target)
                             // The server restarts itself; BackendController re-adopts it.
                         }
-                        note = "已切换访问范围 — Web 服务器正在重启，界面会自动重连"
+                        note = L("已切换访问范围 — Web 服务器正在重启，界面会自动重连", "Access scope changed — web server restarting, the UI will reconnect")
                     }
                     .buttonStyle(QuietButtonStyle(
                         tint: access?.mode == "lan" ? Theme.muted : Theme.amber))
                     .disabled(busy)
                     // The password shown here lives in .env under WEB_PASSWORD;
                     // edit it in place instead of hunting for it in the key list.
-                    Button(access?.passwordSet == true ? "修改密码" : "设置密码") {
+                    Button(access?.passwordSet == true ? L("修改密码", "Change password") : L("设置密码", "Set password")) {
                         editingKey = passwordItem
                     }
                     .buttonStyle(QuietButtonStyle(tint: Theme.blue))
@@ -287,14 +287,14 @@ struct SettingsPanelView: View {
     }
 
     private var maintenancePanel: some View {
-        Panel(title: "维护") {
+        Panel(title: L("维护", "Maintenance"), fillHeight: true) {
             HStack(spacing: Theme.Space.sm) {
-                Button(poller.caffeinate?.on == true ? "关闭防睡眠" : "开启防睡眠") {
+                Button(poller.caffeinate?.on == true ? L("关闭防睡眠", "Disable keep-awake") : L("开启防睡眠", "Keep awake")) {
                     poller.toggleCaffeinate()
                 }
                 .buttonStyle(QuietButtonStyle(
                     tint: poller.caffeinate?.on == true ? Theme.amber : Theme.muted))
-                Button("重置交易统计") { confirmReset = true }
+                Button(L("重置交易统计", "Reset stats")) { confirmReset = true }
                     .buttonStyle(QuietButtonStyle(tint: Theme.red))
                 Spacer()
             }
@@ -305,17 +305,31 @@ struct SettingsPanelView: View {
     // Native adds a "跟随系统" option the web theme toggle doesn't have; it drives
     // NSApp.appearance so native colours and the WKWebView both follow it.
     private var appearancePanel: some View {
-        Panel(title: "外观", fillHeight: true) {
+        Panel(title: L("外观 & 语言", "Appearance & language"), fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                Picker("", selection: $appearance) {
-                    Text("跟随系统").tag("system")
-                    Text("深色").tag("dark")
-                    Text("浅色").tag("light")
+                HStack(spacing: Theme.Space.sm) {
+                    Text(L("主题", "Theme"))
+                        .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                        .frame(width: 40, alignment: .leading)
+                    Picker("", selection: $appearance) {
+                        Text(L("跟随系统", "System")).tag("system")
+                        Text(L("深色", "Dark")).tag("dark")
+                        Text(L("浅色", "Light")).tag("light")
+                    }
+                    .pickerStyle(.segmented).labelsHidden()
+                    .onChange(of: appearance) { _, mode in Appearance.apply(mode) }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .onChange(of: appearance) { _, mode in Appearance.apply(mode) }
-                Text("界面配色。语言方面：原生界面为中文，English 版仍在「完整面板」。")
+                HStack(spacing: Theme.Space.sm) {
+                    Text(L("语言", "Lang"))
+                        .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                        .frame(width: 40, alignment: .leading)
+                    Picker("", selection: $l10n.lang) {
+                        Text("中文").tag("zh")
+                        Text("English").tag("en")
+                    }
+                    .pickerStyle(.segmented).labelsHidden()
+                }
+                Text(L("界面配色与语言。立即生效，记在本机。", "Theme and language. Applies immediately, saved on this Mac."))
                     .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -324,12 +338,12 @@ struct SettingsPanelView: View {
 
     // ── 支持 ──
     private var supportPanel: some View {
-        Panel(title: "支持") {
+        Panel(title: L("支持", "Support")) {
             HStack(alignment: .center, spacing: Theme.Space.md) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("支持这个项目")
+                    Text(L("支持这个项目", "Support this project"))
                         .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.strong)
-                    Text("本软件免费开源。如果它帮到了你，欢迎请作者喝杯咖啡 ☕")
+                    Text(L("本软件免费开源。如果它帮到了你，欢迎请作者喝杯咖啡 ☕", "This app is free & open source. If it helped you, buy the author a coffee ☕"))
                         .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                 }
                 Spacer(minLength: Theme.Space.sm)
@@ -369,7 +383,7 @@ struct SettingsPanelView: View {
         busy = true
         Task {
             defer { busy = false }
-            do { try await body() } catch { note = "操作失败：\(error.localizedDescription)" }
+            do { try await body() } catch { note = L("操作失败：", "Action failed: ") + error.localizedDescription }
             await load()
             await poller.refresh()
         }
@@ -382,14 +396,14 @@ struct SettingsPanelView: View {
             do {
                 try await APIClient.shared.setTradeEnv(target, confirm: confirm)
                 note = target == "REAL"
-                    ? "已切到实盘 — 点「重启调度器」后生效"
-                    : "已切回模拟盘 — 点「重启调度器」后生效"
+                    ? L("已切到实盘 — 点「重启调度器」后生效", "Switched to LIVE — restart the scheduler to apply")
+                    : L("已切回模拟盘 — 点「重启调度器」后生效", "Switched to PAPER — restart the scheduler to apply")
             } catch let e as APIClient.HTTPError {
                 note = e.status == 409
-                    ? "拒绝切换：还有未平仓持仓，请先全部平仓"
-                    : "拒绝切换（HTTP \(e.status)）— 检查是否已设 6 位交易密码 MOO_TRADE_PWD"
+                    ? L("拒绝切换：还有未平仓持仓，请先全部平仓", "Refused: open positions exist — close them all first")
+                    : L("拒绝切换（HTTP \(e.status)）— 检查是否已设 6 位交易密码 MOO_TRADE_PWD", "Refused (HTTP \(e.status)) — check the 6-digit trade password MOO_TRADE_PWD is set")
             } catch {
-                note = "切换失败：\(error.localizedDescription)"
+                note = L("切换失败：", "Switch failed: ") + error.localizedDescription
             }
             await load()
         }
@@ -397,13 +411,13 @@ struct SettingsPanelView: View {
 
     private func applyBudget() {
         guard let v = Double(budgetText.trimmingCharacters(in: .whitespaces)) else {
-            note = "预算需要是数字"
+            note = L("预算需要是数字", "Budget must be a number")
             return
         }
         act {
             try await APIClient.shared.setBudget(v)
         }
-        note = "预算已更新为 \(Fmt.money(v, decimals: 0))"
+        note = L("预算已更新为 ", "Budget set to ") + Fmt.money(v, decimals: 0)
     }
 
     /// The WEB_PASSWORD row for the editor — reuse the loaded item (keeps its
@@ -411,7 +425,7 @@ struct SettingsPanelView: View {
     private var passwordItem: SettingsKeys.Item {
         keys.first { $0.key == "WEB_PASSWORD" }
             ?? SettingsKeys.Item(key: "WEB_PASSWORD",
-                                 desc: "网页访问密码 — 手机/局域网打开面板要先登录(本机也是)。留空=清除密码，面板将不再需要登录。",
+                                 desc: L("网页访问密码 — 手机/局域网打开面板要先登录(本机也是)。留空=清除密码，面板将不再需要登录。", "Web access password — phone/LAN must log in (local too). Empty = clear it, no login needed."),
                                  masked: nil, isSet: access?.passwordSet)
     }
 
@@ -419,10 +433,10 @@ struct SettingsPanelView: View {
         do {
             try await APIClient.shared.setSettingsKey(key, value: value)
             note = key == "WEB_PASSWORD"
-                ? "访问密码已更新 — 下次打开面板需要重新登录"
-                : "已写入 .env — 重启 bot 后生效"
+                ? L("访问密码已更新 — 下次打开面板需要重新登录", "Access password updated — you'll need to log in again next time")
+                : L("已写入 .env — 重启 bot 后生效", "Written to .env — takes effect after a bot restart")
         } catch {
-            note = "写入失败：\(error.localizedDescription)"
+            note = L("写入失败：", "Write failed: ") + error.localizedDescription
         }
         await load()
     }
@@ -431,6 +445,7 @@ struct SettingsPanelView: View {
 /// Secret entry sheet. The stored value is never fetched or prefilled — the
 /// server only ever returns a masked form.
 struct KeyEditor: View {
+    @ObservedObject private var l10n = L10n.shared
     @Environment(\.dismiss) private var dismiss
     let item: SettingsKeys.Item
     let onSave: (String) -> Void
@@ -443,13 +458,13 @@ struct KeyEditor: View {
                 .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                 .frame(width: 360, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
-            SecureField("留空则清除该项", text: $value)
+            SecureField(L("留空则清除该项", "Empty to clear"), text: $value)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 360)
             HStack {
-                Button("取消") { dismiss() }
+                Button(L("取消", "Cancel")) { dismiss() }
                 Spacer()
-                Button("保存") { onSave(value); dismiss() }
+                Button(L("保存", "Save")) { onSave(value); dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
         }

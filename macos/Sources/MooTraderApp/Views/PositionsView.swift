@@ -6,6 +6,7 @@ import SwiftUI
 /// layout, and one shared column spec keeps the header, cells and every other
 /// panel on the same grid.
 struct PositionsView: View {
+    @ObservedObject private var l10n = L10n.shared
     let positions: [Position]
     @State private var tableWidth: CGFloat = 0
 
@@ -16,7 +17,7 @@ struct PositionsView: View {
 
     var body: some View {
         if positions.isEmpty {
-            EmptyNote(text: "🌙 当前无持仓", compact: true)
+            EmptyNote(text: "🌙 " + L("当前无持仓", "No open positions"), compact: true)
         } else {
             VStack(alignment: .leading, spacing: 2) {
                 header
@@ -30,15 +31,15 @@ struct PositionsView: View {
         HStack(spacing: Theme.Space.sm) {
             // Header alignment must match each data cell's, or the labels drift
             // off their columns once the widths stretch.
-            ColumnHeader(text: "代码", alignment: .leading).frame(width: cols[0])
-            ColumnHeader(text: "数量", alignment: .trailing).frame(width: cols[1])
-            ColumnHeader(text: "入场", alignment: .trailing).frame(width: cols[2])
-            ColumnHeader(text: "现价", alignment: .trailing).frame(width: cols[3])
-            ColumnHeader(text: "止损", alignment: .trailing).frame(width: cols[4])
-            ColumnHeader(text: "止盈", alignment: .trailing).frame(width: cols[5])
-            ColumnHeader(text: "区间", alignment: .center).frame(width: cols[6])
-            ColumnHeader(text: "策略", alignment: .leading).frame(width: cols[7])
-            ColumnHeader(text: "盈亏", alignment: .trailing).frame(width: cols[8])
+            ColumnHeader(text: L("代码", "Sym"), alignment: .leading).frame(width: cols[0])
+            ColumnHeader(text: L("数量", "Qty"), alignment: .trailing).frame(width: cols[1])
+            ColumnHeader(text: L("入场", "Entry"), alignment: .trailing).frame(width: cols[2])
+            ColumnHeader(text: L("现价", "Last"), alignment: .trailing).frame(width: cols[3])
+            ColumnHeader(text: L("止损", "Stop"), alignment: .trailing).frame(width: cols[4])
+            ColumnHeader(text: L("止盈", "Target"), alignment: .trailing).frame(width: cols[5])
+            ColumnHeader(text: L("区间", "Range"), alignment: .center).frame(width: cols[6])
+            ColumnHeader(text: L("策略", "Strategy"), alignment: .leading).frame(width: cols[7])
+            ColumnHeader(text: L("盈亏", "P&L"), alignment: .trailing).frame(width: cols[8])
         }
         .padding(.horizontal, Theme.Space.md)
         .padding(.bottom, Theme.Space.xs)
@@ -74,21 +75,22 @@ struct PositionsView: View {
 /// semantics: 手动·自管 = your own buy, high risk, you're watching it;
 /// 手动·接管 = the bot has taken over stops/targets.
 struct StrategyTags: View {
+    @ObservedObject private var l10n = L10n.shared
     let position: Position
 
     var body: some View {
         HStack(spacing: Theme.Space.xs) {
             if position.manualAdopted {
-                Pill(text: position.userManaged ? "手动·自管" : "手动·接管",
+                Pill(text: position.userManaged ? L("手动·自管", "Manual·self") : L("手动·接管", "Manual·bot"),
                      tint: position.userManaged ? Theme.amber : Theme.blue, icon: "🖐")
                     .help(position.userManaged
-                          ? "你手动买入 · 高风险 · 等你确认是否接管（你自己盯盘）"
-                          : "你手动买入 · 已被机器人接管止损/止盈")
+                          ? L("你手动买入 · 高风险 · 等你确认是否接管（你自己盯盘）", "Your manual buy · high risk · awaiting your takeover decision (you're watching it)")
+                          : L("你手动买入 · 已被机器人接管止损/止盈", "Your manual buy · bot has taken over stop/target"))
             } else {
                 Pill(text: position.strategy ?? "—", tint: Theme.blue)
             }
             if let pattern = position.pattern {
-                Pill(text: pattern, tint: Theme.purple, icon: "📐").help("AI 形态识别")
+                Pill(text: pattern, tint: Theme.purple, icon: "📐").help(L("AI 形态识别", "AI pattern"))
             }
         }
     }
