@@ -1,10 +1,12 @@
+import AppKit
 import SwiftUI
 
-/// 设置 — trade env, budget, AI engine, .env keys, web exposure, stats reset.
-/// Every mutation goes through the same endpoints the web panel uses, so the
-/// Python side stays the single source of truth (and keeps its guards).
+/// 设置 — trade env, budget, AI engine, .env keys, web exposure, appearance,
+/// support. Backend settings go through the same endpoints the web panel uses,
+/// so the Python side stays the single source of truth (and keeps its guards).
 struct SettingsPanelView: View {
     @EnvironmentObject var poller: StatusPoller
+    @AppStorage(Appearance.key) private var appearance = "system"
 
     @State private var env: TradeEnvState?
     @State private var autoBudget: AutoBudgetState?
@@ -44,7 +46,11 @@ struct SettingsPanelView: View {
                     accessPanel
                 }
                 keysPanel
-                maintenancePanel
+                HStack(alignment: .top, spacing: Theme.Space.md) {
+                    maintenancePanel
+                    appearancePanel
+                }
+                supportPanel
             }
             .padding(Theme.Space.xl)
         }
@@ -293,6 +299,54 @@ struct SettingsPanelView: View {
                 Spacer()
             }
         }
+    }
+
+    // ── 外观 ──
+    // Native adds a "跟随系统" option the web theme toggle doesn't have; it drives
+    // NSApp.appearance so native colours and the WKWebView both follow it.
+    private var appearancePanel: some View {
+        Panel(title: "外观", fillHeight: true) {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Picker("", selection: $appearance) {
+                    Text("跟随系统").tag("system")
+                    Text("深色").tag("dark")
+                    Text("浅色").tag("light")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: appearance) { _, mode in Appearance.apply(mode) }
+                Text("界面配色。语言方面：原生界面为中文，English 版仍在「完整面板」。")
+                    .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // ── 支持 ──
+    private var supportPanel: some View {
+        Panel(title: "支持") {
+            HStack(alignment: .center, spacing: Theme.Space.md) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("支持这个项目")
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.strong)
+                    Text("本软件免费开源。如果它帮到了你，欢迎请作者喝杯咖啡 ☕")
+                        .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                }
+                Spacer(minLength: Theme.Space.sm)
+                Button("☕ Buy me a coffee") {
+                    open("https://buymeacoffee.com/YOUR_HANDLE")
+                }
+                .buttonStyle(QuietButtonStyle(tint: Theme.amber))
+                Button("⭐ GitHub") {
+                    open("https://github.com/ethan6945/moomoo-trader")
+                }
+                .buttonStyle(QuietButtonStyle(tint: Theme.blue))
+            }
+        }
+    }
+
+    private func open(_ url: String) {
+        if let u = URL(string: url) { NSWorkspace.shared.open(u) }
     }
 
     // ── data ──

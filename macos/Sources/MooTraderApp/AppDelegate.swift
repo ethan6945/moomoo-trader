@@ -2,6 +2,7 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Appearance.applySaved()
         Task { @MainActor in
             BackendController.shared.start()
             StatusPoller.shared.start()
