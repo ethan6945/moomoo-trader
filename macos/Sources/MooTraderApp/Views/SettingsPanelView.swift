@@ -171,27 +171,19 @@ struct SettingsPanelView: View {
     }
 
     // ── AI 引擎 ──
+    // Single engine (DeepSeek) — no provider picker. Just the fixed engine and
+    // its live-fetched model list.
     private var aiPanel: some View {
         Panel(title: "AI 引擎", fillHeight: true) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 HStack(spacing: Theme.Space.sm) {
-                    Pill(text: ai?.provider ?? "—", tint: Theme.purple)
+                    Pill(text: "DeepSeek", tint: Theme.purple)
                     Pill(text: ai?.model ?? "—")
-                    if ai?.supportsVision == true { Pill(text: "支持看图", tint: Theme.blue, icon: "📐") }
                     Spacer()
                 }
-                if let providers = ai?.providers {
-                    HStack {
-                        ForEach(providers) { p in
-                            Button(p.label ?? p.id) { switchProvider(p.id) }
-                                .buttonStyle(QuietButtonStyle(
-                                    tint: ai?.provider == p.id ? Theme.purple : Theme.blue))
-                                .disabled(busy || p.hasKey != true || ai?.provider == p.id)
-                                .help(p.hasKey == true ? "" : "未配置该引擎的 API Key")
-                        }
-                        Spacer()
-                    }
-                }
+                Text("所有需要 AI 的功能（盯盘 / 情绪 / 退出 / 优化 / 入场验证）都用 DeepSeek。")
+                    .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !aiModels.isEmpty {
                     // Own label + labelsHidden: a Picker's built-in label is
                     // laid out as one unit with the control, which floats the
@@ -352,22 +344,6 @@ struct SettingsPanelView: View {
             try await APIClient.shared.setBudget(v)
         }
         note = "预算已更新为 \(Fmt.money(v, decimals: 0))"
-    }
-
-    private func switchProvider(_ id: String) {
-        busy = true
-        Task {
-            defer { busy = false }
-            let models = (try? await APIClient.shared.aiModels(provider: id)) ?? []
-            let model = models.first ?? ""
-            do {
-                try await APIClient.shared.setAIProvider(id, model: model)
-                note = "AI 引擎已切换为 \(id)"
-            } catch {
-                note = "切换失败 — 该引擎可能未配置 API Key"
-            }
-            await load()
-        }
     }
 
     private func save(key: String, value: String) async {
