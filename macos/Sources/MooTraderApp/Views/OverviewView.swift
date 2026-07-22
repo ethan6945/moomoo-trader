@@ -99,7 +99,6 @@ struct OverviewView: View {
                 Pill(text: "VIX \(String(format: "%.1f", vix))",
                      tint: vix >= 25 ? Theme.amber : Theme.muted)
             }
-            if let phase = s?.phase, !phase.isEmpty { Pill(text: phase) }
             if let env = s?.tradeEnv {
                 Pill(text: env == "REAL" ? "实盘" : "模拟盘",
                      tint: env == "REAL" ? Theme.red : Theme.blue)
