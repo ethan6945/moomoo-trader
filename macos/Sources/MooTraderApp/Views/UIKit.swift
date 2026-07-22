@@ -206,13 +206,16 @@ struct RangeBar: View {
 /// Empty-state line used by every panel so they all read the same.
 struct EmptyNote: View {
     let text: String
+    /// Tight vertical padding — for panels that shouldn't balloon into a big
+    /// empty block just because they have nothing to show (e.g. 0 持仓).
+    var compact = false
 
     var body: some View {
         Text(text)
             .font(Theme.Font_.body)
             .foregroundStyle(Theme.muted)
             .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.vertical, Theme.Space.xl)
+            .padding(.vertical, compact ? Theme.Space.sm : Theme.Space.xl)
     }
 }
 

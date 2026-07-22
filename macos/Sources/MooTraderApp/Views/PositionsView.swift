@@ -13,7 +13,7 @@ struct PositionsView: View {
 
     var body: some View {
         if positions.isEmpty {
-            EmptyNote(text: "🌙 当前无持仓")
+            EmptyNote(text: "🌙 当前无持仓", compact: true)
         } else {
             // .leading: fixed-width columns, so a centring stack would float the
             // table away from the panel title.

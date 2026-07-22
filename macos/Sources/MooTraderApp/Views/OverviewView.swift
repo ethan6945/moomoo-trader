@@ -25,7 +25,7 @@ struct OverviewView: View {
                 }
                 if let sec = poller.sectors, !sec.sectors.isEmpty {
                     Panel(title: "美国板块总览", subtitle: sec.sessionLabel) {
-                        SectorGrid(overview: sec)
+                        SectorGrid(overview: sec, tileHeight: sectorTileHeight)
                     }
                 }
             }
@@ -63,6 +63,18 @@ struct OverviewView: View {
     private var streakNote: String? {
         guard let sm = s?.summary, let streak = sm.streak, streak > 0 else { return nil }
         return sm.streakKind == "win" ? "\(streak) 连胜" : (sm.streakKind == "loss" ? "\(streak) 连败" : nil)
+    }
+
+    /// Sector tiles grow when few positions crowd the page, shrink as the book
+    /// fills — so the two bottom panels share the height rather than the sector
+    /// block staying fixed while 持仓 sits mostly empty.
+    private var sectorTileHeight: CGFloat {
+        switch s?.positions.count ?? 0 {
+        case 0:     return 84
+        case 1...3: return 66
+        case 4...6: return 54
+        default:    return 46
+        }
     }
 
     // ── engine + market state, and the scheduler controls ──
@@ -212,6 +224,10 @@ struct TradeRecordView: View {
 /// scale (intensity ∝ |pct| against the day's largest move).
 struct SectorGrid: View {
     let overview: SectorOverview
+    /// Grows when positions are few, shrinks when the book fills up — so the
+    /// two panels share the window's height instead of the sector block
+    /// staying a fixed size while 持仓 sits mostly empty.
+    var tileHeight: CGFloat = 56
 
     private var maxAbs: Double {
         max(0.5, overview.sectors.map { abs($0.pct ?? 0) }.max() ?? 0.5)
@@ -243,7 +259,7 @@ struct SectorGrid: View {
                                      count: 4),
                       spacing: Theme.Space.sm) {
                 ForEach(overview.sectors.sorted { ($0.pct ?? 0) > ($1.pct ?? 0) }) { tile in
-                    SectorTileView(tile: tile, maxAbs: maxAbs)
+                    SectorTileView(tile: tile, maxAbs: maxAbs, minHeight: tileHeight)
                 }
             }
         }
@@ -253,6 +269,7 @@ struct SectorGrid: View {
 struct SectorTileView: View {
     let tile: SectorTile
     let maxAbs: Double
+    var minHeight: CGFloat = 56
 
     private var up: Bool { (tile.pct ?? 0) >= 0 }
     private var base: Color { up ? Theme.green : Theme.red }
@@ -284,7 +301,7 @@ struct SectorTileView: View {
             }
         }
         .padding(Theme.Space.md)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .topLeading)
         .background(base.opacity(intensity),
                     in: RoundedRectangle(cornerRadius: Theme.Radius.row, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: Theme.Radius.row, style: .continuous)
