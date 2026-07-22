@@ -5,9 +5,12 @@ import SwiftUI
 struct HistoryView: View {
     @State private var trades: [ClosedTrade] = []
     @State private var loading = true
+    @State private var tableWidth: CGFloat = 0
 
-    /// Same column spec idea as PositionsView so the two tables share a grid.
-    private let cols: [CGFloat] = [92, 66, 50, 74, 74, 92, 92, 56, 140]
+    /// Column weights — justified to the panel width once measured (fixed px as
+    /// the pre-measure fallback).
+    private let weights: [CGFloat] = [92, 66, 50, 74, 74, 92, 92, 56, 140]
+    private var cols: [CGFloat] { columnWidths(weights, total: tableWidth) }
 
     /// Running total after each closed trade.
     private var equityCurve: [(index: Int, value: Double)] {
@@ -93,8 +96,6 @@ struct HistoryView: View {
     }
 
     private var table: some View {
-        // .leading: the columns are fixed-width, so a centring stack would
-        // float the whole table away from the panel title.
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: Theme.Space.sm) {
                 ColumnHeader(text: "时间").frame(width: cols[0], alignment: .leading)
@@ -140,6 +141,7 @@ struct HistoryView: View {
                 }
             }
         }
+        .measureWidth { tableWidth = $0 }
     }
 
     /// SL red, TP green, everything else neutral — matches the P&L language.

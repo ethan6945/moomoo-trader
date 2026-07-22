@@ -219,6 +219,37 @@ struct EmptyNote: View {
     }
 }
 
+// ── column-width distribution ─────────────────────────────────────────
+/// Reports a view's measured width up the tree.
+struct WidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+extension View {
+    func measureWidth(_ onChange: @escaping (CGFloat) -> Void) -> some View {
+        background(GeometryReader { g in
+            Color.clear.preference(key: WidthKey.self, value: g.size.width)
+        })
+        .onPreferenceChange(WidthKey.self, perform: onChange)
+    }
+}
+
+/// Spread a container's width across columns by weight, so fixed-looking tables
+/// justify to the full panel width instead of leaving a big empty right side.
+/// `weights` double as the fallback (used until the width is measured).
+func columnWidths(_ weights: [CGFloat], total: CGFloat,
+                  spacing: CGFloat = Theme.Space.sm,
+                  hPadding: CGFloat = Theme.Space.md) -> [CGFloat] {
+    let gaps = CGFloat(max(0, weights.count - 1)) * spacing
+    let usable = total - gaps - hPadding * 2
+    let sum = weights.reduce(0, +)
+    guard total > 0, usable > 0, sum > 0 else { return weights }
+    return weights.map { usable * $0 / sum }
+}
+
 extension String {
     /// "green"/"red"/... from /api/status → a themed colour.
     var statusColor: Color {

@@ -7,20 +7,22 @@ import SwiftUI
 /// panel on the same grid.
 struct PositionsView: View {
     let positions: [Position]
+    @State private var tableWidth: CGFloat = 0
 
-    /// Relative column widths — header and rows read from this one list.
-    private let cols: [CGFloat] = [70, 52, 74, 74, 74, 74, 110, 150, 140]
+    /// Column weights — justified to the panel width once measured (fixed px as
+    /// the pre-measure fallback). 区间 carries the extra slack.
+    private let weights: [CGFloat] = [70, 52, 74, 74, 74, 74, 110, 150, 140]
+    private var cols: [CGFloat] { columnWidths(weights, total: tableWidth) }
 
     var body: some View {
         if positions.isEmpty {
             EmptyNote(text: "🌙 当前无持仓", compact: true)
         } else {
-            // .leading: fixed-width columns, so a centring stack would float the
-            // table away from the panel title.
             VStack(alignment: .leading, spacing: 2) {
                 header
                 ForEach(positions) { row($0) }
             }
+            .measureWidth { tableWidth = $0 }
         }
     }
 
@@ -32,7 +34,7 @@ struct PositionsView: View {
             ColumnHeader(text: "现价").frame(width: cols[3], alignment: .trailing)
             ColumnHeader(text: "止损").frame(width: cols[4], alignment: .trailing)
             ColumnHeader(text: "止盈").frame(width: cols[5], alignment: .trailing)
-            ColumnHeader(text: "区间").frame(minWidth: cols[6], alignment: .center)
+            ColumnHeader(text: "区间").frame(width: cols[6], alignment: .center)
             ColumnHeader(text: "策略").frame(width: cols[7], alignment: .leading)
             ColumnHeader(text: "盈亏").frame(width: cols[8], alignment: .trailing)
         }
@@ -51,7 +53,7 @@ struct PositionsView: View {
             NumCell(text: Fmt.money(p.last), tint: Theme.strong).frame(width: cols[3])
             NumCell(text: Fmt.money(p.stopLoss), tint: Theme.red).frame(width: cols[4])
             NumCell(text: Fmt.money(p.takeProfit), tint: Theme.green).frame(width: cols[5])
-            RangeBar(position: p).frame(minWidth: cols[6])
+            RangeBar(position: p).frame(width: cols[6])
             StrategyTags(position: p).frame(width: cols[7], alignment: .leading)
             NumCell(text: pnlText(p), tint: pnlColor(p.plValue)).frame(width: cols[8])
         }
