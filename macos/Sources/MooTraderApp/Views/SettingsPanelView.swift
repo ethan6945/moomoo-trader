@@ -256,7 +256,7 @@ struct SettingsPanelView: View {
                 Text("局域网为明文 HTTP，密码/会话在同网段可被嗅探；公共 WiFi 下建议走 Tailscale 地址。开放局域网前必须先设 WEB_PASSWORD。")
                     .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack {
+                HStack(spacing: Theme.Space.sm) {
                     Button(access?.mode == "lan" ? "改回仅本机" : "开放到局域网") {
                         let target = access?.mode == "lan" ? "local" : "lan"
                         act {
@@ -268,6 +268,12 @@ struct SettingsPanelView: View {
                     .buttonStyle(QuietButtonStyle(
                         tint: access?.mode == "lan" ? Theme.muted : Theme.amber))
                     .disabled(busy)
+                    // The password shown here lives in .env under WEB_PASSWORD;
+                    // edit it in place instead of hunting for it in the key list.
+                    Button(access?.passwordSet == true ? "修改密码" : "设置密码") {
+                        editingKey = passwordItem
+                    }
+                    .buttonStyle(QuietButtonStyle(tint: Theme.blue))
                     Spacer()
                 }
             }
@@ -344,6 +350,15 @@ struct SettingsPanelView: View {
             try await APIClient.shared.setBudget(v)
         }
         note = "预算已更新为 \(Fmt.money(v, decimals: 0))"
+    }
+
+    /// The WEB_PASSWORD row for the editor — reuse the loaded item (keeps its
+    /// description) or synthesise one if the key list hasn't arrived yet.
+    private var passwordItem: SettingsKeys.Item {
+        keys.first { $0.key == "WEB_PASSWORD" }
+            ?? SettingsKeys.Item(key: "WEB_PASSWORD",
+                                 desc: "网页访问密码 — 手机/局域网打开面板要先登录(本机也是)。留空=清除密码，面板将不再需要登录。",
+                                 masked: nil, isSet: access?.passwordSet)
     }
 
     private func save(key: String, value: String) async {
