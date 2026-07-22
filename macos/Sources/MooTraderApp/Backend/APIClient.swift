@@ -88,6 +88,11 @@ final class APIClient: @unchecked Sendable {
         try await getJSON("api/log?n=\(lines)")
     }
 
+    /// US sector/index ETF overview (server caches ~60 s).
+    func sectors() async throws -> SectorOverview {
+        try await getJSON("api/sectors", timeout: 20)
+    }
+
     func setCaffeinate(on: Bool) async throws {
         try await post("api/caffeinate", json: ["on": on])
     }

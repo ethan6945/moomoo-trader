@@ -237,6 +237,35 @@ struct CaffeinateStatus: Decodable {
     var lid: Bool?
 }
 
+// ── US sector overview (/api/sectors) ────────────────────────────────
+struct SectorOverview: Decodable {
+    var sectors: [SectorTile] = []
+    var indices: [SectorTile] = []
+    var session: String?      // open / premarket / afterhours / weekend / holiday
+    var asof: String?
+    var stale: Bool?
+
+    /// zh session label + as-of date, matching the web panel's header line.
+    var sessionLabel: String {
+        let map = ["open": "🟢 盘中", "premarket": "🌅 盘前", "afterhours": "🌙 盘后",
+                   "weekend": "⚪️ 周末", "holiday": "⚪️ 休市"]
+        var s = map[session ?? ""] ?? ""
+        if let asof, !asof.isEmpty { s += " · \(asof.dropFirst(5))" }
+        if stale == true { s += " · 延迟" }
+        return s
+    }
+}
+
+struct SectorTile: Decodable, Identifiable {
+    var sym: String
+    var zh: String?
+    var en: String?
+    var price: Double?
+    var pct: Double?
+
+    var id: String { sym }
+}
+
 // ── signals (盯盘) ────────────────────────────────────────────────────
 /// One symbol's latest tick from data/signal_monitor_state.json.
 struct MonitorTick: Identifiable {

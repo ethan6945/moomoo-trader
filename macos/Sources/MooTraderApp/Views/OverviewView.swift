@@ -23,6 +23,11 @@ struct OverviewView: View {
                 Panel(title: "持仓", subtitle: "\(s?.positions.count ?? 0) 只") {
                     PositionsView(positions: s?.positions ?? [])
                 }
+                if let sec = poller.sectors, !sec.sectors.isEmpty {
+                    Panel(title: "美国板块总览", subtitle: sec.sessionLabel) {
+                        SectorGrid(overview: sec)
+                    }
+                }
             }
             .padding(Theme.Space.xl)
         }
@@ -110,28 +115,34 @@ struct OverviewView: View {
         .cardSurface()
     }
 
+    /// /api/log is oldest→newest, so the freshest line is last; keep it pinned
+    /// to the bottom as new lines arrive (a fresh scroll each poll).
     private var activityLog: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 3) {
-                ForEach(Array(poller.activity.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(Theme.Font_.mono)
-                        .foregroundStyle(logColor(line))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(poller.activity.enumerated()), id: \.offset) { i, line in
+                        Text(line)
+                            .font(Theme.Font_.mono)
+                            .foregroundStyle(logColor(line))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .id(i)
+                    }
+                    Color.clear.frame(height: 1).id(logBottomID)
                 }
+                .padding(Theme.Space.sm)
             }
-            .padding(Theme.Space.sm)
+            .frame(height: 150)
+            .rowSurface()
+            .onChange(of: poller.activity.count) { _, _ in
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(logBottomID, anchor: .bottom) }
+            }
+            .onAppear { proxy.scrollTo(logBottomID, anchor: .bottom) }
         }
-        .frame(height: 150)
-        // Fade the last line out instead of slicing it in half — the cut edge
-        // reads as a rendering glitch, the fade reads as "there's more".
-        .mask(LinearGradient(stops: [.init(color: .black, location: 0),
-                                     .init(color: .black, location: 0.88),
-                                     .init(color: .clear, location: 1)],
-                             startPoint: .top, endPoint: .bottom))
-        .rowSurface()
     }
+
+    private let logBottomID = "log-bottom"
 
     /// Same highlighting rules as the web log pane.
     private func logColor(_ line: String) -> Color {
@@ -193,5 +204,90 @@ struct TradeRecordView: View {
         .padding(.vertical, Theme.Space.sm)
         .padding(.horizontal, Theme.Space.sm)
         .rowSurface()
+    }
+}
+
+/// US sector heatmap — the web dashboard's 美国板块总览, natively. Index pills up
+/// top, then sector tiles sorted strongest→weakest with a shared green/red tint
+/// scale (intensity ∝ |pct| against the day's largest move).
+struct SectorGrid: View {
+    let overview: SectorOverview
+
+    private var maxAbs: Double {
+        max(0.5, overview.sectors.map { abs($0.pct ?? 0) }.max() ?? 0.5)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            if !overview.indices.isEmpty {
+                HStack(spacing: Theme.Space.sm) {
+                    ForEach(overview.indices) { idx in
+                        HStack(spacing: 5) {
+                            Text(idx.zh ?? idx.sym)
+                                .font(Theme.Font_.body).foregroundStyle(Theme.text)
+                            Text(Fmt.pct(idx.pct, decimals: 2))
+                                .font(.system(size: 12, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(pnlColor(idx.pct))
+                        }
+                        .padding(.horizontal, 9).padding(.vertical, 4)
+                        .background(Theme.card2, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Theme.border))
+                        .help("\(idx.sym) · \(Fmt.money(idx.price))")
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: Theme.Space.sm),
+                                     count: 4),
+                      spacing: Theme.Space.sm) {
+                ForEach(overview.sectors.sorted { ($0.pct ?? 0) > ($1.pct ?? 0) }) { tile in
+                    SectorTileView(tile: tile, maxAbs: maxAbs)
+                }
+            }
+        }
+    }
+}
+
+struct SectorTileView: View {
+    let tile: SectorTile
+    let maxAbs: Double
+
+    private var up: Bool { (tile.pct ?? 0) >= 0 }
+    private var base: Color { up ? Theme.green : Theme.red }
+    private var intensity: Double {
+        0.10 + 0.30 * min(1, abs(tile.pct ?? 0) / maxAbs)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                Text(tile.zh ?? tile.sym)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Theme.strong)
+                    .lineLimit(1)
+                Text(tile.sym)
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.muted)
+                Spacer(minLength: 0)
+            }
+            HStack(alignment: .firstTextBaseline) {
+                Text(Fmt.pct(tile.pct, decimals: 2))
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(base)
+                Spacer(minLength: 0)
+                Text(Fmt.money(tile.price))
+                    .font(.system(size: 10)).monospacedDigit()
+                    .foregroundStyle(Theme.muted)
+            }
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(base.opacity(intensity),
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.row, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.row, style: .continuous)
+            .strokeBorder(base.opacity(0.38)))
     }
 }

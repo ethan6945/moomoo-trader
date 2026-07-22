@@ -13,6 +13,7 @@ final class StatusPoller: ObservableObject {
     @Published private(set) var caffeinate: CaffeinateStatus?
     @Published private(set) var approvals: [Approval] = []
     @Published private(set) var activity: [String] = []
+    @Published private(set) var sectors: SectorOverview?
     @Published private(set) var schedulerPID: Int32?
     @Published var needsLogin = false
     @Published var schedulerBusy = false   // start/stop in flight (can take ~60 s)
@@ -66,6 +67,9 @@ final class StatusPoller: ObservableObject {
             notifyIfNewApprovals(items.filter(\.isPending).count)
         }
         activity = (try? await APIClient.shared.activityLog(lines: 40)) ?? activity
+        // Server caches sectors ~60 s, so polling every cycle is cheap; keep the
+        // last good value on a transient miss rather than blanking the panel.
+        if let s = try? await APIClient.shared.sectors() { sectors = s }
         if let root = BackendController.shared.repoRoot {
             schedulerPID = await Self.alivePID(at: root.appendingPathComponent("logs/scheduler.pid"))
         }
