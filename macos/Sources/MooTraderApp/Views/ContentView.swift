@@ -21,8 +21,8 @@ struct ContentView: View {
 
             case .running:
                 if poller.needsLogin {
-                    // Never load the web view while unauthenticated: it would
-                    // land on /login and stay there after the sheet wins.
+                    // Wait behind the login sheet until authenticated (the API
+                    // returns 401 until then).
                     message {
                         BrandMark(size: 44)
                         Text(L("等待登录…", "Waiting for login…"))
@@ -82,7 +82,7 @@ struct BrandMark: View {
 }
 
 /// Sidebar navigation. Native views cover everything day to day; the full web
-/// dashboard stays one click away for the backtest tab and the sector heatmap.
+/// dashboard opens in the default browser from Settings (backtest tab etc.).
 struct RootView: View {
     @EnvironmentObject var backend: BackendController
     @EnvironmentObject var poller: StatusPoller
@@ -90,7 +90,7 @@ struct RootView: View {
     @State private var section: Section? = .overview
 
     enum Section: String, CaseIterable, Identifiable {
-        case overview, approvals, signals, history, settings, web
+        case overview, approvals, signals, history, settings
         var id: String { rawValue }
 
         @MainActor var title: String {
@@ -100,7 +100,6 @@ struct RootView: View {
             case .signals: return L("信号", "Signals")
             case .history: return L("历史", "History")
             case .settings: return L("设置", "Settings")
-            case .web: return L("完整面板", "Web panel")
             }
         }
 
@@ -111,7 +110,6 @@ struct RootView: View {
             case .signals: return "antenna.radiowaves.left.and.right"
             case .history: return "clock.arrow.circlepath"
             case .settings: return "gearshape.fill"
-            case .web: return "globe"
             }
         }
 
@@ -123,7 +121,6 @@ struct RootView: View {
             case .signals: return Theme.purple
             case .history: return Theme.green
             case .settings: return Theme.muted
-            case .web: return Theme.blueUp
             }
         }
     }
@@ -167,7 +164,6 @@ struct RootView: View {
             case .signals:   SignalsView()
             case .history:   HistoryView()
             case .settings:  SettingsPanelView()
-            case .web:       DashboardWebView(url: backend.baseURL).navigationTitle(L("完整面板", "Web panel"))
             }
         }
         .tint(Theme.blue)

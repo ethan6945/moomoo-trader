@@ -280,6 +280,13 @@ struct SettingsPanelView: View {
                         editingKey = passwordItem
                     }
                     .buttonStyle(QuietButtonStyle(tint: Theme.blue))
+                    // The full dashboard (backtest, sector heatmap, everything)
+                    // lives in the browser now — open it in the default browser
+                    // rather than embedding a WKWebView.
+                    Button(L("在浏览器打开完整面板", "Open web panel in browser")) {
+                        open(BackendController.shared.baseURL.absoluteString)
+                    }
+                    .buttonStyle(QuietButtonStyle(tint: Theme.blueUp))
                     Spacer()
                 }
             }
