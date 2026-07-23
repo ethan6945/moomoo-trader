@@ -348,7 +348,7 @@ struct SettingsPanelView: View {
                 }
                 Spacer(minLength: Theme.Space.sm)
                 Button("☕ Buy me a coffee") {
-                    open("https://buymeacoffee.com/YOUR_HANDLE")
+                    open("https://buymeacoffee.com/ethan6945")
                 }
                 .buttonStyle(QuietButtonStyle(tint: Theme.amber))
                 Button("⭐ GitHub") {
