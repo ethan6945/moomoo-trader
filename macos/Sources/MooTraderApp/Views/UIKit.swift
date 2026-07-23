@@ -237,16 +237,33 @@ extension View {
     }
 }
 
-/// Spread a container's width across columns by weight, so fixed-looking tables
-/// justify to the full panel width instead of leaving a big empty right side.
+/// Spread a container's width across columns so the table justifies to the full
+/// panel width instead of leaving a big empty right side.
+///
+/// - `flex == nil`: every column scales proportionally by weight (good when all
+///   columns hold similar-density text).
+/// - `flex == i`: every other column keeps its weight as a FIXED point width and
+///   column `i` absorbs the remainder. Use this when one column is a stretchable
+///   visual (e.g. the positions range bar) — it keeps the short number/pill
+///   columns snug so nothing floats with an awkward gap.
+///
 /// `weights` double as the fallback (used until the width is measured).
-func columnWidths(_ weights: [CGFloat], total: CGFloat,
+func columnWidths(_ weights: [CGFloat], total: CGFloat, flex: Int? = nil,
                   spacing: CGFloat = Theme.Space.sm,
                   hPadding: CGFloat = Theme.Space.md) -> [CGFloat] {
     let gaps = CGFloat(max(0, weights.count - 1)) * spacing
     let usable = total - gaps - hPadding * 2
+    guard total > 0, usable > 0 else { return weights }
+
+    if let flex, weights.indices.contains(flex) {
+        let fixed = weights.enumerated()
+            .filter { $0.offset != flex }.map(\.element).reduce(0, +)
+        var out = weights
+        out[flex] = max(weights[flex], usable - fixed)   // absorb the slack
+        return out
+    }
     let sum = weights.reduce(0, +)
-    guard total > 0, usable > 0, sum > 0 else { return weights }
+    guard sum > 0 else { return weights }
     return weights.map { usable * $0 / sum }
 }
 

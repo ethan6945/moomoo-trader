@@ -10,10 +10,11 @@ struct PositionsView: View {
     let positions: [Position]
     @State private var tableWidth: CGFloat = 0
 
-    /// Column weights — justified to the panel width once measured (fixed px as
-    /// the pre-measure fallback). 区间 carries the extra slack.
-    private let weights: [CGFloat] = [70, 52, 74, 74, 74, 74, 110, 150, 140]
-    private var cols: [CGFloat] { columnWidths(weights, total: tableWidth) }
+    /// Fixed content widths; the 区间 (Range) bar is the flex column and soaks
+    /// up all the slack, so the number/pill columns stay snug and nothing floats
+    /// with a gap. (Values double as the pre-measure fallback.)
+    private let weights: [CGFloat] = [66, 46, 74, 74, 74, 80, 120, 128, 132]
+    private var cols: [CGFloat] { columnWidths(weights, total: tableWidth, flex: 6) }
 
     var body: some View {
         if positions.isEmpty {
@@ -23,6 +24,10 @@ struct PositionsView: View {
                 header
                 ForEach(positions) { row($0) }
             }
+            // Fill the panel so measureWidth reports the available width, not the
+            // fixed columns' content width — otherwise the flex (Range) column
+            // can never expand to absorb the slack.
+            .frame(maxWidth: .infinity, alignment: .leading)
             .measureWidth { tableWidth = $0 }
         }
     }
