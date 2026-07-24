@@ -41,49 +41,6 @@ func pnlColor(_ v: Double?) -> Color {
 }
 
 // ── building blocks ───────────────────────────────────────────────────
-/// Headline figure with caption — the dashboard's top row. Fixed height so a
-/// row of them lines up regardless of whether footnotes are present.
-struct StatCard: View {
-    let label: String
-    let value: String
-    var tint: Color = Theme.strong
-    var footnote: String?
-    /// Draws the brand sweep as a thin left rail — used on the hero card.
-    var accent: Bool = false
-
-    var body: some View {
-        HStack(spacing: 0) {
-            if accent {
-                Theme.brand.frame(width: 3)
-            }
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                Text(label)
-                    .font(Theme.Font_.label)
-                    .foregroundStyle(Theme.muted)
-                Text(value)
-                    .font(Theme.Font_.figure)
-                    .monospacedDigit()
-                    .foregroundStyle(tint)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.55)
-                Text(footnote ?? " ")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.muted.opacity(footnote == nil ? 0 : 1))
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.vertical, Theme.Space.md)
-            Spacer(minLength: 0)
-        }
-        .frame(maxWidth: .infinity, minHeight: 84, alignment: .leading)
-        // Clip BEFORE the surface: the accent rail is a square-cornered
-        // rectangle in the content layer, so without this it pokes out past the
-        // card's rounded corners. Clipping first leaves the border stroke whole.
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-        .cardSurface()
-    }
-}
-
 /// Small capsule label — status, tags, badges.
 struct Pill: View {
     let text: String

@@ -36,29 +36,55 @@ struct OverviewView: View {
         .navigationTitle(L("总览", "Overview"))
     }
 
-    // ── account numbers ──
+    // ── account cards — mirrors the web dashboard's four stat cards ──
     private var cards: some View {
         HStack(spacing: Theme.Space.md) {
-            StatCard(label: L("净值", "Equity"), value: Fmt.money(s?.equity),
-                     footnote: L("现金 ", "Cash ") + Fmt.money(s?.cash, decimals: 0), accent: true)
-            StatCard(label: L("持仓市值", "Invested"), value: Fmt.money(s?.invested),
-                     footnote: L("\(s?.positionsCount ?? 0) 只持仓", "\(s?.positionsCount ?? 0) held"))
-            StatCard(label: L("未实现盈亏", "Unrealized"), value: Fmt.signed(s?.unrealizedPnl),
-                     tint: pnlColor(s?.unrealizedPnl), footnote: unrealizedNote)
-            StatCard(label: L("已实现累计", "Realized"), value: Fmt.signed(s?.realizedPnlTotal),
-                     tint: pnlColor(s?.realizedPnlTotal),
-                     footnote: L("今日 ", "Today ") + Fmt.signed(s?.realizedPnlToday, decimals: 0))
-            StatCard(label: L("预算", "Budget"), value: Fmt.money(s?.budget, decimals: 0),
-                     footnote: L("敞口 ", "Risk ") + "\(Fmt.money(s?.openRisk, decimals: 0)) / \(Fmt.money(s?.heatCap, decimals: 0))")
+            // ① Deployed / budget + progress bar
+            MetricCard(label: L("已部署 / 预算", "Deployed / budget"),
+                       value: "\(Fmt.money(s?.invested, decimals: 0)) / \(Fmt.money(s?.budget, decimals: 0))",
+                       accent: Theme.blue,
+                       sub: L("\(deployedPct)% 预算已部署", "\(deployedPct)% deployed")) {
+                ProgressMeter(fraction: deployedFraction)
+            }
+            // ② Today realized + daily P&L bars
+            MetricCard(label: L("今日盈亏 · 已实现", "Today · realized"),
+                       value: Fmt.signed(s?.realizedPnlToday, decimals: 0),
+                       valueTint: pnlColor(s?.realizedPnlToday), accent: Theme.green) {
+                BarSparkline(values: dailyPnl)
+            }
+            // ③ Total realized + cumulative equity line
+            MetricCard(label: L("总盈亏 · 累计已实现", "Total · realized"),
+                       value: Fmt.signed(s?.realizedPnlTotal, decimals: 0),
+                       valueTint: pnlColor(s?.realizedPnlTotal), accent: Theme.purple) {
+                LineSparkline(values: equityCurve)
+            }
+            // ④ Unrealized + per-position bars
+            MetricCard(label: L("浮动盈亏 · 持仓", "Unrealized · open"),
+                       value: Fmt.signed(s?.unrealizedPnl, decimals: 0),
+                       valueTint: pnlColor(s?.unrealizedPnl), accent: Theme.blueUp,
+                       sub: L("\(s?.positionsCount ?? 0) 笔持仓", "\(s?.positionsCount ?? 0) open")) {
+                BarSparkline(values: (s?.positions ?? []).map { $0.plValue ?? 0 })
+            }
         }
     }
 
-    /// Return on cost — the only card without a footnote otherwise, which left
-    /// a visible hole in the row.
-    private var unrealizedNote: String {
-        guard let invested = s?.invested, invested > 0,
-              let pnl = s?.unrealizedPnl else { return L("无持仓", "No positions") }
-        return L("成本回报 ", "Return ") + Fmt.pct(pnl / invested * 100)
+    private var deployedFraction: Double {
+        guard let b = s?.budget, b > 0 else { return 0 }
+        return (s?.invested ?? 0) / b
+    }
+    private var deployedPct: Int { Int((deployedFraction * 100).rounded()) }
+
+    /// Daily realized P&L (last ~18 sessions) — the today card's bars.
+    private var dailyPnl: [Double] {
+        var byDay: [String: Double] = [:]
+        for t in poller.closed where !t.day.isEmpty { byDay[t.day, default: 0] += t.pnl ?? 0 }
+        return byDay.keys.sorted().suffix(18).map { byDay[$0] ?? 0 }
+    }
+
+    /// Cumulative realized curve — the total card's line.
+    private var equityCurve: [Double] {
+        var total = 0.0
+        return poller.closed.map { total += $0.pnl ?? 0; return total }
     }
 
     private var streakNote: String? {
