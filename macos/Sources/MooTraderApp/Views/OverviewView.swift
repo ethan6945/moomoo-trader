@@ -9,29 +9,34 @@ struct OverviewView: View {
     private var s: TraderStatus? { poller.status }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.md) {
-                cards
-                statusBar
-                HStack(alignment: .top, spacing: Theme.Space.md) {
-                    // fillHeight: match the log panel so the bottom edges line up.
-                    Panel(title: L("战绩", "Record"), subtitle: streakNote, fillHeight: true) {
-                        TradeRecordView(summary: s?.summary)
-                    }
-                    .frame(width: 340)
-                    Panel(title: L("近期动态", "Activity")) { activityLog }
+        // Fills the window height instead of an outer ScrollView, so the page
+        // fits without scrolling; the sector grid is the flexible section that
+        // absorbs the leftover height (and scrolls inside itself if the window
+        // gets short).
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            cards
+                .frame(height: 112)   // fixed, or the cards' inner spacer grows greedily
+            statusBar
+            HStack(alignment: .top, spacing: Theme.Space.md) {
+                Panel(title: L("战绩", "Record"), subtitle: streakNote, fillHeight: true) {
+                    TradeRecordView(summary: s?.summary)
                 }
-                Panel(title: L("持仓", "Positions"), subtitle: L("\(s?.positions.count ?? 0) 只", "\(s?.positions.count ?? 0)")) {
-                    PositionsView(positions: s?.positions ?? [])
-                }
-                if let sec = poller.sectors, !sec.sectors.isEmpty {
-                    Panel(title: L("美国板块总览", "US sectors"), subtitle: sec.sessionLabel) {
-                        SectorGrid(overview: sec, tileHeight: sectorTileHeight)
-                    }
+                .frame(width: 340)
+                Panel(title: L("近期动态", "Activity")) { activityLog }
+            }
+            .frame(height: 156)
+            Panel(title: L("持仓", "Positions"), subtitle: L("\(s?.positions.count ?? 0) 只", "\(s?.positions.count ?? 0)")) {
+                PositionsView(positions: s?.positions ?? [])
+            }
+            if let sec = poller.sectors, !sec.sectors.isEmpty {
+                Panel(title: L("美国板块总览", "US sectors"), subtitle: sec.sessionLabel,
+                      fillHeight: true) {
+                    ScrollView { SectorGrid(overview: sec, tileHeight: sectorTileHeight) }
                 }
             }
-            .padding(Theme.Space.xl)
         }
+        .padding(Theme.Space.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .pageBackground()
         .navigationTitle(L("总览", "Overview"))
     }
@@ -92,17 +97,9 @@ struct OverviewView: View {
         return sm.streakKind == "win" ? L("\(streak) 连胜", "\(streak) win streak") : (sm.streakKind == "loss" ? L("\(streak) 连败", "\(streak) loss streak") : nil)
     }
 
-    /// Sector tiles grow when few positions crowd the page, shrink as the book
-    /// fills — so the two bottom panels share the height rather than the sector
-    /// block staying fixed while 持仓 sits mostly empty.
-    private var sectorTileHeight: CGFloat {
-        switch s?.positions.count ?? 0 {
-        case 0:     return 84
-        case 1...3: return 66
-        case 4...6: return 54
-        default:    return 46
-        }
-    }
+    /// The sector panel now flexes and scrolls internally, so a steady tile
+    /// height reads cleaner than shrinking with the position count.
+    private let sectorTileHeight: CGFloat = 56
 
     // ── engine + market state, and the scheduler controls ──
     private var statusBar: some View {
@@ -171,7 +168,7 @@ struct OverviewView: View {
                 }
                 .padding(Theme.Space.sm)
             }
-            .frame(height: 150)
+            .frame(maxHeight: .infinity)
             .rowSurface()
             .onChange(of: poller.activity.count) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(logBottomID, anchor: .bottom) }

@@ -29,28 +29,32 @@ struct HistoryView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.md) {
-                if loading {
-                    Panel(title: L("历史", "History")) {
-                        ProgressView()
-                            .tint(Theme.blue)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 40)
-                    }
-                } else if trades.isEmpty {
-                    Panel(title: L("历史", "History")) { EmptyNote(text: L("暂无已平仓交易", "No closed trades yet")) }
-                } else {
-                    HStack(alignment: .top, spacing: Theme.Space.md) {
-                        Panel(title: L("净值曲线", "Equity curve"), subtitle: L("累计已实现", "cumulative realized")) { equityChart }
-                        Panel(title: L("每日盈亏", "Daily P&L"), subtitle: L("最近 30 个交易日", "last 30 sessions")) { dailyChart }
-                            .frame(width: 380)
-                    }
-                    Panel(title: L("已平仓", "Closed"), subtitle: L("\(trades.count) 笔", "\(trades.count)")) { table }
+        // Fills the window: the charts are a fixed band on top and the trade
+        // table flexes to fill the rest, scrolling inside itself.
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            if loading {
+                Panel(title: L("历史", "History"), fillHeight: true) {
+                    ProgressView().tint(Theme.blue)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            } else if trades.isEmpty {
+                Panel(title: L("历史", "History"), fillHeight: true) {
+                    EmptyNote(text: L("暂无已平仓交易", "No closed trades yet"))
+                        .frame(maxHeight: .infinity)
+                }
+            } else {
+                HStack(alignment: .top, spacing: Theme.Space.md) {
+                    Panel(title: L("净值曲线", "Equity curve"), subtitle: L("累计已实现", "cumulative realized")) { equityChart }
+                    Panel(title: L("每日盈亏", "Daily P&L"), subtitle: L("最近 30 个交易日", "last 30 sessions")) { dailyChart }
+                        .frame(width: 380)
+                }
+                .frame(height: 220)
+                Panel(title: L("已平仓", "Closed"), subtitle: L("\(trades.count) 笔", "\(trades.count)"),
+                      fillHeight: true) { table }
             }
-            .padding(Theme.Space.xl)
         }
+        .padding(Theme.Space.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .pageBackground()
         .navigationTitle(L("历史", "History"))
         .task { await load() }
@@ -97,6 +101,8 @@ struct HistoryView: View {
     }
 
     private var table: some View {
+        // Header pinned; only the rows scroll, so the columns stay labelled as
+        // the list grows past the panel.
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: Theme.Space.sm) {
                 // Header alignment must match each data cell's, or the labels
@@ -114,7 +120,8 @@ struct HistoryView: View {
             .padding(.horizontal, Theme.Space.md)
             .padding(.bottom, Theme.Space.xs)
 
-            LazyVStack(alignment: .leading, spacing: 2) {
+            ScrollView {
+              LazyVStack(alignment: .leading, spacing: 2) {
                 ForEach(trades.reversed()) { t in
                     HStack(spacing: Theme.Space.sm) {
                         Text(Fmt.stamp(t.ts))
@@ -142,6 +149,7 @@ struct HistoryView: View {
                     .padding(.vertical, Theme.Space.sm)
                     .rowSurface()
                 }
+              }
             }
         }
         .measureWidth { tableWidth = $0 }
