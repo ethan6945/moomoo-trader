@@ -8,7 +8,11 @@ import SwiftUI
 struct PositionsView: View {
     @ObservedObject private var l10n = L10n.shared
     let positions: [Position]
+    /// Show up to this many rows at full height; any extra scroll inside a capped
+    /// area, so the panel never grows taller than a few rows deserve.
+    var maxVisibleRows: Int = 4
     @State private var tableWidth: CGFloat = 0
+    @State private var rowHeight: CGFloat = 0
 
     /// Fixed content widths; the 区间 (Range) bar is the flex column and soaks
     /// up all the slack, so the number/pill columns stay snug and nothing floats
@@ -16,19 +20,38 @@ struct PositionsView: View {
     private let weights: [CGFloat] = [66, 46, 74, 74, 74, 80, 120, 128, 132]
     private var cols: [CGFloat] { columnWidths(weights, total: tableWidth, flex: 6) }
 
+    private let rowSpacing: CGFloat = 2
+
     var body: some View {
         if positions.isEmpty {
             EmptyNote(text: "🌙 " + L("当前无持仓", "No open positions"), compact: true)
         } else {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: rowSpacing) {
                 header
-                ForEach(positions) { row($0) }
+                rows
             }
             // Fill the panel so measureWidth reports the available width, not the
             // fixed columns' content width — otherwise the flex (Range) column
             // can never expand to absorb the slack.
             .frame(maxWidth: .infinity, alignment: .leading)
             .measureWidth { tableWidth = $0 }
+        }
+    }
+
+    /// Rows, capped to `maxVisibleRows` in height once we know a row's measured
+    /// height; anything beyond that scrolls within the cap.
+    @ViewBuilder private var rows: some View {
+        let stack = VStack(alignment: .leading, spacing: rowSpacing) {
+            ForEach(positions) { row($0) }
+        }
+        if positions.count > maxVisibleRows, rowHeight > 0 {
+            ScrollView {
+                stack
+            }
+            .frame(height: rowHeight * CGFloat(maxVisibleRows)
+                          + rowSpacing * CGFloat(maxVisibleRows - 1))
+        } else {
+            stack
         }
     }
 
@@ -68,11 +91,25 @@ struct PositionsView: View {
         .padding(.horizontal, Theme.Space.md)
         .padding(.vertical, Theme.Space.sm)
         .rowSurface()
+        // Every row is the same height; measure it so the scroll cap lands on an
+        // exact row boundary rather than a guessed pixel value.
+        .background(GeometryReader { g in
+            Color.clear.preference(key: RowHeightKey.self, value: g.size.height)
+        })
+        .onPreferenceChange(RowHeightKey.self) { if $0 > 0 { rowHeight = $0 } }
     }
 
     private func pnlText(_ p: Position) -> String {
         guard let v = p.plValue, p.last != nil else { return "—" }
         return "\(Fmt.signed(v)) (\(Fmt.pct(p.plRatio)))"
+    }
+}
+
+/// Reports a single row's measured height up the tree (max wins — all rows match).
+private struct RowHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 

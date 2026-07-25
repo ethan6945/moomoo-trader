@@ -190,7 +190,9 @@ struct RootView: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, Theme.Space.md)
-        .padding(.top, Theme.Space.sm)
+        // Clear the traffic-light buttons — with the title bar hidden they now
+        // float over the top-left of the sidebar.
+        .padding(.top, 30)
         .padding(.bottom, Theme.Space.md)
     }
 

@@ -10,35 +10,28 @@ struct OverviewView: View {
 
     var body: some View {
         // Fills the window height instead of an outer ScrollView, so the page
-        // fits without scrolling; the sector grid is the flexible section that
-        // absorbs the leftover height (and scrolls inside itself if the window
-        // gets short).
+        // fits without scrolling. Order: title + engine/scheduler bar → stat
+        // cards → US sectors → positions → activity. The sectors grid sizes to
+        // its content (no inner scroll); positions caps at a few rows and scrolls
+        // for the rest; the activity log is the flexible section that absorbs the
+        // leftover height.
         VStack(alignment: .leading, spacing: Theme.Space.md) {
+            header
             cards
                 .frame(height: 112)   // fixed, or the cards' inner spacer grows greedily
-            statusBar
-            HStack(alignment: .top, spacing: Theme.Space.md) {
-                Panel(title: L("战绩", "Record"), subtitle: streakNote, fillHeight: true) {
-                    TradeRecordView(summary: s?.summary)
+            if let sec = poller.sectors, !sec.sectors.isEmpty {
+                Panel(title: L("美国板块总览", "US sectors"), subtitle: sec.sessionLabel) {
+                    SectorGrid(overview: sec, tileHeight: sectorTileHeight)
                 }
-                .frame(width: 340)
-                Panel(title: L("近期动态", "Activity")) { activityLog }
             }
-            .frame(height: 156)
             Panel(title: L("持仓", "Positions"), subtitle: L("\(s?.positions.count ?? 0) 只", "\(s?.positions.count ?? 0)")) {
                 PositionsView(positions: s?.positions ?? [])
             }
-            if let sec = poller.sectors, !sec.sectors.isEmpty {
-                Panel(title: L("美国板块总览", "US sectors"), subtitle: sec.sessionLabel,
-                      fillHeight: true) {
-                    ScrollView { SectorGrid(overview: sec, tileHeight: sectorTileHeight) }
-                }
-            }
+            Panel(title: L("近期动态", "Activity"), fillHeight: true) { activityLog }
         }
         .padding(Theme.Space.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .pageBackground()
-        .navigationTitle(L("总览", "Overview"))
     }
 
     // ── account cards — mirrors the web dashboard's four stat cards ──
@@ -57,20 +50,36 @@ struct OverviewView: View {
                        valueTint: pnlColor(s?.realizedPnlToday), accent: Theme.green) {
                 BarSparkline(values: dailyPnl)
             }
-            // ③ Total realized + cumulative equity line
-            MetricCard(label: L("总盈亏 · 累计已实现", "Total · realized"),
-                       value: Fmt.signed(s?.realizedPnlTotal, decimals: 0),
-                       valueTint: pnlColor(s?.realizedPnlTotal), accent: Theme.purple) {
-                LineSparkline(values: equityCurve)
-            }
-            // ④ Unrealized + per-position bars
+            // ③ Unrealized + per-position bars (moved up now that 总盈亏 is gone)
             MetricCard(label: L("浮动盈亏 · 持仓", "Unrealized · open"),
                        value: Fmt.signed(s?.unrealizedPnl, decimals: 0),
                        valueTint: pnlColor(s?.unrealizedPnl), accent: Theme.blueUp,
                        sub: L("\(s?.positionsCount ?? 0) 笔持仓", "\(s?.positionsCount ?? 0) open")) {
                 BarSparkline(values: (s?.positions ?? []).map { $0.plValue ?? 0 })
             }
+            // ④ Trade record — net figure, win rate, per-trade result bars
+            MetricCard(label: L("战绩 · 净额", "Record · net"),
+                       value: recordValue,
+                       valueTint: pnlColor(s?.summary?.net), accent: Theme.purple,
+                       sub: recordSub) {
+                BarSparkline(values: poller.closed.map { $0.pnl ?? 0 })
+            }
         }
+    }
+
+    /// Record card headline — net realized, or an em-dash before anything closes.
+    private var recordValue: String {
+        (s?.summary?.count ?? 0) == 0 ? "—" : Fmt.signed(s?.summary?.net, decimals: 0)
+    }
+
+    /// Record card sub — trades + win rate, mirroring the other cards' one-liner.
+    private var recordSub: String {
+        guard let sm = s?.summary, (sm.count ?? 0) > 0 else {
+            return L("暂无成交", "No trades yet")
+        }
+        let n = sm.count ?? 0
+        let wr = String(format: "%.0f", sm.winRate ?? 0)
+        return L("\(n) 笔 · 胜率 \(wr)%", "\(n) trades · \(wr)% win")
     }
 
     private var deployedFraction: Double {
@@ -86,23 +95,26 @@ struct OverviewView: View {
         return byDay.keys.sorted().suffix(18).map { byDay[$0] ?? 0 }
     }
 
-    /// Cumulative realized curve — the total card's line.
-    private var equityCurve: [Double] {
-        var total = 0.0
-        return poller.closed.map { total += $0.pnl ?? 0; return total }
-    }
-
-    private var streakNote: String? {
-        guard let sm = s?.summary, let streak = sm.streak, streak > 0 else { return nil }
-        return sm.streakKind == "win" ? L("\(streak) 连胜", "\(streak) win streak") : (sm.streakKind == "loss" ? L("\(streak) 连败", "\(streak) loss streak") : nil)
-    }
-
-    /// The sector panel now flexes and scrolls internally, so a steady tile
-    /// height reads cleaner than shrinking with the position count.
+    /// The sectors grid now sizes to its content, so a steady tile height keeps
+    /// every row the same size regardless of how many sectors report.
     private let sectorTileHeight: CGFloat = 56
 
-    // ── engine + market state, and the scheduler controls ──
-    private var statusBar: some View {
+    // ── page header: the 总览 title, the engine/market pills right beside it,
+    //    and the scheduler controls pinned to the trailing edge ──
+    private var header: some View {
+        HStack(alignment: .center, spacing: Theme.Space.md) {
+            Text(L("总览", "Overview"))
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(Theme.strong)
+                .fixedSize()
+            statusPills
+            Spacer(minLength: Theme.Space.sm)
+            statusControls
+        }
+    }
+
+    /// Engine + market state, as capsules.
+    private var statusPills: some View {
         HStack(spacing: Theme.Space.sm) {
             if let pid = poller.schedulerPID {
                 Pill(text: L("调度器运行中", "Scheduler running") + " · PID \(String(pid))", tint: Theme.green, icon: "●")
@@ -127,9 +139,12 @@ struct OverviewView: View {
                 Pill(text: env == "REAL" ? L("实盘", "LIVE") : L("模拟盘", "PAPER"),
                      tint: env == "REAL" ? Theme.red : Theme.blue)
             }
+        }
+    }
 
-            Spacer(minLength: Theme.Space.sm)
-
+    /// Start/stop the scheduler and toggle sleep prevention.
+    private var statusControls: some View {
+        HStack(spacing: Theme.Space.sm) {
             if poller.schedulerPID != nil {
                 Button("■ " + L("停止", "Stop")) { poller.scheduler("stop") }
                     .buttonStyle(QuietButtonStyle(tint: Theme.red))
@@ -144,10 +159,6 @@ struct OverviewView: View {
             }
             .buttonStyle(QuietButtonStyle(tint: poller.caffeinate?.on == true ? Theme.amber : Theme.muted))
         }
-        .padding(.horizontal, Theme.Space.md)
-        .padding(.vertical, Theme.Space.sm)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .cardSurface()
     }
 
     /// /api/log is oldest→newest, so the freshest line is last; keep it pinned
@@ -184,62 +195,6 @@ struct OverviewView: View {
         if line.range(of: "buy|BUY|开仓|TP|profit", options: .regularExpression) != nil { return Theme.green }
         if line.range(of: "SL|stop|error|fail|blacklist|⚠", options: .regularExpression) != nil { return Theme.red }
         return Theme.muted
-    }
-}
-
-/// 交易次数 / 胜率 / 盈亏比 / 净额 — mirrors the web "战绩" boxes.
-struct TradeRecordView: View {
-    @ObservedObject private var l10n = L10n.shared
-    let summary: TradeSummary?
-
-    var body: some View {
-        let n = summary?.count ?? 0
-        let wr = summary?.winRate ?? 0
-        let pf = summary?.profitFactor
-        // 2×2, not 1×4: across a 340pt panel four columns leave each box barely
-        // 78pt wide, and a single row can't fill the height the log panel sets.
-        VStack(spacing: Theme.Space.sm) {
-            HStack(spacing: Theme.Space.sm) {
-                box(L("交易", "Trades"), n == 0 ? "—" : String(n), Theme.strong, nil)
-                box(L("胜率", "Win %"), n == 0 ? "—" : String(format: "%.0f%%", wr),
-                    wr >= 50 ? Theme.green : (wr >= 40 ? Theme.amber : Theme.red),
-                    n == 0 ? nil : wr / 100)
-            }
-            HStack(spacing: Theme.Space.sm) {
-                box(L("盈亏比", "P/F"), pfText(pf), (pf ?? 0) >= 1 ? Theme.green : Theme.red, nil)
-                box(L("净额", "Net"), n == 0 ? "—" : Fmt.signed(summary?.net, decimals: 0),
-                    pnlColor(summary?.net), nil)
-            }
-        }
-        .frame(maxHeight: .infinity)
-    }
-
-    private func pfText(_ pf: Double?) -> String {
-        guard let pf else { return "—" }
-        return pf.isInfinite ? "∞" : String(format: "%.2f", pf)
-    }
-
-    /// `ratio` draws a thin progress rail under the figure (win rate only).
-    private func box(_ k: String, _ v: String, _ tint: Color, _ ratio: Double?) -> some View {
-        VStack(spacing: Theme.Space.xs) {
-            Text(k).font(Theme.Font_.label).foregroundStyle(Theme.muted)
-            Text(v).font(Theme.Font_.figureSm).monospacedDigit().foregroundStyle(tint)
-                .lineLimit(1).minimumScaleFactor(0.6)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Theme.border).frame(height: 3)
-                    if let ratio {
-                        Capsule().fill(tint)
-                            .frame(width: geo.size.width * min(1, max(0, ratio)), height: 3)
-                    }
-                }
-            }
-            .frame(height: 3)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.vertical, Theme.Space.sm)
-        .padding(.horizontal, Theme.Space.sm)
-        .rowSurface()
     }
 }
 

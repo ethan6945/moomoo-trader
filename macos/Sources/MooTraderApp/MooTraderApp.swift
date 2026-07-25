@@ -18,6 +18,9 @@ struct MooTraderApp: App {
                 .frame(minWidth: 940, minHeight: 620)
         }
         .defaultSize(width: 1300, height: 880)
+        // Reclaim the empty title-bar strip: the traffic lights float over the
+        // content and the sidebar/detail fill all the way to the top edge.
+        .windowStyle(.hiddenTitleBar)
 
         MenuBarExtra {
             MenuBarView()
