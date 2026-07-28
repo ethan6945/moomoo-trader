@@ -72,8 +72,8 @@ final class StatusPoller: ObservableObject {
         // Server caches sectors ~60 s, so polling every cycle is cheap; keep the
         // last good value on a transient miss rather than blanking the panel.
         if let s = try? await APIClient.shared.sectors() { sectors = s }
-        if let root = BackendController.shared.repoRoot {
-            schedulerPID = await Self.alivePID(at: root.appendingPathComponent("logs/scheduler.pid"))
+        if let work = BackendController.shared.workDir {
+            schedulerPID = await Self.alivePID(at: work.appendingPathComponent("logs/scheduler.pid"))
         }
     }
 
