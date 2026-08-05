@@ -51,6 +51,7 @@ struct SettingsPanelView: View {
                     maintenancePanel
                     appearancePanel
                 }
+                versionPanel
                 supportPanel
             }
             .padding(Theme.Space.xl)
@@ -344,6 +345,60 @@ struct SettingsPanelView: View {
     }
 
     // ── 支持 ──
+    /// App version + WHERE the running backend actually came from.
+    ///
+    /// The path is not decoration. The shell and the Python backend are built
+    /// and shipped together but launched separately, so they can drift: on
+    /// 2026-08-05 a bot was running out of macos/dist (a build-output directory
+    /// that every rebuild wipes) while it was assumed to be the copy in
+    /// /Applications. A version number alone shows none of that; the path does,
+    /// and a mismatch between the two versions is called out explicitly.
+    private var versionPanel: some View {
+        Panel(title: L("版本 Version", "Version")) {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                versionRow(L("应用", "App"), shellVersion)
+                versionRow(L("后端", "Backend"), poller.status?.version ?? "—")
+                if let backend = poller.status?.version,
+                   backend != "dev", backend != shellVersion {
+                    Text(L("⚠ 应用与后端版本不一致 —— 后端可能是另一个 build。",
+                           "⚠ App and backend versions differ — the backend is a different build."))
+                        .font(Theme.Font_.label)
+                        .foregroundStyle(Theme.amber)
+                }
+                if let from = poller.status?.runningFrom {
+                    versionRow(L("运行自", "Running from"), from, mono: true)
+                    if from.contains("/macos/dist/") {
+                        Text(L("⚠ 正在从构建输出目录运行 —— 下次 build.sh 会删掉它并结束进程。测试请复制到别处再跑。",
+                               "⚠ Running from the build output directory — the next build.sh deletes it and kills this process. Copy it elsewhere to test."))
+                            .font(Theme.Font_.label)
+                            .foregroundStyle(Theme.amber)
+                    }
+                }
+                if let home = poller.status?.home {
+                    versionRow(L("数据目录", "Data home"), home, mono: true)
+                }
+            }
+        }
+    }
+
+    private var shellVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+
+    private func versionRow(_ label: String, _ value: String, mono: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
+            Text(label)
+                .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                .frame(width: 84, alignment: .leading)
+            Text(value)
+                .font(mono ? .system(size: 11, design: .monospaced) : Theme.Font_.body)
+                .foregroundStyle(Theme.text)
+                .textSelection(.enabled)
+                .lineLimit(2).truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
     private var supportPanel: some View {
         Panel(title: L("支持", "Support")) {
             HStack(alignment: .center, spacing: Theme.Space.md) {

@@ -25,6 +25,11 @@ struct TraderStatus: Decodable {
     var aiProvider: String?
     var aiModel: String?
     var positionsCount: Int?
+    // Build identity of the BACKEND (which can differ from the shell's own
+    // bundle — see the version row in Settings).
+    var version: String?
+    var runningFrom: String?
+    var home: String?
     var summary: TradeSummary?
     var positions: [Position] = []
 
@@ -48,6 +53,9 @@ struct TraderStatus: Decodable {
         case aiProvider = "ai_provider"
         case aiModel = "ai_model"
         case positionsCount = "positions_count"
+        case version
+        case runningFrom = "running_from"
+        case home
         case perPosition = "per_position"
     }
 
@@ -78,6 +86,9 @@ struct TraderStatus: Decodable {
         aiProvider = d(.aiProvider)
         aiModel = d(.aiModel)
         positionsCount = d(.positionsCount)
+        version = d(.version)
+        runningFrom = d(.runningFrom)
+        home = d(.home)
         summary = d(.summary)
         // per_position is a {symbol: {...}} map — flatten into rows.
         let raw: [String: Position.Payload] = d(.perPosition) ?? [:]

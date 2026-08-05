@@ -39,6 +39,24 @@ swift build -c release
 
 # ── 3. assemble the bundle ───────────────────────────────────────────────────
 APP="dist/MooTrader.app"
+
+# Refuse to delete a bundle something is currently executing from. 2026-08-05: a
+# bot had been launched out of dist/ (rather than /Applications), and the rm -rf
+# below removed the binary from under the live process — the scheduler died
+# mid-session while holding a position, silently. dist/ is build output and gets
+# wiped every run, so anything running from here is by definition about to lose
+# its executable; say so and stop instead of doing it.
+APP_ABS="$(cd "$(dirname "$APP")" 2>/dev/null && pwd)/$(basename "$APP")"
+if RUNNING="$(pgrep -fl "$APP_ABS/" 2>/dev/null)" && [[ -n "$RUNNING" ]]; then
+    echo "✗ REFUSING TO BUILD — a process is running from $APP_ABS:"
+    echo "$RUNNING" | sed 's/^/    /'
+    echo
+    echo "  Quit it first (the app's own Quit, or: pkill -f '$APP_ABS/')."
+    echo "  dist/ is build output and is wiped on every build — for anything"
+    echo "  long-running, copy the .app to /Applications and launch it there."
+    exit 1
+fi
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/MooTraderApp "$APP/Contents/MacOS/"
