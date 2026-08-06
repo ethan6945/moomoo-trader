@@ -2,31 +2,30 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>MooTrader</string>
-    <key>CFBundleDisplayName</key>
-    <string>MooMoo Trader</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.mootrader.app</string>
-    <key>CFBundleExecutable</key>
-    <string>MooTraderApp</string>
-    <key>CFBundleIconFile</key>
-    <string>MooTrader</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>2.3.0</string>
-    <key>CFBundleVersion</key>
-    <string>230</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <!-- The dashboard is plain http on 127.0.0.1 -->
-        <key>NSAllowsLocalNetworking</key>
-        <true/>
-    </dict>
+	<key>CFBundleDisplayName</key>
+	<string>MooMoo Trader</string>
+	<key>CFBundleExecutable</key>
+	<string>MooTraderApp</string>
+	<key>CFBundleIconFile</key>
+	<string>MooTrader</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.mootrader.app</string>
+	<key>CFBundleName</key>
+	<string>MooTrader</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.3.0</string>
+	<key>CFBundleVersion</key>
+	<string>231</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 </dict>
 </plist>
