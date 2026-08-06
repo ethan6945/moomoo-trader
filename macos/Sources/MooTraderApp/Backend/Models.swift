@@ -448,3 +448,74 @@ struct WebAccessState: Decodable {
         case tailscaleIp = "tailscale_ip"
     }
 }
+
+/// One startup readiness check (src/preflight.py). Severity is the contract:
+/// only "blocker" may stop a start — "degraded" means the bot will run but with
+/// a named capability switched off, which the user deserves to see rather than
+/// discover in a log days later.
+struct PreflightCheck: Decodable, Identifiable {
+    var id: String
+    var ok: Bool
+    var severity: String        // blocker | degraded | info | ok
+    var title: String
+    var titleEn: String
+    var detail: String
+    var detailEn: String
+    var impact: String
+    var impactEn: String
+    var fixKey: String?         // .env key the dialog may edit inline
+    var fixHint: String
+    var fixHintEn: String
+    var retryable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, ok, severity, title, detail, impact, retryable
+        case titleEn = "title_en", detailEn = "detail_en", impactEn = "impact_en"
+        case fixKey = "fix_key", fixHint = "fix_hint", fixHintEn = "fix_hint_en"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func d<T: Decodable>(_ k: CodingKeys, _ fallback: T) -> T {
+            ((try? c.decodeIfPresent(T.self, forKey: k)) ?? nil) ?? fallback
+        }
+        id = d(.id, "?"); ok = d(.ok, false); severity = d(.severity, "info")
+        title = d(.title, ""); titleEn = d(.titleEn, "")
+        detail = d(.detail, ""); detailEn = d(.detailEn, "")
+        impact = d(.impact, ""); impactEn = d(.impactEn, "")
+        fixKey = (try? c.decodeIfPresent(String.self, forKey: .fixKey)) ?? nil
+        fixHint = d(.fixHint, ""); fixHintEn = d(.fixHintEn, "")
+        retryable = d(.retryable, true)
+    }
+}
+
+struct PreflightResult: Decodable, Identifiable {
+    /// `.sheet(item:)` needs identity. Derive it from the verdict so that
+    /// re-running preflight with a DIFFERENT outcome re-presents the sheet,
+    /// while an identical result does not churn the view.
+    var id: String { "\(canStart)-\(blockers)-\(degraded)-\(checks.map(\.id).joined())" }
+
+    var canStart: Bool = true
+    var blockers: Int = 0
+    var degraded: Int = 0
+    var summary: String = ""
+    var summaryEn: String = ""
+    var checks: [PreflightCheck] = []
+
+    enum CodingKeys: String, CodingKey {
+        case blockers, degraded, summary, checks
+        case canStart = "can_start", summaryEn = "summary_en"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Fail OPEN: a preflight that cannot be parsed must not become a gate
+        // that blocks the user from starting their own bot.
+        canStart = ((try? c.decodeIfPresent(Bool.self, forKey: .canStart)) ?? nil) ?? true
+        blockers = ((try? c.decodeIfPresent(Int.self, forKey: .blockers)) ?? nil) ?? 0
+        degraded = ((try? c.decodeIfPresent(Int.self, forKey: .degraded)) ?? nil) ?? 0
+        summary = ((try? c.decodeIfPresent(String.self, forKey: .summary)) ?? nil) ?? ""
+        summaryEn = ((try? c.decodeIfPresent(String.self, forKey: .summaryEn)) ?? nil) ?? ""
+        checks = ((try? c.decodeIfPresent([PreflightCheck].self, forKey: .checks)) ?? nil) ?? []
+    }
+}

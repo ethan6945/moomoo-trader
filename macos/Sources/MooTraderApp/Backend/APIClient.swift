@@ -210,3 +210,19 @@ final class APIClient: @unchecked Sendable {
         try await post("api/reset-stats")
     }
 }
+
+extension APIClient {
+    /// Full startup readiness. `fresh` bypasses the server-side probe cache —
+    /// used when the user opens the dialog deliberately, not on every poll.
+    func preflight(fresh: Bool = true) async throws -> PreflightResult {
+        try await getJSON("api/preflight" + (fresh ? "?fresh=1" : ""), as: PreflightResult.self)
+    }
+
+    /// Re-run ONE check after the user edited its key. The POST itself returns
+    /// the fresh result, and server-side it always bypasses the cache — so a
+    /// just-saved value is genuinely re-probed rather than read back stale.
+    func preflightRecheck(_ id: String) async throws -> PreflightCheck {
+        let data = try await post("api/preflight/\(id)", timeout: 40)
+        return try JSONDecoder().decode(PreflightCheck.self, from: data)
+    }
+}

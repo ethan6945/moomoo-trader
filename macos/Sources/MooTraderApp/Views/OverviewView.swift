@@ -34,6 +34,7 @@ struct OverviewView: View {
         .pageBackground()
     }
 
+
     // ── account cards — mirrors the web dashboard's four stat cards ──
     private var cards: some View {
         HStack(spacing: Theme.Space.md) {
@@ -150,9 +151,15 @@ struct OverviewView: View {
                     .buttonStyle(QuietButtonStyle(tint: Theme.red))
                     .disabled(poller.schedulerBusy)
             } else {
-                Button("▶ " + L("启动", "Start")) { poller.scheduler("start") }
+                // Preflight first. Everything key-gated in this bot fails SAFE
+                // and therefore SILENTLY, so pressing start is the one moment
+                // the user is guaranteed to be looking — it is where "half your
+                // capabilities are switched off" has to be said out loud.
+                // Fails open: if the check itself errors we start anyway rather
+                // than stranding the user behind a broken diagnostic.
+                Button("▶ " + L("启动", "Start")) { poller.startWithPreflight() }
                     .buttonStyle(BrandButtonStyle())
-                    .disabled(poller.schedulerBusy)
+                    .disabled(poller.schedulerBusy || poller.preflightBusy)
             }
             Button("☕ " + (poller.caffeinate?.on == true ? L("防睡眠 开", "Awake on") : L("防睡眠 关", "Awake off"))) {
                 poller.toggleCaffeinate()

@@ -167,6 +167,11 @@ struct RootView: View {
             }
         }
         .tint(Theme.blue)
+        .sheet(item: $poller.preflight) { r in
+            PreflightSheet(result: r,
+                           onStart: { poller.preflight = nil; poller.scheduler("start") },
+                           onCancel: { poller.preflight = nil })
+        }
     }
 
     /// Wordmark plus a live scheduler dot — the one place the running state is

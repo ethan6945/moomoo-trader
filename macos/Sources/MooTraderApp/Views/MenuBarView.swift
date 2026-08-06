@@ -41,7 +41,7 @@ struct MenuBarView: View {
             Button("■ " + L("停止调度器", "Stop scheduler")) { confirmStopScheduler() }
                 .disabled(poller.schedulerBusy)
         } else {
-            Button("▶ " + L("启动调度器", "Start scheduler")) { poller.scheduler("start") }
+            Button("▶ " + L("启动调度器", "Start scheduler")) { poller.startWithPreflight() }
                 .disabled(poller.schedulerBusy || backend.phase != .running)
         }
 

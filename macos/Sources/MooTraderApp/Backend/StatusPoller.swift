@@ -18,6 +18,12 @@ final class StatusPoller: ObservableObject {
     @Published private(set) var schedulerPID: Int32?
     @Published var needsLogin = false
     @Published var schedulerBusy = false   // start/stop in flight (can take ~60 s)
+    /// Non-nil while the preflight dialog should be on screen. Lives here rather
+    /// than in a view so EVERY start path (overview button, menu bar) shares one
+    /// guarded route — a second entry point that skipped the check would defeat
+    /// the whole point of having it.
+    @Published var preflight: PreflightResult?
+    @Published var preflightBusy = false
 
     var pending: [Approval] { approvals.filter(\.isPending) }
 
@@ -110,6 +116,27 @@ final class StatusPoller: ObservableObject {
     }
 
     /// action ∈ start / stop / restart. start blocks while OpenD launches.
+    /// Start, but check readiness first. A perfectly clean install starts with
+    /// no dialog at all — friction that only ever says "everything is fine" is
+    /// friction people learn to click through, which would blunt the dialog for
+    /// the times it has something to say. Fails OPEN: if the check itself errors
+    /// we start anyway rather than stranding the user behind a broken probe.
+    func startWithPreflight() {
+        guard !preflightBusy, !schedulerBusy else { return }
+        preflightBusy = true
+        Task {
+            defer { preflightBusy = false }
+            guard let r = try? await APIClient.shared.preflight(fresh: true) else {
+                scheduler("start"); return
+            }
+            if r.canStart && r.blockers == 0 && r.degraded == 0 {
+                scheduler("start")
+            } else {
+                preflight = r
+            }
+        }
+    }
+
     func scheduler(_ action: String) {
         guard !schedulerBusy else { return }
         schedulerBusy = true
