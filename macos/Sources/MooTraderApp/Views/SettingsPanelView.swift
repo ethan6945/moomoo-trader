@@ -14,6 +14,8 @@ struct SettingsPanelView: View {
     @State private var ai: AIProviderState?
     @State private var aiModels: [String] = []
     @State private var keys: [SettingsKeys.Item] = []
+    @State private var toggles: [SettingsToggles.Item] = []
+    @State private var finbert: FinbertState?
     @State private var access: WebAccessState?
     @State private var budgetText = ""
     @State private var note: String?
@@ -21,6 +23,7 @@ struct SettingsPanelView: View {
 
     @State private var confirmReal = false
     @State private var confirmReset = false
+    @State private var confirmFinbert = false
     @State private var editingKey: SettingsKeys.Item?
 
     var body: some View {
@@ -47,6 +50,7 @@ struct SettingsPanelView: View {
                     accessPanel
                 }
                 keysPanel
+                newsPanel
                 HStack(alignment: .top, spacing: Theme.Space.md) {
                     maintenancePanel
                     appearancePanel
@@ -81,6 +85,15 @@ struct SettingsPanelView: View {
             }
         } message: {
             Text(L("战绩/胜率从此刻重新开始统计。历史交易记录本身不会被删除。", "Record/win-rate restart from now. Trade history itself is not deleted."))
+        }
+        .alert(L("下载 FinBERT 模型？", "Download the FinBERT model?"), isPresented: $confirmFinbert) {
+            Button(L("取消", "Cancel"), role: .cancel) {}
+            Button(L("下载", "Download")) {
+                act { try await APIClient.shared.finbertDownload() }
+            }
+        } message: {
+            Text(L("约 \(Int(finbert?.estDownloadMb ?? 120)) MB，下载到：\n\(finbert?.path ?? "")\n随时可以在这里删除。",
+                   "About \(Int(finbert?.estDownloadMb ?? 120)) MB, downloaded to:\n\(finbert?.path ?? "")\nYou can remove it here at any time."))
         }
     }
 
@@ -241,6 +254,88 @@ struct SettingsPanelView: View {
                 }
             }
         }
+    }
+
+    // ── 新闻 ──
+    /// The news sources, the local scorer and the news-driven mode all live in
+    /// .env and all default off. Before this panel existed the only way to turn
+    /// any of them on was to hand-edit a file inside Application Support, which
+    /// a packaged install gives you no way to find — so the whole feature set
+    /// was unreachable for exactly the users who install from the DMG.
+    private var newsPanel: some View {
+        Panel(title: L("新闻（全部默认关闭）", "News (all default off)")) {
+            VStack(spacing: Theme.Space.sm) {
+                if armedForReal {
+                    Text(L("新闻主导模式已开启且影子模式关闭 — 它会按 AI 对新闻的读数真实下单。",
+                           "News-driven mode is on with shadow off — it places real orders on an AI's read of the news."))
+                        .font(Theme.Font_.label)
+                        .foregroundStyle(Theme.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(Theme.Space.md)
+                        .rowSurface()
+                }
+                ForEach(toggles) { item in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .top, spacing: Theme.Space.md) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.key)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(Theme.strong)
+                                Text(l10n.keyDesc(item.key, fallback: item.desc ?? ""))
+                                    .font(Theme.Font_.label).foregroundStyle(Theme.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 8)
+                            Toggle("", isOn: Binding(
+                                get: { item.on },
+                                set: { setToggle(item.key, on: $0) }))
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .disabled(busy)
+                        }
+                        if item.key == "FINBERT_ENABLED" { finbertRow }
+                    }
+                    .padding(Theme.Space.md)
+                    .rowSurface()
+                }
+            }
+        }
+    }
+
+    /// Enabled-but-not-downloaded is the trap here: the switch reads as on and
+    /// the scorer is never called, so state the model's actual situation next to
+    /// it rather than leaving it to be discovered in a log.
+    @ViewBuilder private var finbertRow: some View {
+        HStack(spacing: Theme.Space.sm) {
+            if finbert?.job?.running == true {
+                let done = finbert?.job?.done ?? 0, total = finbert?.job?.total ?? 0
+                Pill(text: L("下载中 ", "downloading ")
+                     + (total > 0 ? "\(Int(done / total * 100))%" : "…"), tint: Theme.blue)
+            } else if finbert?.downloaded == true {
+                Pill(text: L("模型已就绪 ", "model ready ")
+                     + String(format: "%.0f MB", finbert?.diskMb ?? 0), tint: Theme.green)
+                Button(L("删除模型", "Remove model")) {
+                    act { try await APIClient.shared.finbertRemove() }
+                }
+                .buttonStyle(QuietButtonStyle(tint: Theme.muted))
+            } else if finbert?.needsDownload == true {
+                Pill(text: L("模型未下载 — 开了也不会被调用", "not downloaded — nothing will call it"),
+                     tint: Theme.amber, icon: "⚠")
+                Button(L("下载模型", "Download model")) { confirmFinbert = true }
+                    .buttonStyle(QuietButtonStyle(tint: Theme.blue))
+            } else if let rt = finbert?.runtime, rt == "torch" {
+                Pill(text: L("使用已安装的 torch，无需单独下载", "using the installed torch — no separate download"),
+                     tint: Theme.green)
+            }
+            Spacer()
+        }
+        .disabled(busy)
+    }
+
+    /// The one combination that bets money on a headline.
+    private var armedForReal: Bool {
+        func on(_ k: String) -> Bool { toggles.first { $0.key == k }?.on ?? false }
+        return on("NEWS_DRIVEN_ENABLED") && !on("NEWS_DRIVEN_SHADOW")
     }
 
     // ── web 访问 ──
@@ -431,6 +526,8 @@ struct SettingsPanelView: View {
         autoBudget = try? await APIClient.shared.autoBudget()
         ai = try? await APIClient.shared.aiProvider()
         keys = (try? await APIClient.shared.settingsKeys())?.keys ?? []
+        toggles = (try? await APIClient.shared.settingsToggles())?.toggles ?? []
+        finbert = try? await APIClient.shared.finbert()
         access = try? await APIClient.shared.webAccess()
         if budgetText.isEmpty, let b = poller.status?.budget {
             budgetText = String(format: "%.0f", b)
@@ -448,6 +545,24 @@ struct SettingsPanelView: View {
             do { try await body() } catch { note = L("操作失败：", "Action failed: ") + error.localizedDescription }
             await load()
             await poller.refresh()
+        }
+    }
+
+    /// Flip one .env switch. The server's note is shown rather than a canned
+    /// string: it is the only place that knows whether a second switch moved
+    /// with it (shadow mode) — inventing our own message here would hide that.
+    private func setToggle(_ key: String, on: Bool) {
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let serverNote = try await APIClient.shared.setSettingsToggle(key, on: on)
+                note = serverNote ?? L("已写入 .env — 重启 bot 后生效",
+                                       "Written to .env — takes effect after a bot restart")
+            } catch {
+                note = L("写入失败：", "Write failed: ") + error.localizedDescription
+            }
+            await load()
         }
     }
 
@@ -520,9 +635,18 @@ struct KeyEditor: View {
                 .font(Theme.Font_.label).foregroundStyle(Theme.muted)
                 .frame(width: 360, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
-            SecureField(L("留空则清除该项", "Empty to clear"), text: $value)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 360)
+            // A contact string is not a secret: show it, and prefill it so an
+            // edit is an edit rather than a retype from memory.
+            Group {
+                if item.isSecret {
+                    SecureField(L("留空则清除该项", "Empty to clear"), text: $value)
+                } else {
+                    TextField(L("留空则清除该项", "Empty to clear"), text: $value)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 360)
+            .onAppear { if !item.isSecret { value = item.masked ?? "" } }
             HStack {
                 Button(L("取消", "Cancel")) { dismiss() }
                 Spacer()

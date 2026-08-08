@@ -198,6 +198,33 @@ final class APIClient: @unchecked Sendable {
         try await post("api/settings/key", json: ["key": key, "value": value])
     }
 
+    func settingsToggles() async throws -> SettingsToggles {
+        try await getJSON("api/settings/toggles")
+    }
+
+    func finbert() async throws -> FinbertState {
+        try await getJSON("api/finbert")
+    }
+
+    /// Explicit consent to spend ~120 MB of disk. Returns immediately; the
+    /// download runs server-side and is polled through `finbert()`.
+    func finbertDownload() async throws {
+        try await post("api/finbert/download", timeout: 30)
+    }
+
+    func finbertRemove() async throws {
+        try await post("api/finbert/remove", timeout: 30)
+    }
+
+    /// Flips one whitelisted .env boolean. The reply's `note` matters here —
+    /// the server may have changed a second switch (shadow mode) and says so.
+    @discardableResult
+    func setSettingsToggle(_ key: String, on: Bool) async throws -> String? {
+        struct Reply: Decodable { var note: String? }
+        let data = try await post("api/settings/toggle", json: ["key": key, "on": on])
+        return (try? JSONDecoder().decode(Reply.self, from: data))?.note
+    }
+
     func webAccess() async throws -> WebAccessState {
         try await getJSON("api/web-access")
     }

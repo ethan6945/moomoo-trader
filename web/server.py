@@ -541,6 +541,39 @@ def api_status():
         acct["budget"] = risk_manager.budget_usd()   # live override beats stale snapshot
     except Exception:
         pass
+    # AI health (2026-08-07). Read from the runtime ledger + the watchdog's last
+    # verdict — NOT by probing here, because /api/status is polled every 4s and
+    # a probe per poll would bill the provider ~900 times an hour. Surfaced so
+    # the dashboard can show a banner: a fail-safe AI layer degrades silently by
+    # design, and "silently" is the part that cost four blind trading days.
+    try:
+        from src import ai as _ai
+        from src import db as _db
+        _ch = _ai.call_health()
+        _st = _db.get_state()
+        _watchdog_ok = _st.get("health_gemini_ok")
+        _calls_ok = _st.get("health_ai_calls_ok")
+        _has_key = _ai.has_key()
+        _down = _has_key and (_watchdog_ok is False or _calls_ok is False)
+        try:
+            from src import news_driven as _nd
+            _nd_on = _nd.enabled()
+        except Exception:
+            _nd_on = False
+        acct["ai_health"] = {
+            "ok": not _down,
+            "has_key": _has_key,
+            "provider": _ai.PROVIDER_LABELS.get(_ai.active_provider(), "AI"),
+            "model": _ai.active_model(),
+            "fail_streak": _ch.get("fail_streak", 0),
+            "last_error": _ch.get("last_error", ""),
+            "last_ok": _ch.get("last_ok"),
+            # Whether an outage stops trading outright or only blinds the
+            # advisory layers — the banner says different things for each.
+            "blocks_trading": bool(_nd_on),
+        }
+    except Exception:
+        pass
     # Enrich per_position with the GUI's open-trade fields (entry/stop/tp/atr) so the
     # web positions table mirrors the desktop GUI exactly. account.per_position only
     # carries live price/PnL; the static trade params live in open_trades.json.
@@ -801,9 +834,32 @@ SETTING_KEYS = {
     "WEB_PASSWORD": "网页访问密码 — 设了之后，从手机/局域网打开面板要先登录(本机也是)。空=不需要密码(仅本机可用)。这是开放手机访问的前提。",
     "DEEPSEEK_API_KEY": "DeepSeek API Key(可逗号分隔多个)— 所有 AI 分析(信号/情绪/退出/优化/入场验证)都用它。",
     "TAVILY_API_KEY": "Tavily 新闻搜索 Key — 给 AI 提供实时新闻上下文。",
+    "FINNHUB_API_KEY": "Finnhub Key(免费 60次/分)— 按股票代码标注的新闻，"
+                       "且能查历史某一天(Tavily 只能查\"现在\")。需 FINNHUB_ENABLED=true。",
     "TELEGRAM_TOKEN": "Telegram Bot Token — 推送交易通知 + 审批卡片。",
     "TELEGRAM_CHAT_ID": "Telegram Chat ID — 接收通知的聊天 ID。",
 }
+
+# Not every .env value is a secret, and a password field for one that isn't is
+# theatre that hides typos. Empty right now — SEC_EDGAR_USER_AGENT was the only
+# member and that source is gone — but the distinction is load-bearing, so the
+# mechanism stays rather than being rebuilt the next time a plain key appears.
+_PLAIN_KEYS: set[str] = set()
+
+# Booleans the panel can flip. Kept apart from SETTING_KEYS because these are
+# switches, not secrets: they render as toggles, they are never masked, and the
+# write path only ever puts "true"/"false" in .env.
+SETTING_TOGGLES = {
+    "FINNHUB_ENABLED": "Finnhub 新闻源 — 按代码标注、可查历史某一天，是回测新闻策略的前提。需要先填 FINNHUB_API_KEY。",
+    "MOO_NOTICES_ENABLED": "申报 + 分析师动作 — 由 OpenD 转发的 SEC 申报和评级变动，不直连任何监管机构，也不需要注册。注意：只知道「发了 8-K」，不知道内容；日期精确到天，没有时分。",
+    "FINBERT_ENABLED": "FinBERT 本地情绪打分 — 训练语料早于任何测试窗口，所以没有后见之明。要先在下面下载模型(约 120 MB)，否则开了也不会被调用。",
+    "NEWS_DRIVEN_ENABLED": "新闻主导模式 — 技术分降级为预筛，选股和仓位交给 AI 新闻读数，收盘前平掉全部持仓。这会换掉整套策略。",
+    "NEWS_DRIVEN_SHADOW": "影子模式 — 完整跑完新闻主导的决策链路，在下单前一行停住并记录。开着它就不会下单。",
+}
+
+
+def _truthy(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _read_env() -> dict:
@@ -912,9 +968,97 @@ def api_setup_status():
 @app.route("/api/settings")
 def api_settings():
     env = _read_env()
-    keys = [{"key": k, "desc": d, "masked": _mask(env.get(k, "")), "set": bool(env.get(k))}
+    keys = [{"key": k, "desc": d,
+             "masked": (env.get(k, "") if k in _PLAIN_KEYS else _mask(env.get(k, ""))),
+             "secret": k not in _PLAIN_KEYS,
+             "set": bool(env.get(k))}
             for k, d in SETTING_KEYS.items()]
     return jsonify({"keys": keys})
+
+
+@app.route("/api/settings/toggles")
+def api_settings_toggles():
+    """The .env switches the panel can flip. Values are what the file says, i.e.
+    what will be in force after a restart — same contract as the key rows."""
+    env = _read_env()
+    return jsonify({"toggles": [{"key": k, "desc": d, "on": _truthy(env.get(k, ""))}
+                                for k, d in SETTING_TOGGLES.items()]})
+
+
+@app.route("/api/settings/toggle", methods=["POST"])
+def api_set_toggle():
+    body = request.json or {}
+    k, on = body.get("key"), bool(body.get("on"))
+    if k not in SETTING_TOGGLES:
+        return jsonify({"ok": False, "error": "unknown toggle"}), 400
+    try:
+        _write_env_key(k, "true" if on else "false")
+        note = "已写入 .env — 重启 bot 后生效"
+        # Turning news-driven mode on is a strategy swap, and the recommended
+        # order is shadow first. If the user has never expressed a preference
+        # about shadow, choose the safe one FOR them and say so — the failure we
+        # are avoiding is someone flipping one switch and unknowingly betting
+        # real money on an LLM's read of a headline.
+        if k == "NEWS_DRIVEN_ENABLED" and on and "NEWS_DRIVEN_SHADOW" not in _read_env():
+            _write_env_key("NEWS_DRIVEN_SHADOW", "true")
+            note = ("已开启新闻主导模式，并同时开启影子模式 — 会完整跑决策链路但不下单。"
+                    "确认有 edge 之后再手动关掉影子模式。重启 bot 后生效")
+        try:
+            from src import preflight
+            preflight.invalidate()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "note": note})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── FinBERT local model: status / consented download / removal ───────────────
+# The download is a few hundred MB of the user's disk, so it happens ONLY on an
+# explicit POST from the confirm dialog. GET is always safe and never downloads.
+_finbert_job: dict = {"running": False, "file": "", "done": 0, "total": 0,
+                      "ok": None, "detail": ""}
+
+
+@app.route("/api/finbert")
+def api_finbert_status():
+    from src import news_score_local as nsl
+    st = nsl.status()
+    st["job"] = dict(_finbert_job)
+    return jsonify(st)
+
+
+@app.route("/api/finbert/download", methods=["POST"])
+def api_finbert_download():
+    """Explicit consent to spend disk. Runs in a thread so the request returns
+    immediately and the panel can poll progress."""
+    from src import news_score_local as nsl
+    if _finbert_job["running"]:
+        return jsonify({"ok": True, "note": "download already running"})
+    if nsl.is_downloaded():
+        return jsonify({"ok": True, "note": "already downloaded"})
+
+    def _progress(name, done, total):
+        _finbert_job.update(file=name, done=done, total=total)
+
+    def _run():
+        _finbert_job.update(running=True, ok=None, detail="", done=0, total=0)
+        try:
+            ok, detail = nsl.ensure_model(progress=_progress)
+        except Exception as e:                                  # noqa: BLE001
+            ok, detail = False, str(e)
+        _finbert_job.update(running=False, ok=ok, detail=detail)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "note": "download started",
+                    "path": str(nsl.model_home())})
+
+
+@app.route("/api/finbert/remove", methods=["POST"])
+def api_finbert_remove():
+    from src import news_score_local as nsl
+    ok, detail = nsl.remove_model()
+    return jsonify({"ok": ok, "note": detail})
 
 
 @app.route("/api/preflight")

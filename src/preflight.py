@@ -175,7 +175,31 @@ def check_ai() -> Check:
                      fix_key=f"{provider.upper()}_API_KEY",
                      fix_hint=f"填入 {label} 的 API Key 后重试。",
                      fix_hint_en=f"Paste your {label} API key and retry.")
+    # A retired model name fails every call while the key itself is perfectly
+    # valid, so a key-only probe reports green on an install that cannot make a
+    # single AI call. DeepSeek retired deepseek-chat / deepseek-reasoner on
+    # 2026-07-24 with no soft-redirect; ai.migrate_deepseek_model() rewrites
+    # them at call time, but silently living on a rewrite is how config rot
+    # sets in — say it out loud.
+    configured = ai.active_model(provider)
     if provider == "deepseek":
+        migrated, _thinking = ai.migrate_deepseek_model(configured)
+        if migrated != configured:
+            return Check(id="ai", ok=False, severity=DEGRADED,
+                         title=f"{label} 模型已退役", title_en=f"{label} model retired",
+                         detail=f"配置的是 {configured}，已于 2026-07-24 停止解析",
+                         detail_en=f"configured {configured}, retired 2026-07-24",
+                         impact=f"调用已自动改用 {migrated}，所以现在还能跑；"
+                                f"但配置本身是坏的，下次改动或换机器就会暴露。"
+                                f"把 DEEPSEEK_MODEL 改成 {migrated} 或 deepseek-v4-pro。",
+                         impact_en=f"Calls are auto-rewritten to {migrated}, so it "
+                                   f"still runs — but the config itself is stale and "
+                                   f"the next edit or fresh install will expose it. "
+                                   f"Set DEEPSEEK_MODEL to {migrated} or deepseek-v4-pro.",
+                         fix_key="DEEPSEEK_MODEL",
+                         fix_hint=f"填 {migrated}（快、便宜）或 deepseek-v4-pro（会推理，慢且贵）。",
+                         fix_hint_en=f"Use {migrated} (fast, cheap) or deepseek-v4-pro "
+                                     "(reasoning, slower and dearer).")
         status, detail = _probe_deepseek(key)
     else:
         from . import health_check
@@ -263,6 +287,193 @@ def check_news() -> Check:
                  fix_hint_en="Get a free key at tavily.com and retry.")
 
 
+def check_finnhub() -> Check:
+    from . import finnhub_news
+    if not settings.finnhub_enabled:
+        return Check(id="finnhub", ok=True, severity=OK,
+                     title="Finnhub 公司新闻", title_en="Finnhub company news",
+                     detail="关闭", detail_en="off")
+    try:
+        ok, detail = finnhub_news.probe()
+    except Exception as e:
+        ok, detail = False, str(e)[:80]
+    if ok:
+        return Check(id="finnhub", ok=True, severity=OK,
+                     title="Finnhub 公司新闻", title_en="Finnhub company news",
+                     detail=detail, detail_en=detail)
+    return Check(id="finnhub", ok=False, severity=DEGRADED,
+                 title="Finnhub 公司新闻", title_en="Finnhub company news",
+                 detail=detail, detail_en=detail,
+                 impact="按 ticker 标注的新闻源不可用，新闻输入退回只有 Tavily 的"
+                        "关键词搜索（会把不相关的同名内容也搜进来），并且失去"
+                        "「查历史某一天」的能力 —— 那是新闻策略能被回测的前提。",
+                 impact_en="The ticker-tagged feed is unavailable and news falls back "
+                           "to Tavily keyword search alone (which pulls in unrelated "
+                           "same-name content), losing the ability to ask what was "
+                           "published on a past date — the prerequisite for ever "
+                           "backtesting a news strategy.",
+                 fix_key="FINNHUB_API_KEY",
+                 fix_hint="在 finnhub.io 注册免费 Key（60 次/分钟）后重试。",
+                 fix_hint_en="Get a free key at finnhub.io (60 calls/min) and retry.")
+
+
+def check_finbert() -> Check:
+    """Never downloads — reports what is on disk and what it would cost."""
+    from . import news_score_local as nsl
+    if not nsl.enabled():
+        return Check(id="finbert", ok=True, severity=OK,
+                     title="FinBERT 本地打分", title_en="FinBERT local scorer",
+                     detail="关闭", detail_en="off")
+    st = nsl.status()
+    if not st["can_run"]:
+        return Check(id="finbert", ok=False, severity=DEGRADED,
+                     title="FinBERT 本地打分", title_en="FinBERT local scorer",
+                     detail="运行库缺失", detail_en="runtime not installed",
+                     impact="确定性交叉验证不可用（纯顾问功能，不影响下单）。"
+                            "装上：pip install onnxruntime tokenizers",
+                     impact_en="The deterministic cross-check is unavailable "
+                               "(advisory only — no effect on orders). Install with "
+                               "pip install onnxruntime tokenizers")
+    if st["needs_download"]:
+        return Check(id="finbert", ok=False, severity=INFO,
+                     title="FinBERT 本地打分", title_en="FinBERT local scorer",
+                     detail=f"已开启但模型未下载（约 {st['est_download_mb']} MB）",
+                     detail_en=f"on, model not downloaded (~{st['est_download_mb']} MB)",
+                     impact=f"打开「设置 → FinBERT」点下载确认后才会占用磁盘。"
+                            f"路径：{st['path']}",
+                     impact_en=f"Nothing is downloaded until you confirm in "
+                               f"Settings → FinBERT. Path: {st['path']}",
+                     retryable=True)
+    return Check(id="finbert", ok=True, severity=OK,
+                 title="FinBERT 本地打分", title_en="FinBERT local scorer",
+                 detail=f"就绪（{st['runtime']}，{st['disk_mb']} MB）",
+                 detail_en=f"ready ({st['runtime']}, {st['disk_mb']} MB)")
+
+
+def check_moo_notices() -> Check:
+    """Off ⇒ silent. On ⇒ the only thing that can go wrong is OpenD, and this
+    check exists to distinguish 'nothing was filed' from 'the gateway is not
+    answering' — those look identical to every caller downstream."""
+    from . import moo_notices
+    if not moo_notices.enabled():
+        return Check(id="moo_notices", ok=True, severity=OK,
+                     title="申报 / 分析师动作", title_en="Filings / analyst actions",
+                     detail="关闭", detail_en="off")
+    try:
+        ok, detail = moo_notices.probe()
+    except Exception as e:
+        ok, detail = False, str(e)[:80]
+    if ok:
+        return Check(id="moo_notices", ok=True, severity=OK,
+                     title="申报 / 分析师动作", title_en="Filings / analyst actions",
+                     detail=detail, detail_en=detail)
+    return Check(id="moo_notices", ok=False, severity=DEGRADED,
+                 title="申报 / 分析师动作", title_en="Filings / analyst actions",
+                 detail=detail, detail_en=detail,
+                 impact="申报和分析师动作两条催化剂线不可用，新闻判断退回只看 Tavily 转述。"
+                        "这条走的是 OpenD 转发的 SEC / 评级资讯，所以 OpenD 没连上时它也没有。",
+                 impact_en="Both the filings and the analyst-action catalyst lines are "
+                           "unavailable and the news read falls back to Tavily write-ups. "
+                           "This source is relayed by OpenD, so it is gone whenever the "
+                           "gateway is.",
+                 fix_key="MOO_NOTICES_ENABLED",
+                 fix_hint="确认 OpenD 已启动并登录；这条资讯由 OpenD 转发，不直连任何监管机构。",
+                 fix_hint_en="Check OpenD is running and logged in — this feed is relayed "
+                             "by the gateway, not fetched from any regulator directly.")
+
+
+def check_news_driven() -> Check:
+    """The one switch in this bot that invalidates its own backtest.
+
+    Everything else AI-shaped is advisory precisely so the sandbox keeps
+    describing the live system. News-driven mode changes SELECTION, and
+    sandbox.py deliberately skips AI to avoid LLM look-ahead — so with this on,
+    the backtest measures a strategy that is not the one running. That is a
+    legitimate owner choice, but it must never be a silent one.
+    """
+    from . import news_driven
+    if not news_driven.enabled():
+        return Check(id="news_driven", ok=True, severity=OK,
+                     title="新闻主导模式", title_en="News-driven mode",
+                     detail="关闭 — 新闻仅作顾问，技术面选股",
+                     detail_en="off — news is advisory, technicals select")
+
+    # Ask the ACTIVE provider for its key name rather than hardcoding one.
+    # ai.PROVIDERS is ("deepseek",) since 2026-07-22 — naming a Gemini key here
+    # would send this install hunting for a key it deliberately deleted.
+    from . import ai
+    provider = ai.active_provider()
+    env = _live_env()
+    no_news = not _cred(env, "TAVILY_API_KEY")
+    no_ai = not _cred(env, f"{provider.upper()}_API_KEYS", f"{provider.upper()}_API_KEY")
+    if no_news or no_ai:
+        # DEGRADED, not BLOCKER: this module's contract is that only the broker
+        # may stop a start, and the failure here is safe (it trades nothing, it
+        # doesn't trade wrongly). It just has to be impossible to miss.
+        return Check(id="news_driven", ok=False, severity=DEGRADED,
+                     title="新闻主导模式", title_en="News-driven mode",
+                     detail="已开启，但新闻/AI 密钥缺失 —— 不会下任何单",
+                     detail_en="on, but the news/AI keys are missing — zero orders",
+                     impact="新闻主导模式下「读不到新闻」= 不开仓（这是刻意的），"
+                            "所以现在这个配置一单都不会下。要么补上密钥，要么关掉 "
+                            "NEWS_DRIVEN_ENABLED 回到技术面选股。",
+                     impact_en="In news-driven mode 'cannot read the news' means "
+                               "'do not trade' by design — so this configuration "
+                               "will place zero orders. Add the keys, or turn "
+                               "NEWS_DRIVEN_ENABLED off to go back to technical "
+                               "selection.",
+                     fix_key="TAVILY_API_KEY" if no_news else f"{provider.upper()}_API_KEY",
+                     fix_hint=f"补齐 Tavily + {ai.PROVIDER_LABELS.get(provider, provider)} 密钥后重试。",
+                     fix_hint_en=f"Add the Tavily + {ai.PROVIDER_LABELS.get(provider, provider)} "
+                                 "keys and retry.")
+
+    # Shadow is the recommended first posture, so it reads as INFO rather than
+    # DEGRADED — nothing is degraded, it is deliberately not trading. But it
+    # must be unmissable: someone who forgets this is on will wonder for weeks
+    # why a mode they armed never buys anything.
+    if settings.news_driven_shadow:
+        return Check(id="news_driven", ok=True, severity=INFO,
+                     title="新闻主导模式（影子）", title_en="News-driven mode (shadow)",
+                     detail="影子模式 — 完整跑闸门但不下单",
+                     detail_en="shadow — full gate runs, no orders placed",
+                     impact="这个模式当前**不会下任何单**。新闻读数、催化剂判断、"
+                            "风控、仓位全部照跑，只是在下单前一行停住并记录到 "
+                            "data/news_shadow.jsonl。攒几周后用 "
+                            "`python -m scripts.news_factor_study --shadow` "
+                            "看它到底赚不赚，再决定要不要真开。",
+                     impact_en="This mode places NO orders right now. The news read, "
+                               "catalyst check, risk and sizing all run for real; it "
+                               "stops one line before the order and logs to "
+                               "data/news_shadow.jsonl. After a few weeks, score it "
+                               "with `python -m scripts.news_factor_study --shadow` "
+                               "and decide from evidence.",
+                     fix_key="NEWS_DRIVEN_SHADOW",
+                     fix_hint="设为 false 才会真正下单。",
+                     fix_hint_en="Set false to place real orders.",
+                     retryable=False)
+
+    return Check(id="news_driven", ok=False, severity=DEGRADED,
+                 title="新闻主导模式", title_en="News-driven mode",
+                 detail=news_driven.describe(), detail_en=news_driven.describe(),
+                 impact="回测不再描述实盘。新闻决定选股，而回测引擎故意跳过 AI"
+                        "（避免 LLM 后见之明），所以两边跑的是不同的策略 —— "
+                        "此刻的回测数字不能用来判断这个模式的好坏。而且这个模式"
+                        "没有因子研究背书（对比期权放量因子的 5,980 组样本）："
+                        "实盘结果本身就是实验。",
+                 impact_en="The backtest no longer describes live. News now "
+                           "selects trades, and the sandbox deliberately skips "
+                           "AI to avoid LLM look-ahead, so the two run different "
+                           "strategies — current backtest numbers cannot judge "
+                           "this mode. No factor study backs it either (contrast "
+                           "the options-volume factor's 5,980 name-days): live "
+                           "results are the experiment.",
+                 fix_key="NEWS_DRIVEN_ENABLED",
+                 fix_hint="设为 false 即可恢复技术面选股 + 可回测。",
+                 fix_hint_en="Set false to restore technical selection and a "
+                             "meaningful backtest.",
+                 retryable=False)
+
+
 def check_options_feed() -> Check:
     """Only meaningful once the factor is armed — probing an endpoint nothing
     consumes would be a permanent red the user cannot act on."""
@@ -301,6 +512,7 @@ def check_options_feed() -> Check:
 # that answers "what am I actually running?" — the question a fresh install and
 # a hand-typed .env both fail to answer.
 _FEATURES = [
+    ("news_driven_enabled",       "NEWS_DRIVEN_ENABLED",       "新闻主导模式",   "News-driven mode"),
     ("gap_sentinel_enabled",      "GAP_SENTINEL_ENABLED",      "盘前跳空防守",   "Pre-market gap defence"),
     ("smart_exit_enabled",        "SMART_EXIT_ENABLED",        "智能提前退出",   "Smart early exit"),
     ("sentiment_scoring_enabled", "SENTIMENT_SCORING_ENABLED", "情绪打分",       "Sentiment scoring"),
@@ -382,9 +594,16 @@ _CHECKS = {
     "news":      check_news,
     "options":   check_options_feed,
     "features":  check_features,
+    "news_driven": check_news_driven,
+    "moo_notices": check_moo_notices,
+    "finnhub": check_finnhub,
+    "finbert": check_finbert,
 }
 # Dialog order: the blocker first, then identity, then the degradable layers.
-ORDER = ["broker", "trade_env", "config", "features", "ai", "news", "telegram", "options"]
+# news_driven sits right after the inventory — when it is on it changes what
+# every layer below it means, so it should be read before them, not after.
+ORDER = ["broker", "trade_env", "config", "features", "news_driven",
+         "ai", "news", "finnhub", "moo_notices", "finbert", "telegram", "options"]
 
 
 def run_one(check_id: str, use_cache: bool = False) -> Check:

@@ -21,7 +21,7 @@ from moomoo import KLType
 from . import (
     adaptive_sizing, ai, ai_validator, approvals, audit, blacklist, breadth,
     clock, cron_state, db, executor, gap_sentinel, history, indicators,
-    kill_switch, notifier, options_stats, portfolio,
+    kill_switch, news_driven, notifier, options_stats, portfolio,
     regime as regime_mod, risk_manager, runtime_config, sector, self_improve,
     self_review, strategy_momentum, strategy_mr, strategy_pattern,
     tg_approvals,
@@ -538,6 +538,14 @@ def scan_once() -> None:
             base_thr = min(85, entry_thr + 5)
         # BEAR: regime kill_switch already blocks — threshold is moot
         threshold_floor = base_thr
+        # News-driven mode (2026-08-07, DEFAULT OFF): when news is the selector,
+        # the rule score demotes to a tradeability prefilter, so its bar drops
+        # (delta is negative, clamped at 50 — a headline is not a reason to buy
+        # broken tape). Inert when the switch is off: returns base_thr unchanged.
+        if news_driven.enabled():
+            threshold_floor = news_driven.threshold_floor(base_thr)
+            log.info("%s — rule floor %.0f → %.0f", news_driven.describe(),
+                     base_thr, threshold_floor)
         # P1-2 (2026-06-26): Late-entry risk premium. Entries after 14:00 ET
         # face shrinking liquidity, wider spreads, and immediate overnight gap
         # exposure before the thesis has time to play out. Raise the bar by
@@ -634,11 +642,29 @@ def scan_once() -> None:
         vision_budget = settings.pattern_vision_budget
         # Per-scan budget for the Phase 2B sentiment Gemini calls.
         sentiment_budget = settings.sentiment_budget
+        # News-driven mode gets its own, larger budget: here a name that doesn't
+        # get read cannot trade at all, so running dry stops the scan finding
+        # anything (vs. sentiment, where running dry just loses an annotation).
+        news_budget = settings.news_driven_budget
         scan_skips: list[tuple[str, str]] = []   # (symbol, gate) — summarised at scan end
+
+        # News-driven entry cutoff — checked once, outside the loop: it is a
+        # property of the clock, not of the candidate, so re-asking per symbol
+        # would only repeat the same answer. Inert when the mode is off.
+        _nd_closed, _nd_closed_why = news_driven.entries_closed()
+        if _nd_closed:
+            log.info("no new entries this scan — %s", _nd_closed_why)
+            audit.record("scan_end", gate="news_entry_cutoff", reason=_nd_closed_why)
 
         for sig in ranked:
             # Ranked is sorted desc by score; stop once we drop below the floor.
             if sig.score < threshold_floor:
+                break
+
+            # Past the news-driven entry cutoff, only stacking add-ons on names
+            # already held are pointless too (they get flattened with the rest),
+            # so nothing new opens at all.
+            if _nd_closed:
                 break
 
             # Concentration gate — once per-scan new-names budget is spent,
@@ -783,20 +809,80 @@ def scan_once() -> None:
             # score into conviction (sizing only). FAIL-SAFE → neutral 50.
             sent_verdict = sent_reason = None
             sent_score = None
+            # Initialised here, not inside the news-driven branch below: the
+            # trade dict is built outside that branch, so a mode-off scan would
+            # hit a NameError on it.
+            fin_score = None
             # 2026-07-27: don't pay for sentiment on a name that cannot be sized
             # no matter what the score comes back as. SENTIMENT_SIZING can only
             # scale conviction by up to 1.25 (see below), so if qty is already 0
             # at that BEST case, no verdict can rescue the entry — skip before
             # spending the call. Purely a cost saving: any name that could pass
             # still reaches the real gate below with its true conviction.
-            _best_conv = conviction * (1.25 if settings.sentiment_sizing else 1.0)
+            _best_mult = 1.0
+            if news_driven.enabled():
+                _best_mult = settings.news_driven_max_mult
+            elif settings.sentiment_sizing:
+                _best_mult = 1.25
+            _best_conv = conviction * _best_mult
             if risk_manager.calc_position_size(
                     sig, vix=vix, conviction=_best_conv,
                     regime_mult=max(1.0, settings.regime_bull_mult)) <= 0:
                 _skip("risk", "qty=0 even at best-case conviction — "
                               "skipped before sentiment spend")
                 continue
-            if (settings.sentiment_scoring_enabled and not is_stack_candidate
+
+            # --- NEWS-DRIVEN MODE (2026-08-07; DEFAULT OFF) --------------------
+            # The switch that makes news the decider instead of an annotation.
+            # Unlike the advisory block below, this one SELECTS: a candidate
+            # that has already cleared every technical/risk gate is still
+            # dropped unless the news read carries it. Stacking add-ons are
+            # gated too — adding to a position is a fresh bet on the same news.
+            #
+            # Budget exhaustion SKIPS rather than passing through. In advisory
+            # mode "budget spent → neutral, proceed" is right (technicals were
+            # the thesis); here it would silently downgrade the scan back to a
+            # technicals-only strategy, which is precisely the thing the switch
+            # claims not to be doing.
+            if news_driven.enabled():
+                if news_budget <= 0:
+                    # break, not continue: the budget cannot come back inside
+                    # this scan, so every remaining candidate would fail here
+                    # too and only spam the audit log with the same line.
+                    _skip("news_budget", "news-driven: per-scan AI budget spent "
+                                         f"({settings.news_driven_budget}) — "
+                                         "remaining candidates unread this scan")
+                    break
+                try:
+                    nd_verdict, nd_score, nd_catalyst, nd_reason, nd_ok = \
+                        ai_validator.assess_news(sig)
+                except Exception as e:
+                    nd_verdict, nd_score, nd_catalyst, nd_reason, nd_ok = \
+                        "neutral", 50, False, f"news read error: {e}", False
+                news_budget -= 1
+                # Record the read on the trade regardless of outcome, so a
+                # rejected name is still auditable ("what did it see?").
+                sent_verdict, sent_score, sent_reason = nd_verdict, nd_score, nd_reason
+                # Deterministic cross-check on the same headlines (advisory,
+                # None when off/unavailable). Logged and persisted so
+                # LLM-vs-FinBERT disagreement is measurable later instead of a
+                # hunch — it does NOT influence the gate.
+                fin_score, fin_detail = ai_validator.finbert_crosscheck(sig.symbol)
+                if fin_score is not None:
+                    log.info("%s finbert=%s vs llm=%s (%s)",
+                             sig.symbol, fin_score, nd_score, fin_detail)
+                nd_pass, nd_gate_reason = news_driven.gate(
+                    sig.symbol, nd_score, nd_verdict, nd_catalyst, nd_ok)
+                log.info("%s news-driven=%s score=%s catalyst=%s → %s (%s)",
+                         sig.symbol, nd_verdict, nd_score, nd_catalyst,
+                         "PASS" if nd_pass else "SKIP", nd_reason)
+                if not nd_pass:
+                    _skip("news_gate", nd_gate_reason)
+                    continue
+                conviction *= news_driven.conviction_multiplier(nd_score)
+
+            if (not news_driven.enabled()
+                    and settings.sentiment_scoring_enabled and not is_stack_candidate
                     and sentiment_budget > 0):
                 # P0-5 (2026-06-26): options_flow removed — noise > signal at $5K
                 # scale. AI validator handles sentiment from news better.
@@ -857,6 +943,34 @@ def scan_once() -> None:
 
             qty = risk_manager.calc_position_size(
                 sig, vix=vix, conviction=conviction, regime_mult=regime_mult)
+
+            # --- NEWS-DRIVEN SHADOW MODE (2026-08-07) ---------------------------
+            # Everything above has run for real — the news read, the catalyst
+            # requirement, the risk gate, the sizing. Shadow stops exactly here,
+            # one line before the order, and writes down what it WOULD have done.
+            #
+            # This exists because the offline factor study can measure whether
+            # FinBERT sentiment sorts returns, but it cannot measure THIS gate:
+            # an LLM's read plus a named-catalyst requirement. The only way to
+            # find out whether the live pipeline has an edge is to collect its
+            # decisions with outcomes attached, and the choice of how to do that
+            # is between "with money" and "without". This is without.
+            if news_driven.enabled() and settings.news_driven_shadow:
+                news_driven.record_shadow(
+                    symbol=sig.symbol, price=sig.price, qty=qty,
+                    score=sent_score, verdict=sent_verdict, reason=sent_reason,
+                    finbert=fin_score, conviction=conviction,
+                    strategy=getattr(sig, "strategy", "trend"),
+                    rule_score=sig.score,
+                )
+                log.info("SHADOW %s: would buy %s @ $%.2f (news=%s finbert=%s) "
+                         "— not ordering", sig.symbol, qty, sig.price,
+                         sent_score, fin_score)
+                audit.record("skip", symbol=sig.symbol, gate="news_shadow",
+                             reason=f"shadow mode — would have bought {qty} "
+                                    f"@ ${sig.price:.2f} (news={sent_score})",
+                             score=sig.score)
+                continue
 
             # 2026-06-03: portfolio.heat_check gate removed — structurally
             # non-binding (heat cap = 20% of account while per-trade risk is also
@@ -926,8 +1040,18 @@ def scan_once() -> None:
                                     "is_stack": is_stack_candidate,
                                     "strategy": getattr(sig, "strategy", "trend"),
                                     # Phase 2B sentiment (advisory; None when off).
+                                    # In news-driven mode these carry the
+                                    # news read instead — same fields, but the
+                                    # score SELECTED the trade rather than
+                                    # annotating it, which news_driven tells
+                                    # apart when the log is scored later.
                                     "sentiment_verdict": sent_verdict,
                                     "sentiment_score": sent_score,
+                                    "news_driven": news_driven.enabled(),
+                                    # Deterministic scorer's read on the same
+                                    # headlines (None when off). Persisted so
+                                    # the two can be scored against outcomes.
+                                    "finbert_score": fin_score,
                                     # Aggregate options flow (advisory; None when
                                     # off). Persisted so the factor can be scored
                                     # against real outcomes later — the 1y study
@@ -1621,6 +1745,16 @@ def run_loop() -> None:
     # stops + breakeven + bracket fill-check), no scoring, no AI, no entries.
     # Wrapped so a broker hiccup here can never stop the scheduler from arming.
     _startup_protect_stops()
+
+    # Headless opt-in only (FINBERT_AUTO_DOWNLOAD). A desktop user consents via
+    # the Settings dialog instead, which names the size and path first. No-op
+    # unless both flags are on and the weights are absent, and it runs AFTER
+    # protective exits so a slow download can never delay a stop.
+    try:
+        from . import news_score_local
+        news_score_local.maybe_auto_download()
+    except Exception as e:
+        log.warning("FinBERT auto-download skipped: %s", e)
 
     # Detect missed scheduled jobs and run them once before the normal loop
     # takes over. Synchronous on purpose — a quick Telegram lets the user know

@@ -1,5 +1,131 @@
 # CHANGELOG
 
+## 2026-08-08 — 移除 SEC EDGAR，改用 OpenD 转发的申报 + 分析师动作
+
+机主要求：这个机器人不要跟美国政府的服务通信。EDGAR 整条链路删除（`src/sec_edgar.py`、config 四项、`ai_validator` 里的调用、预检检查、`.env.example` 段落、设置面板里的开关和 UA 输入框）。
+
+**替代品是 `src/moo_notices.py`** —— 你已经连着的那台 OpenD 本来就在转发 SEC 申报（`NewsSubType.NOTICE`）和分析师动作（`RATING`）。本进程只跟 `127.0.0.1` 说话，不注册、不要 key、不要 User-Agent。
+
+代价必须讲清楚，因为它改变了模型能得出什么结论：
+
+- **没有 item code。** EDGAR 说的是「8-K，item 2.02 = 业绩发布」；这里只说「8-K: Current report」。你知道**发了**一份材料文件，不知道**它说了什么** —— 所以要求「具名催化剂」的提示词不能把申报本身当催化剂，事件内容仍要从新闻源来。
+- **只有日期，没有时分。** 实测对照（2026-08-08，AAPL，120 天窗口）：**同样的三份 8-K 都在，但每一份都晚一天** —— EDGAR 的 accepted 是 07-30 20:30 / 04-30 20:30 / 04-20 21:29，这里是 07-31 / 05-01 / 04-21。三份都是盘后提交的，而这个源按发布日期计。覆盖等价，时点系统性偏移；point-in-time 回放不能把这些日期当成提交时刻。
+- **更薄**：每个代码约 30 条、两三个月。
+
+**EDGAR 没有的东西：分析师动作。** 升评、初评、目标价调整 —— 按新闻主导模式提示词自己的定义，这些就是具名催化剂，而它们根本不是申报。NVDA 120 天内 69 条，AAPL 61 条。
+
+**过滤走 `related_securities` 而不是标题字符串。** NVIDIA 自己的申报标记 `['US.NVDA']`，只是跟踪它的杠杆 ETF 标记 `['US.NVDS']` —— 精确匹配天然滤掉 wrapper 噪音，而对「497K: Tradr 1.5X Short NVDA Daily ETF」做任何字符串手术都不可能安全做到这件事。
+
+写的时候踩了一次同类的坑并修掉：这个源的标题有两种形状（`8-K: NVIDIA | 8-K: Current report` 和 `NVIDIA | 8-K: ...`），按开头解析会把第二种整批丢掉，而结果读起来像「这个源很薄」而不像 bug —— NVDA 因此只报出 3 条，实际有 6 条。改成从最后一段解析。
+
+
+## 2026-08-08 — 新闻开关接进设置面板 + FinBERT 权重源修复（v2.4.0）
+
+**FinBERT 的 ONNX 下载指向了一个没有 ONNX 的 repo。** `ProsusAI/finbert` 只发布 torch checkpoint —— 没有 `onnx/` 目录、没有 `tokenizer.json`。所以 `ensure_model()` 先 404 掉量化图、再 404 掉 fp32 fallback，对**每一个开了 FinBERT 的用户**返回「could not download an ONNX graph」。沙箱测不出来：推理逻辑是拿本地构造的真实 ONNX 图验的，那张图是对的，错的是它的来源。ONNX 路径改指 `Xenova/finbert`（同权重的 ONNX 导出，`id2label` 与架构均已比对一致），torch 路径留在 `ProsusAI` —— 反过来 Xenova 没有 `pytorch_model.bin`，两个 repo 各有一半。`FINBERT_MODEL` 仍可覆盖两者，但仅在它被指向 torch 默认值以外时才算数：把那个默认值当成用户的选择，正是 ONNX 路径撞 404 的原因。macOS 实测：111.7 MB / 7.8 秒，bullish 76 > neutral 56 > bearish 24。
+
+**新闻功能在 DMG 安装上根本开不起来。** 上一版新增的开关全部只存在于 `.env`，而打包安装的 `.env` 在 `~/Library/Application Support/MooMooTrader/`，界面里没有任何入口能碰它 —— 装了 2.4.0 的人看到的和 2.3.0 完全一样。
+
+- `/api/settings/toggles` + `/api/settings/toggle`：五个开关（`FINNHUB_ENABLED` / `SEC_EDGAR_ENABLED` / `FINBERT_ENABLED` / `NEWS_DRIVEN_ENABLED` / `NEWS_DRIVEN_SHADOW`）走独立布尔白名单，写入只可能是 `true`/`false`；原生面板与网页面板共用同一批端点。
+- **开启新闻主导模式时，若用户从未对影子模式表过态，同时把影子模式打开并明说**。要避免的失败是：有人翻了一个开关，就在不知情的情况下拿真钱赌 LLM 对一条标题的读数。一旦用户明确关掉影子模式，这个偏好就被尊重，不会再被改回去。
+- `SEC_EDGAR_USER_AGENT` 进 key 白名单，且**不打码**（它是联系方式不是密钥；`••••com` 会藏住那个让你 IP 被封 10 分钟的拼写错误）。原生面板对非密钥用普通输入框并预填。
+- FinBERT 那一行显示模型实际状态 —— 「已开启但没下载」= 打分器永不被调用，这个陷阱现在写在开关旁边，而不是留给用户去日志里发现。
+
+## 2026-08-07 — 新闻因子研究 + 影子模式（v2.4.0）
+
+给 `NEWS_DRIVEN_ENABLED` 补上它一直欠着的那道闸门。期权放量因子当初必须先过 `scripts/options_factor_study.py`（5,980 组名日）才被允许碰仓位；新闻主导模式至今没有对应的东西，预检里那句「没有因子研究背书」写的就是这件事。
+
+**`scripts/news_factor_study.py`** — 离线因子研究，现在才可能做，因为它需要两样东西同时存在：Finnhub 的历史新闻（Tavily 只答「现在」，过去某天的输入无法重建）＋ FinBERT（训练语料早于测试窗口；用前沿 LLM 去评 2026 年的新闻，测的是它的记忆）。
+
+- **时点对齐刻意取保守的那一种**：用 **D-1 收盘前**发布的新闻打分 → **D 日开盘**进 → **D 日收盘**出。当天 15:00 发的新闻去「预测」当天走势不是预测、是复盘，而那是制造一条漂亮却毫无价值的回测曲线最省事的方法。
+- `ret_session`（开盘→收盘）是主口径，因为收盘平仓的模式只能吃到这一段。next1 / next3 也报，用于和期权研究对齐、也因为 PEAD 漂移是按天算的 —— 但**当前模式吃不到**，不能当作它的预期收益读。
+- PASS 判据：分桶在 `ret_session` 上单调 ＋ 顶桶在胜率和均值上都胜过基线 ＋ **两个半段都成立**。报告结尾明写三条局限：FinBERT 评的是情绪不是价格影响；单一市场环境、桶小到几只票就能带偏；**成本完全没建模**，日内往返每天付价差和手续费，边缘太薄的话实盘就是亏。
+- 每次抓取落盘缓存（`data/news_study_cache/`），首跑慢（Finnhub 免费档 60 次/分），重跑免费、中断可续。
+
+**影子模式 `NEWS_DRIVEN_SHADOW`（本次最推荐的东西）**
+
+离线研究能测「FinBERT 情绪分能不能排序收益」，但**测不了真正会上场的那道闸门** —— LLM 的判断 ＋ 具名催化剂要求。想知道实盘链路有没有 edge，只能收集它自己的决策并附上结果，而这件事要么拿钱做、要么不拿钱做。
+
+- 开启后完整跑完整条链路（新闻读数、催化剂判断、风控、仓位），在**下单前一行**停住，把「本来会买什么」写进 `data/news_shadow.jsonl`（JSON-lines 追加，崩溃不会丢历史行；时间戳用 ET，和这个机器人其他所有时间决策一致）。
+- `python -m scripts.news_factor_study --shadow` 给这些决策附上结果：胜率、每笔均值、按 LLM 分数分桶，以及 **LLM 和 FinBERT 分歧时的表现** —— 如果分歧确实标记出了亏损单，那个交叉验证就值得从顾问升级成真闸门。
+- 预检把影子模式报成 INFO 而非 DEGRADED（它不是降级，是刻意不交易），但措辞明确：**「这个模式当前不会下任何单」** —— 忘了自己开着影子的人，会困惑好几周为什么armed 的模式一单不下。
+
+**打包**：`packaging/entry.py` 的 `--import-check` 补进 5 个新模块和 `onnxruntime` / `tokenizers`。这些是惰性 import，PyInstaller 的静态分析看不见，全靠 spec 里的 hiddenimports —— 而这条自检就是证明那个 hiddenimports 真的生效的东西，缺了会在构建时失败而不是在用户机器上变成一个永不触发的功能。版本 2.3.0 → 2.4.0。
+
+## 2026-08-07 — Finnhub 新闻源 + FinBERT 落地（app / 源码共用一份模型）
+
+**Finnhub**（`src/finnhub_news.py`，默认关，需 finnhub.io 免费 Key：60 次/分钟、约 1 年历史）
+
+- 新闻由**供应商按股票代码标注**，而不是靠搜索字符串匹配 —— "AAPL" 不会再搜进无关的同名内容。
+- 真正的意义是它能**查历史某一天**（`from` / `to`）。Tavily 只答"现在"，而**你没法回放一个输入都无法重建的决策** —— 这就是新闻策略至今无法回测的根本原因。`fetch_company_news(..., until=某个过去日期)` 就是为此留的接口；窗口边界在本地二次校验，不信任服务端（point-in-time 回放里漏进一条未来新闻就是前视 bug）。
+- 与 Tavily 合并后按标题归一化去重 —— 同一条通讯社原稿从两个源进来会被算成两条，让单个事件看起来像互相印证，而这恰恰是新闻下注最不能有的错觉。Finnhub 优先保留。
+- 复用 `NEWS_INCLUDE_DOMAINS` 做来源过滤（Finnhub 返回的是 source 名不是 URL，所以是宽松子串匹配，目的是滤掉明显的聚合噪音）。
+
+**FinBERT 改造：从"源码版专属"变成"哪里都能用"**（`src/news_score_local.py`）
+
+上一版把 FinBERT 做成了可选依赖，`.app` 用户实际上用不了。按要求改了三处：
+
+- **运行时换成 ONNX Runtime**。`onnxruntime` + `tokenizers` 约 25 MB，进 `requirements.txt` 和打包 hiddenimports —— 这是让 `.app` 也能跑的唯一可行代价（torch + transformers 是 1–2 GB，而这个项目为省 53 MB 排除了 matplotlib）。源码版若已装 torch + transformers 则自动走那条路，不会存第二份权重。
+- **模型放一份共享路径**，`news_score_local.model_home()`，**刻意不用 `config.ROOT`** —— ROOT 在源码版是仓库目录、frozen 是 app-support，用它会让两边各下一份。权重是机器级用户数据，不是每个安装各自的状态。macOS 走 `~/Library/Application Support/MooMooTrader/models/finbert`，Linux/Windows 各自的标准位置，`FINBERT_HOME` 可覆盖。
+- **绝不隐式下载**。`FINBERT_ENABLED=true` 本身不拉一个字节。新增「设置 → FinBERT」面板：先 `confirm` 弹窗说明**约 120 MB、下载到哪个具体路径、随时可删回收**，用户点了才开始；后台线程下载 + 进度条轮询，另有「删除」按钮把空间还回去。headless 机器可以用 `FINBERT_AUTO_DOWNLOAD=true` 跳过弹窗，且该调用排在开机保护性止损**之后**，慢下载永远不会拖延止损。
+- 下载走 `.part` 临时文件再改名，中断不会留下一个能加载但输出垃圾的截断图；加载前还有 1 MB 体积下限兜底。
+- 新增 `/api/finbert`（GET 永远安全、不触发下载）、`/api/finbert/download`（POST 即为知情同意）、`/api/finbert/remove`。预检把「已开启但未下载」报成 INFO 并写明路径和体积，而不是报错。
+
+**验证**：用真实 ONNX 图 + 真实 tokenizer 端到端跑通推理路径（padding、`token_type_ids` 输入名检测、softmax、`id2label` 映射），确认 bullish > neutral > bearish 单调且落在 0–100；`remove_model` 正确回收。真实权重下载和 Finnhub 实网调用在本沙箱被出网代理挡住，未端到端验证。
+
+## 2026-08-07 — AI 故障必须发声 + SEC EDGAR 一手源 + FinBERT 交叉验证
+
+**1. AI 挂掉不再静默**（`ai.py` / `health_check.py` / `web/`）
+
+上一条修 `deepseek-chat` 时发现的根因不止是模型名过期，而是**看门狗本身有个分类漏洞**：`check_ai()` 把 404 归到 "unclassified" → `skip`，而 `skip` 从不翻转状态、从不告警。所以模型下线这种最该报警的情况，恰恰是唯一报不出来的。
+
+- **404 / model not found 归类为 `bad`**（owner-actionable，改一个设置就好），补上那个洞。
+- **新增运行时调用账本**（`ai.call_health()`）：`generate()` 每次调用记录成败，连续失败 3 次由看门狗边沿触发告警。这是和定时 ping **相互独立**的第二路信号 —— ping 能通不代表本机器人真正发出的请求能成。无 key 时不记为失败（「从没配过」和「配了但坏了」是两个问题）。
+- **新闻主导模式下告警措辞升级**：平时 AI 挂了只是降级（技术面照跑、AI 层 fail-safe），但新闻主导模式下读不到新闻就不下单 —— 那是**完全停止交易**。同一个通道，两种后果，消息里说清楚是哪一种。
+- **网页红色横幅**（`/api/status` 新增 `ai_health` + `index.html`）：4 秒轮询已有，不额外探测（否则每小时给供应商刷 900 次）。「知道了」按当次故障（provider+model+错误）记忆，不是按页面加载 —— 每 4 秒重弹的横幅只会训练你无视它，而那正是四天失明的成因。换一种新故障会重新弹。
+
+**2. SEC EDGAR 一手催化剂源**（`src/sec_edgar.py`，默认关）
+
+Tavily 搜的是开放网络，通讯社原稿、聚合站洗稿、涨跌复盘、SEO 列表长得都一样。EDGAR 反过来：**8-K 本身就是重大事件**，由发行人申报、带精确时间戳。对「有没有具体且新鲜的催化剂」这个问题，这是能拿到的最高信噪比答案，且免费。
+
+- 8-K item code 映射成人话（2.02 业绩、1.01 重大协议、5.02 高管变动…），把「有份申报」变成「有个**什么类型**的催化剂」。10-K/10-Q 故意排除 —— 定期报告不是意外，当成催化剂就是在买已被消化的事件。
+- **没配 User-Agent 就拒绝发请求**。SEC 要求 UA 写明身份 + 联系邮箱，否则 403 并可能封 IP 约 10 分钟 —— 而那是同一台连着券商的机器。宁可静默不发，也不赌这一下。预检把这条单列出来。
+- Ticker→CIK 映射本地缓存一周，刷新失败时回退旧缓存（一周前的映射依然基本正确，为一次网络抖动丢掉整个数据源不划算）。
+- **`assess_news` 的空源判断改成「两个都空才拒」**：原本 Tavily 没结果就直接不下单，但「已有 8-K 而媒体还没写」恰恰是这个模式能遇到的**最好情况**（一手源，早于转述），不该被沉默的 Tavily 否决掉。
+
+**3. FinBERT 本地打分**（`src/news_score_local.py`，默认关，**不进打包**）
+
+- 价值**不在于**让实盘进场更准 —— 它评的是句子情绪，不是价格影响；「公司公布创纪录利润」在它眼里就是正面，哪怕股票因不及预期而跌。价值在于它的训练语料**早于**任何你要测的窗口，所以没有后见之明。这是让新闻策略可回测的那一半拼图（另一半 point-in-time 新闻归档仍然缺，Tavily 只答「现在」）。
+- 今天的定位：对**同一批**标题给一个确定性的第二意见，和 LLM 的分数一起记进成交记录，让「LLM 和 FinBERT 分歧」从直觉变成可量化的东西。ADVISORY，不参与闸门。
+- **刻意不列进 requirements.txt**：torch + transformers 给冻结包加约 1–2 GB，而 `mmt-backend.spec` 为省 53 MB 排除了 matplotlib —— 为一个顾问性交叉验证背一整套深度学习栈不值。惰性 import，所有失败路径降级为 unavailable；源码安装 `pip install transformers torch` 即可开启，`.app` 永远不带。
+- 打分为 mean(P(正) − P(负)) 重映射到 0–100，且**从模型 config 读 `id2label`** 而不是假定列序 —— 标签顺序不同的 fine-tune 会让整个信号悄悄反向，那种 bug 看起来像「alpha 不行」。取不到真实结果时返回 `None` 而非中性 50：「FinBERT 说中性」和「FinBERT 没跑」是两件事，只有前者是证据。
+
+## 2026-08-07 — DeepSeek V4 迁移（`deepseek-chat` 已停止解析）+ 新闻检索质量
+
+**这一条是修故障，不是加功能。** DeepSeek 于 2026-07-24 15:59 UTC 退役了 `deepseek-chat` / `deepseek-reasoner` 两个旧模型名，**没有软重定向** —— 请求直接失败。本仓库 `DEEPSEEK_MODEL` 的默认值正是 `deepseek-chat`，而所有 AI 层都是 fail-safe 的（AI 挂 → 返回中性 → 交易照跑），所以这是一次典型的静默降级：主循环看起来一切正常，AI 复核/情绪/智能退出实际全部空转。这正是 `preflight.py` 开头那段自述要防的事，但当时的预检只验 key、不验模型名，key 有效 → 一路绿灯。
+
+- **调用时自动改名**（`ai.migrate_deepseek_model`）：`deepseek-chat` → `deepseek-v4-flash`（thinking 关）、`deepseek-reasoner` → `deepseek-v4-flash`（thinking 开），并 WARNING 一次。未编辑的 .env 和残留的 db-state 覆盖都能继续跑，不认识的名字原样放行 —— 绝不替用户猜他自己选的模型。
+- **thinking 变成请求参数**：V4 把推理模式从模型名移到 body 的 `thinking`，且 pro 档默认开。`_deepseek()` 现在显式声明模式，不继承会变的默认值 —— 本仓库每个调用点要的都是「限时内吐一段短 JSON」，不是长思考。
+- **预检验模型名**（`check_ai`）：配了退役名字时以 DEGRADED 明说「现在靠自动改名还能跑，但配置本身是坏的」，并指出 flash / pro 的取舍。默认值与 `_FALLBACK_MODELS` 同步更新为 V4。
+- **修 `check_news_driven` 里我自己写的 Gemini 硬编码**：改成问 `ai.active_provider()` 要 key 名。`PROVIDERS` 自 2026-07-22 起就只有 deepseek，硬写 Gemini 会让这个装机去找一个用户早就删掉的 key。
+
+**新闻检索质量**（`src/news_fetcher.py`）：
+
+- **不再丢弃 `published_date`**（以及 Tavily 的 `score`）。此前每个消费方看到的 5 分钟前的头条和 3 天前的头条是同一段纯文本 —— 对新闻主导模式是致命的，它的核心问题就是「这个催化剂是新鲜的还是已经走完了」，光看标题答不了。`format_news` 现在前缀 `[时间戳]`，`NEWS_DRIVEN_PROMPT` 也把当前 ET 时间一起喂进去，那个 `stale` 判断这才真的有依据。
+- **`NEWS_INCLUDE_DOMAINS` 域名白名单**（默认空 = 行为不变）。Tavily 搜的是开放网络，会把「3 只值得关注的 AI 股」这类 SEO 列表、聚合站洗稿、涨跌幅复盘和真报道混在一起返回，而这些在模型眼里都像催化剂。填 `recommended` 即启用主流财经通讯社 + `sec.gov` —— 8-K 本身**就是**重大事件，有时间戳，且早于媒体转述。
+- 新增 `NEWS_SEARCH_DEPTH`、`NEWS_TICKER_DAYS`（默认 3 保持不变；同日内平仓的策略应该调到 1 —— 3 天窗口正是「读到的是旧闻」的直接原因）。
+
+## 2026-08-07 — 新闻主导模式（`NEWS_DRIVEN_ENABLED`，默认关）
+
+机主要求的一个显式开关：把新闻从「顾问」提升为「主信号」，据此下注，收盘平仓。默认关闭时全链路逐字节不变。
+
+- **漏斗倒置**（`src/news_driven.py` 新增 + `src/main.py`）：开启后技术分降级为「这票能不能碰」的预筛（`threshold_floor` 按 `NEWS_DRIVEN_THRESHOLD_DELTA` 放松，硬地板 50 —— 再好的消息也不买烂走势），由 AI 新闻读数决定**选股**（`NEWS_DRIVEN_MIN_SCORE`，默认 65）和**仓位**（分数线性映射到 1.0–`NEWS_DRIVEN_MAX_MULT`，下游 `max_position_pct` 仍封顶）。加仓单同样过闸 —— 加仓是对同一条新闻的新下注。
+- **要求具名催化剂**（`NEWS_DRIVEN_REQUIRE_CATALYST=true`）：提示词（`ai_validator.NEWS_DRIVEN_PROMPT`）明确区分「具体事件」（上调指引、签约、升评、获批）和「氛围」（泛泛看好、涨幅复盘、维持评级）。模型标记 `stale=true` 的催化剂降级为无催化剂 —— 市场已经走完的行情不是现在进场的理由。关掉这一项等于让 LLM 的情绪分替你选股。
+- **fail-safe 方向反转**，这是本次最要紧的设计点：顾问模式下「AI 不可用 → 中性 50 → 照常下单」是对的（技术面才是论据）；新闻主导模式下新闻**就是**论据，所以无 key / 无新闻 / 配额错误 / 预算耗尽一律**不下单**，绝不回退成技术面选股 —— 那会在用户以为跑着 A 策略时偷偷跑 B。`assess_news()` 因此额外返回 `ok` 标志，`news_driven.gate()` 只认真读数。
+- **收盘平仓**（`executor` auto-flush 0.7）：`NEWS_DRIVEN_FLATTEN_ET`（默认 15:45 ET，盘中正常挂单、避开 15:30 MOC 区）无视盈亏/TP/SL 平掉全部 bot 持仓。机主手工持仓照旧豁免；取不到价的停牌票宁可留过夜也不砸向虚空。
+- **堵住两个空转**：① 平仓后加 `EOD_FLAT` 再入场冷却，否则 15:45 平掉、15:50 被扫回来、15:55 再平，在一天里价差最宽的时段来回付费；② 新增 `NEWS_DRIVEN_MIN_HOLD_MIN`（默认 30 分钟），15:15 后不再开新仓 —— 开一个五分钟后就被平掉的仓位只是白付一轮手续费和滑点。
+- **回测失效必须说出口**（`src/preflight.py` 新增 `check_news_driven`，`src/sandbox.py` 注释）：本仓库其他 AI 层一律 advisory，正是为了让回测仍然描述实盘；这个开关改的是**选股**，而 sandbox 故意跳过 AI（防 LLM 后见之明），于是两边跑的是不同策略。开着它时每次启动预检都会以 DEGRADED 说明这一点，并指出它也没有因子研究背书（对比期权放量因子的 5,980 组样本）—— 实盘结果本身就是实验。缺 Tavily/AI key 时预检明说「一单都不会下」。
+- 未加 `NEWS_DRIVEN_MODEL`：`ai.generate()` 没有 `model=` 参数，现有 `GAP_SENTINEL_MODEL` / `SMART_EXIT_MODEL` / `SENTIMENT_MODEL` 实际都没人读（`.env.example:32` 已注明）。不再增加第四个假旋钮。
+
 ## 2026-07-11 — Sandbox 配置对齐 + 真实 VIX + sandbox↔backtest 交易级差分
 
 三件事把 sandbox 从"独立但配置漂移"修成可信的差分基准（快引擎 engine_compare 只互查 V3 与冻结 oracle，此前**没有任何东西**把快引擎和 sandbox 对过账）：

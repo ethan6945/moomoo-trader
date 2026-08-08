@@ -423,13 +423,58 @@ struct SettingsKeys: Decodable {
         var desc: String?
         var masked: String?
         var isSet: Bool?
+        /// False for values that are contact strings rather than credentials
+        /// (SEC_EDGAR_USER_AGENT). Those get a plain field and are shown back
+        /// verbatim — you cannot spot the typo that gets your IP blocked in
+        /// `••••com`. Absent = secret, so an older backend stays safe.
+        var secret: Bool?
 
         var id: String { key }
+        var isSecret: Bool { secret ?? true }
 
         enum CodingKeys: String, CodingKey {
-            case key, desc, masked
+            case key, desc, masked, secret
             case isSet = "set"
         }
+    }
+}
+
+/// `/api/finbert` — local sentiment model state. Reading it never downloads.
+struct FinbertState: Decodable {
+    var downloaded: Bool?
+    var path: String?
+    var diskMb: Double?
+    var estDownloadMb: Double?
+    var runtime: String?
+    var needsDownload: Bool?
+    var job: Job?
+
+    struct Job: Decodable {
+        var running: Bool?
+        var done: Double?
+        var total: Double?
+        var ok: Bool?
+        var detail: String?
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case downloaded, path, runtime, job
+        case diskMb = "disk_mb"
+        case estDownloadMb = "est_download_mb"
+        case needsDownload = "needs_download"
+    }
+}
+
+/// `/api/settings/toggles` — the .env booleans the panel may flip.
+struct SettingsToggles: Decodable {
+    var toggles: [Item]
+
+    struct Item: Decodable, Identifiable {
+        var key: String
+        var desc: String?
+        var on: Bool
+
+        var id: String { key }
     }
 }
 

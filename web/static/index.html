@@ -243,6 +243,15 @@
 </style>
 </head>
 <body>
+  <!-- AI-down banner. Every AI layer here fail-safes to neutral, so an outage
+       degrades the bot in total silence — that is the whole reason this exists.
+       Dismissible per-outage (see aiBannerKey), not per-page-load: a banner you
+       re-close every 4s is a banner you learn to ignore. -->
+  <div id="aiBanner" class="hidden" style="background:#3d1518;border-bottom:1px solid #f8514966;color:#ffb4ab;padding:10px 16px;font-size:13px;display:flex;align-items:center;gap:12px">
+    <span style="font-size:16px">⚠️</span>
+    <span id="aiBannerMsg" style="flex:1"></span>
+    <button class="sm" id="aiBannerDismiss" style="background:transparent;border-color:#f8514966;color:#ffb4ab">知道了</button>
+  </div>
   <div class="topbar">
     <div class="logo">Moo<span class="b">Trader</span></div>
     <span class="pill" id="sched"><span class="dot" style="background:#8b949e"></span>scheduler …</span>
@@ -410,6 +419,22 @@
           <button class="sm" id="btnEnvToggle">切换</button></div>
       </div>
 
+      <div class="set-sec"><h3>新闻源与模式 News sources &amp; mode</h3>
+        <div class="setdesc">全部默认关闭。开关写入 .env，需<b>重启交易循环</b>生效。</div>
+        <div id="toggleList" style="margin-top:8px"></div>
+      </div>
+
+      <div class="set-sec"><h3>本地新闻打分模型 FinBERT</h3>
+        <div class="set-row"><div style="flex:1"><b>FinBERT（本地运行，确定性）</b>
+          <div class="setdesc">对 AI 读过的<b>同一批</b>标题给一个确定性的第二意见，两个分数一起记进成交记录，让「AI 和 FinBERT 分歧」变成可量化的东西。<b>仅供参考，不参与下单决策。</b>它评的是句子情绪、不是价格影响 —— 真正的价值是它的训练语料早于任何回测窗口，没有后见之明。<br>
+          模型只下载一次，<b>app 和源码版共用同一份</b>。</div>
+          <div id="finbertState" class="setdesc" style="margin-top:6px">—</div></div>
+          <span style="display:flex;gap:6px">
+            <button class="sm" id="btnFinbertGet">下载</button>
+            <button class="sm" id="btnFinbertDel">删除</button>
+          </span></div>
+      </div>
+
       <div class="set-sec"><h3>资金 Capital</h3>
         <div class="set-row"><div style="flex:1"><b>预算 Budget</b><div class="setdesc">分配给交易的本金。改了下次扫描生效（免重启）；仓位/风控按它派生，并自动不超过实盘 equity。</div></div>
           <span style="display:flex;gap:6px"><input id="setBudget" type="number" step="100" placeholder="$"/><button class="sm" id="btnSetBudget">保存</button></span></div>
@@ -497,9 +522,35 @@ function setTab(t){
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>setTab(b.dataset.tab));
 
 let LAST_STATUS=null;
+// Dismissal is keyed to the OUTAGE (provider+model+error), not to the session.
+// Poll is every 4s: a per-load dismissal would re-fire forever and train you to
+// click it away without reading, which is how the four silent days happened.
+// A NEW/different failure re-opens the banner even if you dismissed the last one.
+let AI_BANNER_DISMISSED='';
+function renderAiBanner(h){
+  const el=$('#aiBanner');
+  if(!h||h.ok||!h.has_key){el.classList.add('hidden');return;}
+  const key=`${h.provider}|${h.model}|${(h.last_error||'').slice(0,80)}`;
+  if(AI_BANNER_DISMISSED===key){el.classList.add('hidden');return;}
+  const zh=LANG!=='en';
+  const consequence=h.blocks_trading
+    ? (zh?'新闻主导模式已开启 —— 读不到新闻就不下单，现在是完全停止交易。'
+         :'News-driven mode is ON — no news means no orders, so trading has stopped entirely.')
+    : (zh?'AI 层已 fail-safe（不会乱动仓位），但智能退出/情绪打分处于失明状态。'
+         :'The AI layers have failed safe (no rogue orders), but smart exit and sentiment are blind.');
+  const err=(h.last_error||'').slice(0,120);
+  $('#aiBannerMsg').innerHTML=
+    `<b>${h.provider} ${zh?'调用失败':'is failing'}</b>${h.fail_streak?` (${h.fail_streak}${zh?' 次连续':' in a row'})`:''} — ${consequence}`
+    +(err?`<br><span style="opacity:.75;font-size:11.5px">${h.model||''} · ${err.replace(/</g,'&lt;')}</span>`:'');
+  el.dataset.key=key;
+  el.classList.remove('hidden');
+}
+$('#aiBannerDismiss').onclick=()=>{AI_BANNER_DISMISSED=$('#aiBanner').dataset.key||'';$('#aiBanner').classList.add('hidden');};
+
 async function refresh(){
   let a; try{a=await api('/api/status');}catch(e){return;}
   LAST_STATUS=a;
+  renderAiBanner(a.ai_health);
   const run=a.scheduler_running;
   $('#sched').innerHTML=`<span class="dot ${run?'live':''}" style="background:${run?'#3fb950':'#f85149'};color:${run?'#3fb950':'#f85149'}"></span>scheduler ${run?'running':'stopped'}`;
   $('#sched').style.borderColor=(run?'#3fb950':'#f85149')+'66';
@@ -909,10 +960,18 @@ function applyTheme(t){document.body.classList.toggle('light',t==='light');local
 // ── settings ──
 async function loadSettings(){
   try{const s=await api('/api/settings');
+    // A contact string (SEC_EDGAR_USER_AGENT) is not a secret — a password
+    // field for it hides the typo that gets the IP blocked.
     $('#keyList').innerHTML=s.keys.map(k=>`<div class="set-row"><div style="flex:1"><b>${k.key}</b>
        <div class="setdesc">${k.desc}</div><div class="setdesc">当前: ${k.masked||'(未设置)'}</div></div>
-       <span style="display:flex;gap:6px"><input id="k_${k.key}" type="password" placeholder="新值(留空不改)"/>
+       <span style="display:flex;gap:6px"><input id="k_${k.key}" type="${k.secret===false?'text':'password'}" placeholder="新值(留空不改)"/>
        <button class="sm" onclick="saveKey('${k.key}')">保存</button></span></div>`).join('');
+  }catch(e){}
+  try{const t=await api('/api/settings/toggles');
+    $('#toggleList').innerHTML=t.toggles.map(g=>`<div class="set-row"><div style="flex:1"><b>${g.key}</b>
+       <div class="setdesc">${g.desc}</div></div>
+       <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="t_${g.key}"
+       ${g.on?'checked':''} onchange="saveToggle('${g.key}',this.checked)"/><span>${g.on?'开':'关'}</span></label></div>`).join('');
   }catch(e){}
   try{const a=LAST_STATUS||await api('/api/status');
     $('#setBudget').value=Math.round(a.budget||0);
@@ -1057,8 +1116,64 @@ async function saveKey(key){
   const r=await api('/api/settings/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,value:v})});
   alert(r.note||(r.ok?'已保存':('失败: '+(r.error||'')))); el.value=''; loadSettings();
 }
+// The server's note is what gets shown: turning news-driven mode on may also
+// have turned shadow mode on, and only the server knows whether it did.
+async function saveToggle(key,on){
+  const r=await api('/api/settings/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,on})});
+  alert(r.note||(r.ok?'已保存':('失败: '+(r.error||'')))); loadSettings();
+}
 $('#btnSetBudget').onclick=async()=>{const v=+$('#setBudget').value; if(v>0){await api('/api/budget',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({value:v})});refresh();alert('预算已更新: $'+v);}};
-$('#btnSettings').onclick=async()=>{await loadSettings();$('#settingsModal').classList.remove('hidden');};
+// ── FinBERT: status + a consent dialog before spending the user's disk ──
+// The download is only ever started by this button. Opening Settings, or even
+// setting FINBERT_ENABLED, never pulls a byte — the confirm below IS the
+// consent, and it names the size and the exact path before asking.
+let FINBERT_POLL=null;
+async function loadFinbert(){
+  let s; try{s=await api('/api/finbert');}catch(e){return;}
+  const el=$('#finbertState'), get=$('#btnFinbertGet'), del=$('#btnFinbertDel');
+  const j=s.job||{};
+  if(j.running){
+    const pct=j.total?Math.round(100*j.done/j.total):0;
+    el.innerHTML=`⬇️ 下载中 ${j.file||''} — ${pct}% (${(j.done/1e6).toFixed(1)}/${(j.total/1e6).toFixed(1)} MB)`;
+    get.disabled=true; del.disabled=true;
+    if(!FINBERT_POLL) FINBERT_POLL=setInterval(loadFinbert,1000);
+    return;
+  }
+  if(FINBERT_POLL){clearInterval(FINBERT_POLL);FINBERT_POLL=null;}
+  if(!s.can_run){
+    el.innerHTML=`⚪ 运行库缺失 — <code>pip install onnxruntime tokenizers</code>`;
+    get.disabled=true; del.disabled=!s.downloaded;
+  }else if(s.runtime==='torch'){
+    el.innerHTML=`✅ 就绪（torch/transformers，模型走 HuggingFace 缓存）`;
+    get.disabled=true; del.disabled=true;
+  }else if(s.downloaded){
+    el.innerHTML=`✅ 已下载 · ${s.disk_mb} MB · <span style="opacity:.7">${s.path}</span>`
+      +(s.enabled?'':' <span style="color:#d29922">（FINBERT_ENABLED 仍是 false，不会被调用）</span>');
+    get.disabled=true; del.disabled=false;
+  }else{
+    el.innerHTML=`⚪ 未下载 — 约 ${s.est_download_mb} MB`
+      +(j.ok===false?` <span style="color:#f85149">上次失败：${(j.detail||'').slice(0,80)}</span>`:'');
+    get.disabled=false; del.disabled=true;
+  }
+}
+$('#btnFinbertGet').onclick=async()=>{
+  let s; try{s=await api('/api/finbert');}catch(e){return;}
+  const okd=confirm(
+    `将从 HuggingFace 下载 FinBERT 模型（约 ${s.est_download_mb} MB）到：\n\n${s.path}\n\n`
+    +`• 占用你硬盘约 ${s.est_download_mb} MB，可随时点「删除」收回\n`
+    +`• 只下载一次，app 版和源码版共用\n`
+    +`• 下载期间可以继续用，不影响交易\n\n继续？`);
+  if(!okd) return;
+  await api('/api/finbert/download',{method:'POST'});
+  loadFinbert();
+};
+$('#btnFinbertDel').onclick=async()=>{
+  if(!confirm('删除本地 FinBERT 模型？会释放硬盘空间，之后可以重新下载。')) return;
+  const r=await api('/api/finbert/remove',{method:'POST'});
+  alert(r.note||'已删除'); loadFinbert();
+};
+
+$('#btnSettings').onclick=async()=>{await loadSettings();await loadFinbert();$('#settingsModal').classList.remove('hidden');};
 $('#btnCloseSet').onclick=()=>$('#settingsModal').classList.add('hidden');
 $('#settingsModal').onclick=e=>{if(e.target.id==='settingsModal')$('#settingsModal').classList.add('hidden');};
 $('#selTheme').onchange=e=>applyTheme(e.target.value);

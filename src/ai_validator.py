@@ -374,6 +374,161 @@ If you have no strong view, return neutral with score ~50.
 """
 
 
+NEWS_DRIVEN_PROMPT = """You are a NEWS analyst for a LONG-ONLY US-stock trading
+bot that is running in NEWS-DRIVEN mode: the news is the thesis, not a
+tiebreaker. The bot will hold {symbol} (now ${price}) for ONE session only and
+flatten before the close, so only catalysts that can move the stock TODAY
+count.
+
+Right now it is {now_et} US/Eastern. Each headline below is prefixed with its
+publication timestamp — use them, they are the difference between a catalyst
+and a recap.
+
+Recent news:
+{ticker_news}
+
+Macro / market context:
+{macro_news}
+
+SEC filings by this company (PRIMARY SOURCE — the filing IS the event, filed by
+the issuer with an exact timestamp. Trust these over any press write-up that
+disagrees with them. "(none in the window)" means no material filing, which is
+normal and is NOT evidence against a catalyst reported elsewhere; "(disabled)"
+means we did not look):
+{filings}
+
+Technical signals the bot computed (CONTEXT ONLY — do not let a pretty chart
+raise the score; this mode is betting on the news):
+{reasons}
+
+Score 0-100 how bullish the NEWS is for a same-session long (50 = neutral).
+
+A "concrete catalyst" means a specific, named, dated corporate or macro event:
+raised guidance, an earnings beat, a signed contract or partnership, an analyst
+upgrade or price-target raise, a product launch, a regulatory approval, an
+index inclusion. It is NOT: generic optimism, a "stock to watch" listicle, a
+price-move recap ("shares rose 4%"), an analyst merely reiterating, or your own
+inference from the chart. If the only item is a recap of a move that ALREADY
+happened, has_catalyst is false — the move is already in the price.
+
+Be strict. Returning has_catalyst=false with a neutral score is the correct
+answer most days, and this bot is built to sit out.
+
+Respond with STRICT JSON, no markdown fence:
+{{"verdict": "bullish" | "neutral" | "bearish", "score": 0-100,
+  "has_catalyst": true | false,
+  "catalyst": "the specific event in <=10 words, or empty string",
+  "stale": true | false,
+  "reason": "one short sentence"}}
+
+Set stale=true if the catalyst is real but its timestamp is old enough that the
+stock has plainly already reacted to it.
+"""
+
+
+def finbert_crosscheck(symbol: str) -> tuple[int | None, str]:
+    """Deterministic second opinion on the SAME headlines the LLM just read.
+
+    None when FinBERT is off or unavailable — deliberately not a neutral 50, so
+    "FinBERT saw nothing bullish" stays distinguishable from "FinBERT did not
+    run". Advisory only; nothing consumes this to gate a trade.
+    """
+    try:
+        from . import news_score_local
+        if not news_score_local.enabled():
+            return None, "off"
+        # Hits news_fetcher's 30-min cache, so this costs no extra API call.
+        return news_score_local.score_news(news_fetcher.fetch_ticker_news(symbol))
+    except Exception as e:
+        log.warning("FinBERT cross-check failed for %s: %s", symbol, e)
+        return None, f"error: {e}"
+
+
+def assess_news(signal) -> tuple[str, int, bool, str, bool]:
+    """News-driven read for a BUY candidate. Returns
+    (verdict, score_0_100, has_catalyst, reason, ok).
+
+    `ok` is False whenever the verdict is NOT a real AI read — no key, no news,
+    quota, parse error. The caller (news_driven.gate) refuses to trade on
+    ok=False. This is the opposite of assess_sentiment's fail-safe, and it is
+    deliberate: in news-driven mode the news IS the thesis, so "we couldn't
+    read the news" must mean "no trade", never "fall back to technicals".
+
+    A catalyst the model marks `stale` is downgraded to has_catalyst=False —
+    a move the market already made is not a reason to enter now.
+    """
+    if not ai.has_key():
+        return "neutral", 50, False, "no AI key — news-driven cannot trade", False
+
+    try:
+        raw_ticker = news_fetcher.fetch_ticker_news(signal.symbol)
+        ticker_news = news_fetcher.format_news(raw_ticker, "Ticker news")
+        macro_news = news_fetcher.format_news(news_fetcher.fetch_macro_news(), "Macro")
+    except Exception as e:
+        return "neutral", 50, False, f"news fetch failed ({e})", False
+
+    # Filings and analyst actions are additive and best-effort: a failure here
+    # degrades the read back to Tavily-only, which is what this did before the
+    # source existed. It must never be able to block a news read.
+    raw_filings: list = []
+    filings = "(disabled)"
+    try:
+        from . import moo_notices
+        if moo_notices.enabled():
+            found = moo_notices.fetch_filings(signal.symbol)
+            ratings = moo_notices.fetch_ratings(signal.symbol)
+            # Ratings count as material for the "is there anything at all" test
+            # below: an upgrade with no press write-up yet is exactly the early
+            # catalyst this mode exists to catch.
+            raw_filings = found + ratings
+            filings = moo_notices.format_block(found, ratings)
+    except Exception as e:
+        log.warning("moomoo notices lookup failed for %s: %s — continuing without it",
+                    signal.symbol, e)
+        filings = "(lookup failed)"
+
+    if not raw_ticker and not raw_filings:
+        # Nothing from either source: no TAVILY_API_KEY, or genuinely nothing
+        # published and nothing filed. Either way there is no thesis to act on,
+        # and asking the model anyway invites it to invent one from the ticker.
+        # Note the AND — an 8-K with no press coverage yet is the BEST case this
+        # mode can see (the primary source, before the write-ups), so a silent
+        # Tavily must not veto it.
+        return "neutral", 50, False, "no ticker news and no material filings", False
+
+    try:
+        from . import clock
+        now_et = f"{clock.ny_now():%Y-%m-%d %H:%M}"
+    except Exception:
+        now_et = "(unknown)"
+    prompt = NEWS_DRIVEN_PROMPT.format(
+        symbol=signal.symbol, price=signal.price, now_et=now_et,
+        ticker_news=ticker_news, macro_news=macro_news, filings=filings,
+        reasons="\n".join(f"- {r}" for r in signal.reasons))
+
+    try:
+        text, model_name = ai.generate(prompt)
+        payload = _extract_json(text)
+        verdict = str(payload.get("verdict", "neutral")).lower()
+        score = int(payload.get("score", 50))
+        has_catalyst = bool(payload.get("has_catalyst", False))
+        catalyst = str(payload.get("catalyst", "")).strip()
+        stale = bool(payload.get("stale", False))
+        reason = str(payload.get("reason", ""))
+        if has_catalyst and stale:
+            has_catalyst = False
+            reason = f"catalyst already priced in ({catalyst or 'stale'}) — {reason}"
+        elif has_catalyst and catalyst:
+            reason = f"{catalyst} — {reason}"
+        log.info("news-driven [%s] %s → %s (%d) catalyst=%s",
+                 model_name, signal.symbol, verdict, score, has_catalyst or "none")
+        return verdict, score, has_catalyst, reason, True
+    except Exception as e:
+        log.warning("news-driven: AI unavailable for %s (%s) — no trade (fail-safe)",
+                    signal.symbol, e)
+        return "neutral", 50, False, f"AI unavailable ({e})", False
+
+
 def assess_sentiment(signal, options_summary: str = "") -> tuple[str, int, str]:
     """Phase 2B broker-style sentiment read for a BUY candidate. Returns
     (verdict, score_0_100, reason). ADVISORY — never vetoes. FAIL-SAFE → neutral

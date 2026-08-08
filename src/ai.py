@@ -42,8 +42,41 @@ PROVIDER_LABELS = {"deepseek": "DeepSeek"}
 # key). Kept tiny and current; the live fetch is the source of truth.
 _FALLBACK_MODELS = {
     "gemini": ["gemini-3.5-flash", "gemini-3.5-pro", "gemini-2.5-flash"],
-    "deepseek": ["deepseek-chat", "deepseek-reasoner"],
+    "deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"],
 }
+
+# DeepSeek retired the legacy alias names on 2026-07-24 15:59 UTC. They do NOT
+# soft-redirect — a request naming one fails outright, which for this bot means
+# every AI layer silently degrading to its neutral fallback while the trading
+# loop carries on looking healthy. Exactly the failure mode preflight.py was
+# written for, so we do not rely on the user noticing: the name is rewritten
+# here (with a warning) and preflight.check_ai() reports the stale config.
+#
+# Both aliases pointed at deepseek-v4-flash — deepseek-chat was its
+# non-thinking mode, deepseek-reasoner its thinking mode. Thinking is now a
+# request parameter rather than a model name, so both map to the same model and
+# _deepseek() sets the mode explicitly.
+_RETIRED_DEEPSEEK_MODELS = {
+    "deepseek-chat": ("deepseek-v4-flash", False),
+    "deepseek-reasoner": ("deepseek-v4-flash", True),
+}
+
+
+def migrate_deepseek_model(model: str) -> tuple[str, bool]:
+    """(effective_model, thinking) for a configured DeepSeek model name.
+
+    Unknown/current names pass through untouched with thinking left off — this
+    must never guess at a model the user deliberately chose.
+    """
+    hit = _RETIRED_DEEPSEEK_MODELS.get((model or "").strip())
+    if not hit:
+        return model, False
+    new, thinking = hit
+    log.warning("DEEPSEEK_MODEL=%r was retired on 2026-07-24 and no longer "
+                "resolves — using %r (thinking=%s). Update the setting to "
+                "silence this.", model, new, thinking)
+    return new, thinking
+
 
 _DEEPSEEK_BASE = "https://api.deepseek.com"
 
@@ -115,6 +148,52 @@ def model_cascade(provider: str | None = None) -> list[str]:
 
 
 # ── generation ───────────────────────────────────────────────────────────────
+# ── runtime call-outcome ledger (2026-08-07) ─────────────────────────────────
+# health_check probes the provider with its own "ping" on a timer. That is not
+# the same question as "are the calls this bot actually makes succeeding": the
+# probe can pass while a layer's real prompts fail, and — as the retired
+# deepseek-chat name proved — a real outage can run for days between probes
+# with every layer fail-safing to neutral and the loop looking healthy.
+#
+# So every generate() records its outcome. health_check reads the streak and
+# alerts on it; the web status endpoint shows it. Best-effort throughout: a
+# db hiccup must never turn a working AI call into a failed one.
+_K_FAIL_STREAK = "ai_fail_streak"
+_K_LAST_ERR = "ai_last_error"
+_K_LAST_OK = "ai_last_ok_ts"
+_K_LAST_FAIL = "ai_last_fail_ts"
+
+
+def _record_outcome(ok: bool, err: str = "") -> None:
+    try:
+        import time as _t
+        now = _t.time()
+        if ok:
+            def _upd(s: dict) -> dict:
+                return {_K_FAIL_STREAK: 0, _K_LAST_OK: now, _K_LAST_ERR: ""}
+        else:
+            def _upd(s: dict) -> dict:
+                return {_K_FAIL_STREAK: int(s.get(_K_FAIL_STREAK) or 0) + 1,
+                        _K_LAST_FAIL: now, _K_LAST_ERR: err[:200]}
+        db.atomic_state(_upd)
+    except Exception as e:
+        log.debug("ai outcome ledger write failed: %s", e)
+
+
+def call_health() -> dict:
+    """What the LAST real calls did. Consumed by health_check + /api/status."""
+    try:
+        s = db.get_state()
+    except Exception:
+        return {"fail_streak": 0, "last_error": "", "last_ok": None, "last_fail": None}
+    return {
+        "fail_streak": int(s.get(_K_FAIL_STREAK) or 0),
+        "last_error": s.get(_K_LAST_ERR) or "",
+        "last_ok": s.get(_K_LAST_OK),
+        "last_fail": s.get(_K_LAST_FAIL),
+    }
+
+
 def generate(prompt: str, *, temperature: float | None = None,
              image: bytes | None = None, search: bool = False) -> tuple[str, str]:
     """Run one prompt on the ACTIVE provider. Returns (text, model_used).
@@ -130,10 +209,22 @@ def generate(prompt: str, *, temperature: float | None = None,
     provider = active_provider()
     keys = provider_keys(provider)
     if not keys:
+        # NOT a failure of the provider — nothing was called. Recording this as
+        # one would make "you never configured a key" indistinguishable from
+        # "your key stopped working", which are different problems with
+        # different fixes.
         raise RuntimeError(f"no {PROVIDER_LABELS[provider]} key configured")
-    if provider == "deepseek":
-        return _deepseek(prompt, keys, temperature=temperature)
-    return _gemini(prompt, keys, temperature=temperature, image=image, search=search)
+    try:
+        if provider == "deepseek":
+            out = _deepseek(prompt, keys, temperature=temperature)
+        else:
+            out = _gemini(prompt, keys, temperature=temperature, image=image,
+                          search=search)
+    except Exception as e:
+        _record_outcome(False, str(e))
+        raise
+    _record_outcome(True)
+    return out
 
 
 def generate_text(prompt: str, **kw) -> str:
@@ -334,9 +425,15 @@ def _gemini(prompt, keys, *, temperature, image, search) -> tuple[str, str]:
 
 
 def _deepseek(prompt, keys, *, temperature) -> tuple[str, str]:
-    model = active_model("deepseek")
+    model, thinking = migrate_deepseek_model(active_model("deepseek"))
     body: dict = {"model": model, "messages": [{"role": "user", "content": prompt}],
                   "stream": False}
+    # Thinking moved from the model name to a request parameter in V4, and it
+    # defaults to ON for the pro tier. Every caller in this bot wants a short
+    # JSON verdict on a latency budget (the entry path already measured median
+    # 42s / p90 99s BEFORE reasoning was in the picture), so state the mode
+    # explicitly rather than inheriting a per-model default that can change.
+    body["thinking"] = {"type": "enabled" if thinking else "disabled"}
     if temperature is not None:
         body["temperature"] = temperature
     last_err: Exception | None = None
